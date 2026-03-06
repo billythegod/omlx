@@ -124,12 +124,16 @@ class VLMBatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
+        draft_model_path: str | None = None,
+        num_draft_tokens: int = 3,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
+        self._draft_model_path = draft_model_path
+        self._num_draft_tokens = num_draft_tokens
 
         self._vlm_model = None
         self._processor = None
@@ -241,6 +245,25 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # Load draft model for speculative decoding
+        if self._draft_model_path:
+            from mlx_lm import load as llm_load
+
+            def _load_draft_sync():
+                draft_model, _ = llm_load(self._draft_model_path)
+                return draft_model
+
+            draft_model = await loop.run_in_executor(
+                get_mlx_executor(), _load_draft_sync
+            )
+            self._engine.engine.scheduler.set_draft_model(
+                draft_model, self._num_draft_tokens
+            )
+            logger.info(
+                f"Speculative decoding enabled: draft={self._draft_model_path}, "
+                f"num_draft_tokens={self._num_draft_tokens}"
+            )
 
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)

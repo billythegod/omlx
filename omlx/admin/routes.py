@@ -68,6 +68,9 @@ class ModelSettingsRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     forced_ct_kwargs: Optional[list[str]] = None
     ttl_seconds: Optional[int] = None
+    speculative_decoding: Optional[bool] = None
+    draft_model: Optional[str] = None
+    num_draft_tokens: Optional[int] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1015,6 +1018,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "chat_template_kwargs": settings.chat_template_kwargs,
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
+                "speculative_decoding": settings.speculative_decoding,
+                "draft_model": settings.draft_model,
+                "num_draft_tokens": settings.num_draft_tokens,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
@@ -1170,6 +1176,12 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "speculative_decoding" in sent:
+        current_settings.speculative_decoding = request.speculative_decoding or False
+    if "draft_model" in sent:
+        current_settings.draft_model = request.draft_model or None
+    if "num_draft_tokens" in sent:
+        current_settings.num_draft_tokens = request.num_draft_tokens
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -1184,15 +1196,21 @@ async def update_model_settings(
     settings_manager.set_settings(model_id, current_settings)
 
     # Warn if engine type actually changed while model is loaded
+    speculative_changed = (
+        entry.engine is not None
+        and any(k in sent for k in ("speculative_decoding", "draft_model", "num_draft_tokens"))
+    )
     requires_reload = (
-        "model_type_override" in sent
-        and entry.engine is not None
-        and entry.engine_type != prev_engine_type
+        entry.engine is not None
+        and (
+            ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+            or speculative_changed
+        )
     )
     if requires_reload:
         logger.info(
-            f"Model type changed for loaded model {model_id} "
-            f"(now {entry.model_type}/{entry.engine_type}). "
+            f"Settings changed for loaded model {model_id} "
+            f"(engine_type={entry.engine_type}). "
             f"Reload required to take effect."
         )
 
@@ -1204,6 +1222,34 @@ async def update_model_settings(
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
     }
+
+
+@router.get("/api/models/{model_id}/draft_candidates")
+async def get_draft_candidates(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Get list of LLM models that can serve as draft models for speculative decoding."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    candidates = []
+    for mid in engine_pool.get_model_ids():
+        if mid == model_id:
+            continue
+        e = engine_pool.get_entry(mid)
+        if e and e.model_type in ("llm", "vlm"):
+            candidates.append({
+                "model_id": mid,
+                "estimated_size": e.estimated_size,
+            })
+
+    return {"candidates": candidates}
 
 
 @router.get("/api/models/{model_id}/generation_config")

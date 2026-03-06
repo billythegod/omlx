@@ -144,6 +144,47 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "ttl_seconds" not in d
 
+    def test_speculative_decoding_defaults(self):
+        """Test speculative decoding fields default values."""
+        settings = ModelSettings()
+        assert settings.speculative_decoding is False
+        assert settings.draft_model is None
+        assert settings.num_draft_tokens is None
+
+    def test_speculative_decoding_to_dict(self):
+        """Test speculative decoding fields in to_dict."""
+        settings = ModelSettings(
+            speculative_decoding=True,
+            draft_model="small-model",
+            num_draft_tokens=5,
+        )
+        d = settings.to_dict()
+        assert d["speculative_decoding"] is True
+        assert d["draft_model"] == "small-model"
+        assert d["num_draft_tokens"] == 5
+
+    def test_speculative_decoding_excluded_when_defaults(self):
+        """Test speculative decoding None fields excluded from to_dict when default."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        # speculative_decoding=False is not None, so it IS included (like force_sampling)
+        assert d.get("speculative_decoding") is False
+        assert "draft_model" not in d
+        assert "num_draft_tokens" not in d
+
+    def test_speculative_decoding_roundtrip(self):
+        """Test speculative decoding fields survive to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            speculative_decoding=True,
+            draft_model="draft-0.6b",
+            num_draft_tokens=4,
+        )
+        d = original.to_dict()
+        restored = ModelSettings.from_dict(d)
+        assert restored.speculative_decoding is True
+        assert restored.draft_model == "draft-0.6b"
+        assert restored.num_draft_tokens == 4
+
     def test_model_type_override_default(self):
         """Test model_type_override defaults to None."""
         settings = ModelSettings()
@@ -340,6 +381,25 @@ class TestModelSettingsManager:
             loaded = manager2.get_settings("test-model")
             assert loaded.forced_ct_kwargs == ["enable_thinking"]
             assert loaded.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_speculative_decoding_persist(self):
+        """Test speculative decoding settings survive save/load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            settings = ModelSettings(
+                speculative_decoding=True,
+                draft_model="qwen3-0.6b",
+                num_draft_tokens=5,
+            )
+            manager.set_settings("test-model", settings)
+
+            # Reload from file
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            loaded = manager2.get_settings("test-model")
+            assert loaded.speculative_decoding is True
+            assert loaded.draft_model == "qwen3-0.6b"
+            assert loaded.num_draft_tokens == 5
 
     def test_model_type_override_persist(self):
         """Test model_type_override survives save/load cycle."""

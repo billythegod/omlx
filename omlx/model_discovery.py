@@ -74,7 +74,6 @@ EMBEDDING_MODEL_TYPES = {
     "xlm-roberta",
     "xlm_roberta",
     "modernbert",
-    "qwen3",
     "gemma3-text",
     "gemma3_text",
     "siglip",

@@ -76,7 +76,11 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                speculative_decoding: false,
+                draft_model: '',
+                num_draft_tokens: 3,
             },
+            draftModelCandidates: [],
             savingModelSettings: false,
             loadingGenDefaults: false,
 
@@ -518,9 +522,28 @@
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
                     ttl_seconds: settings.ttl_seconds ?? null,
                     ctKwargEntries,
+                    speculative_decoding: settings.speculative_decoding || false,
+                    draft_model: settings.draft_model || '',
+                    num_draft_tokens: settings.num_draft_tokens ?? 3,
                 };
                 this.showModelSettingsModal = true;
                 this.$nextTick(() => lucide.createIcons());
+
+                // Fetch draft model candidates for speculative decoding.
+                // Must load candidates BEFORE the select renders, otherwise
+                // Alpine resets x-model to '' when no matching option exists.
+                const savedDraftModel = settings.draft_model || '';
+                if (model.model_type === 'llm' || model.model_type === 'vlm') {
+                    fetch(`/admin/api/models/${encodeURIComponent(model.id)}/draft_candidates`)
+                        .then(r => r.json())
+                        .then(data => {
+                            this.draftModelCandidates = data.candidates || [];
+                            this.modelSettings.draft_model = savedDraftModel;
+                        })
+                        .catch(() => { this.draftModelCandidates = []; });
+                } else {
+                    this.draftModelCandidates = [];
+                }
             },
 
             async saveModelSettings() {
@@ -569,6 +592,9 @@
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
                                     ? forcedCtKwargs : null,
+                                speculative_decoding: this.modelSettings.speculative_decoding,
+                                draft_model: this.modelSettings.draft_model || null,
+                                num_draft_tokens: this.modelSettings.num_draft_tokens || null,
                             };
                         })()),
                     });

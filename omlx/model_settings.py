@@ -50,6 +50,11 @@ class ModelSettings:
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
 
+    # Speculative decoding
+    speculative_decoding: bool = False
+    draft_model: Optional[str] = None  # Draft model ID (from discovered models)
+    num_draft_tokens: Optional[int] = None  # Number of tokens to draft (None = use default 3)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

@@ -90,6 +90,7 @@ class EnginePool:
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._settings_manager: "ModelSettingsManager | None" = None  # Set by apply_settings_overrides
 
     @property
     def max_model_memory(self) -> int | None:
@@ -174,6 +175,7 @@ class EnginePool:
         self, settings_manager: "ModelSettingsManager"
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
+        self._settings_manager = settings_manager
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
@@ -430,15 +432,59 @@ class EnginePool:
                 engine = RerankerEngine(model_name=entry.model_path)
             elif entry.engine_type == "vlm":
                 # VLMBatchedEngine for vision-language models
+                # Resolve speculative decoding settings
+                vlm_draft_model_path = None
+                vlm_num_draft_tokens = 3
+                if self._settings_manager:
+                    vlm_settings = self._settings_manager.get_settings(model_id)
+                    if vlm_settings.speculative_decoding and vlm_settings.draft_model:
+                        vlm_draft_entry = self._entries.get(vlm_settings.draft_model)
+                        if vlm_draft_entry and vlm_draft_entry.model_type in ("llm", "vlm"):
+                            vlm_draft_model_path = vlm_draft_entry.model_path
+                            vlm_num_draft_tokens = vlm_settings.num_draft_tokens or 3
+                            logger.info(
+                                f"Speculative decoding for VLM {model_id}: "
+                                f"draft={vlm_settings.draft_model}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Draft model '{vlm_settings.draft_model}' not found "
+                                f"or not a valid type, skipping speculative decoding"
+                            )
+
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    draft_model_path=vlm_draft_model_path,
+                    num_draft_tokens=vlm_num_draft_tokens,
                 )
             else:
                 # BatchedEngine with continuous batching (default)
+                # Resolve speculative decoding settings
+                draft_model_path = None
+                num_draft_tokens = 3
+                if self._settings_manager:
+                    settings = self._settings_manager.get_settings(model_id)
+                    if settings.speculative_decoding and settings.draft_model:
+                        draft_entry = self._entries.get(settings.draft_model)
+                        if draft_entry and draft_entry.model_type == "llm":
+                            draft_model_path = draft_entry.model_path
+                            num_draft_tokens = settings.num_draft_tokens or 3
+                            logger.info(
+                                f"Speculative decoding for {model_id}: "
+                                f"draft={settings.draft_model}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Draft model '{settings.draft_model}' not found "
+                                f"or not an LLM, skipping speculative decoding"
+                            )
+
                 engine = BatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
+                    draft_model_path=draft_model_path,
+                    num_draft_tokens=num_draft_tokens,
                 )
 
             try:
