@@ -724,6 +724,8 @@
                     enableToolResultLimit: !!(settings.max_tool_result_tokens),
                     max_tool_result_tokens: settings.max_tool_result_tokens || null,
                     ttl_seconds: settings.ttl_seconds ?? null,
+                    enableIndexCache: !!(settings.index_cache_freq),
+                    index_cache_freq: settings.index_cache_freq || null,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -772,6 +774,9 @@
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
+                                index_cache_freq: this.modelSettings.enableIndexCache
+                                    ? (this.modelSettings.index_cache_freq || null)
+                                    : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
