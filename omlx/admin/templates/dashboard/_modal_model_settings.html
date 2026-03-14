@@ -137,7 +137,7 @@
                     </div>
 
                     <!-- IndexCache (DSA Models) -->
-                    <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                    <div x-show="DSA_MODEL_TYPES.has(selectedModel?.config_model_type || '')" class="p-4 bg-neutral-50 rounded-xl space-y-3">
                         <div class="flex items-center justify-between">
                             <div>
                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.index_cache') }}</span>

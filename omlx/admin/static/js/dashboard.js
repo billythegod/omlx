@@ -2,6 +2,9 @@
     const OCR_CONFIG_MODEL_TYPES = new Set([
         'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
     ]);
+    const DSA_MODEL_TYPES = new Set([
+        'deepseek_v32', 'glm_moe_dsa',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader']);
