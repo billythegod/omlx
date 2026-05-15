@@ -107,11 +107,13 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     with patch("omlx.scheduler.mx.get_active_memory", return_value=0), patch(
         "omlx.scheduler.get_phys_footprint", return_value=0
     ):
-        error = scheduler._preflight_memory_check(_make_request(65536))
+        rejection = scheduler._preflight_memory_check(_make_request(65536))
 
-    assert error is not None
-    assert "Prefill would require" in error
-    assert "KV+SDPA" in error
+    assert rejection is not None
+    assert "Prefill would require" in rejection.message
+    assert "KV+SDPA" in rejection.message
+    assert rejection.estimated_bytes > 0
+    assert rejection.limit_bytes == 1
 
 
 def test_preflight_returns_none_when_guard_disabled():
@@ -317,8 +319,14 @@ def test_preflight_rejection_path_invokes_release_helper():
     # _ensure_batch_generator runs — patch the preflight check to
     # short-circuit on entry and keep this test independent of the
     # batch-generator construction path.
+    from omlx.scheduler import _PreflightRejection
+
     def _force_reject(_request):
-        return "forced rejection for test"
+        return _PreflightRejection(
+            message="forced rejection for test",
+            estimated_bytes=1,
+            limit_bytes=1,
+        )
 
     with patch.object(
         scheduler, "_release_paged_cache_for_request"
@@ -346,10 +354,10 @@ def test_vlm_preflight_rejects_oversize_request():
     ):
         # 100k tokens at head_dim=256 should push (28 GiB baseline + KV+SDPA
         # peak) past the 40 GiB limit.
-        error = scheduler._preflight_memory_check(_make_request(100000))
+        rejection = scheduler._preflight_memory_check(_make_request(100000))
 
-    assert error is not None
-    assert "KV+SDPA" in error
+    assert rejection is not None
+    assert "KV+SDPA" in rejection.message
 
 
 # ---------------------------------------------------------------------------

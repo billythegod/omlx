@@ -165,6 +165,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
 from .model_discovery import format_size
@@ -458,6 +459,12 @@ def _status_to_error_type(status_code: int) -> str:
         return "authentication_error"
     if status_code == 404:
         return "not_found_error"
+    if status_code == 413:
+        # Prefill-memory-guard rejection. OpenAI uses
+        # invalid_request_error for context-window-exceeded as well; we
+        # use the finer-grained 413 status but the same type so existing
+        # clients that branch on type still recognise the failure mode.
+        return "invalid_request_error"
     if status_code == 429:
         return "rate_limit_error"
     if status_code >= 500:
@@ -466,7 +473,16 @@ def _status_to_error_type(status_code: int) -> str:
 
 
 def _is_api_route(request: FastAPIRequest) -> bool:
-    """Check if request targets an OpenAI-compatible API route."""
+    """Check if request targets an OpenAI-compatible API route.
+
+    Path-prefix only. This assumes the FastAPI app is mounted at root
+    (the oMLX deployment shape) and that route paths are case-sensitive
+    — both true today. If a future deployment mounts this app under a
+    prefix (``app.mount("/api", ...)``), ``request.url.path`` returns
+    the full mounted path and every ``/v1/...`` route would be
+    classified as non-API. Switch to ``request.scope.get("route")``
+    matching at that point.
+    """
     return request.url.path.startswith("/v1/")
 
 
@@ -557,6 +573,60 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(PrefillMemoryExceededError)
+async def prefill_memory_exceeded_handler(
+    request: FastAPIRequest, exc: PrefillMemoryExceededError
+):
+    """Map prefill peak overshoot to HTTP 413 with a clean JSON body.
+
+    The synchronous prefill memory guard in ``Scheduler.add_request`` raises
+    this when the estimated KV+SDPA peak for a request would push memory
+    past the user-configured ``max_process_memory``. The caller's prompt
+    fits in the model's context window but is too large for the host's
+    headroom, so 413 (Payload Too Large) is the right code.
+
+    Code vs status trade-off: 413 (Payload Too Large) is a request-shape
+    error; 507 (Insufficient Storage) more accurately describes "host
+    can't service it right now". We use 413 because it maps cleanly to
+    the OpenAI SDK retry-with-smaller-input flow that most clients
+    already implement, and the ``error.code`` field gives consumers a
+    machine-readable discriminator (``"prefill_memory_exceeded"``)
+    distinct from genuine context-window-exceeded rejections.
+    """
+    detail = str(exc)
+    logger.warning(
+        "%s %s → 413: %s",
+        request.method,
+        request.url.path,
+        detail,
+    )
+    if _is_api_route(request):
+        # code="prefill_memory_exceeded" lets OpenAI-SDK clients branch
+        # on the failure mode. Without it, "context window too small"
+        # and "host has no memory headroom" both surface as
+        # invalid_request_error with code=None and clients can only
+        # tell the user "shorten your prompt" — which is wrong when
+        # the actual fix is to raise --max-process-memory.
+        content = _openai_error_body(
+            detail, 413, code="prefill_memory_exceeded"
+        )
+        # Surface the structured fields so clients can branch on
+        # numeric values instead of regex-matching the human message.
+        # OpenAI clients ignore unknown error fields so this is a
+        # forward-compatible extension.
+        if exc.estimated_bytes is not None:
+            content["error"]["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["error"]["limit_bytes"] = exc.limit_bytes
+    else:
+        content = {"detail": detail}
+        if exc.estimated_bytes is not None:
+            content["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["limit_bytes"] = exc.limit_bytes
+    return JSONResponse(status_code=413, content=content)
 
 
 @app.exception_handler(Exception)
@@ -1969,6 +2039,17 @@ async def create_completion(
         num_tokens = len(engine.tokenizer.encode(prompt))
         validate_context_window(num_tokens, request.model)
 
+    # Pre-flight prefill memory guard — see create_chat_completion for
+    # the reason this must precede any StreamingResponse return.
+    # Thread the client-provided X-Request-ID when present so the 413
+    # log line and the FastAPI handler trace correlate with whatever
+    # the client is using on its side.
+    upstream_request_id = http_request.headers.get("x-request-id")
+    for prompt in prompts:
+        await engine.preflight_completion(
+            prompt, request_id=upstream_request_id
+        )
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -2306,6 +2387,19 @@ async def create_chat_completion(
 
     if request.stop:
         chat_kwargs["stop"] = request.stop
+
+    # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
+    # the response in a StreamingResponse — starlette emits
+    # http.response.start (status 200) before iterating the body generator,
+    # so a typed exception thrown later by add_request lands as "Caught
+    # handled exception, but response already started" and the client sees
+    # an incomplete chunked read. Running the check here lets
+    # prefill_memory_exceeded_handler return a clean HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
 
     if request.stream:
         return StreamingResponse(
@@ -3616,6 +3710,14 @@ async def create_anthropic_message(
     if request.stop_sequences:
         chat_kwargs["stop"] = request.stop_sequences
 
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -4015,6 +4117,14 @@ async def create_response(
         chat_kwargs["tools"] = tools_for_template
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
 
     if request.stream:
         return StreamingResponse(

@@ -40,7 +40,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
-from .exceptions import is_cache_corruption_error
+from .exceptions import PrefillMemoryExceededError, is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -709,6 +709,20 @@ class _BoundarySnapshotProvider:
 
     def __bool__(self) -> bool:
         return bool(self._valid_tcs)
+
+
+@dataclass(frozen=True)
+class _PreflightRejection:
+    """Structured rejection returned by ``_preflight_memory_check_tokens``.
+
+    Carrying the numeric values lets callers populate
+    ``PrefillMemoryExceededError.estimated_bytes`` / ``limit_bytes``
+    cleanly instead of parsing the human-readable message.
+    """
+
+    message: str
+    estimated_bytes: int
+    limit_bytes: int
 
 
 class Scheduler:
@@ -2052,13 +2066,30 @@ class Scheduler:
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
                 ):
-                    logger.warning(
+                    msg = (
                         f"Prefill force-stopped at {processed_tokens} "
                         f"tokens: memory {current / 1024**3:.1f}GB "
                         f"exceeds hard limit "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
                     )
-                    raise RuntimeError("Memory limit exceeded during prefill")
+                    logger.warning(msg)
+                    # Raise the typed exception so the FastAPI 413
+                    # handler can map it cleanly. The pre-admission
+                    # preflight is the primary guard; this in-flight
+                    # check is the race-safety net when memory shifted
+                    # between admission and prefill.
+                    from .exceptions import PrefillMemoryExceededError
+
+                    raise PrefillMemoryExceededError(
+                        message=msg,
+                        request_id=(
+                            getattr(request, "request_id", None)
+                            if "request" in locals()
+                            else None
+                        ),
+                        estimated_bytes=current,
+                        limit_bytes=self._memory_hard_limit_bytes,
+                    )
                 elif current > self._memory_limit_bytes:
                     logger.warning(
                         f"Prefill memory soft limit exceeded at "
@@ -2443,11 +2474,22 @@ class Scheduler:
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
             ):
-                raise RuntimeError(
+                msg = (
                     f"Memory limit exceeded during chunked prefill at "
                     f"{state.tokens_processed}/{state.total_length - 1} tokens: "
                     f"{current / 1024**3:.1f}GB exceeds hard limit "
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                )
+                # See _do_external_prefill's identical check: race-safety
+                # net for the case where memory shifted between admission
+                # and prefill. Typed exception → HTTP 413.
+                from .exceptions import PrefillMemoryExceededError
+
+                raise PrefillMemoryExceededError(
+                    message=msg,
+                    request_id=state.request.request_id,
+                    estimated_bytes=current,
+                    limit_bytes=self._memory_hard_limit_bytes,
                 )
             elif current > self._memory_limit_bytes:
                 logger.warning(
@@ -2569,7 +2611,7 @@ class Scheduler:
                 # be fully processed by _process_pending_aborts() next step.
                 self._prefill_states.pop(rid, None)
                 continue
-            except RuntimeError as e:
+            except (RuntimeError, PrefillMemoryExceededError) as e:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._fail_prefill_request(rid, e, rejected)
                 continue
@@ -3689,9 +3731,18 @@ class Scheduler:
         """
         Add a new request to the scheduler.
 
-        Raises SchedulerQueueFullError when the waiting queue is at or above
-        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
-        this to HTTP 503 + Retry-After.
+        Raises:
+        - ``SchedulerQueueFullError`` when the waiting queue is at or
+          above the configured cap (max(max_num_seqs * 4, 32)). Server
+          layer maps this to HTTP 503 + Retry-After.
+        - ``PrefillMemoryExceededError`` when the preflight memory
+          check rejects the request. Server layer maps this to HTTP
+          413. The rejection runs AFTER admission preprocessing
+          (tokenisation, prefix-cache lookup, block-table acquisition,
+          SpecPrefill scoring) but BEFORE ``self.waiting.append`` — any
+          state allocated during preprocessing (block-table refs, prefix
+          cache reservations) is rolled back on the raise path so the
+          rejection does not leak resources.
 
         Args:
             request: The request to add
@@ -3828,6 +3879,43 @@ class Scheduler:
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
+
+        # Synchronous prefill memory guard. Rejecting here (before append to
+        # self.waiting) means the request never enters MLX prefill, which is
+        # the path that triggers the Apple IOGPUFamily kernel bug
+        # (FB22091885 / ml-explore/mlx#3186). The _schedule_waiting() call
+        # still re-checks asynchronously as a race-safety net for cases where
+        # memory conditions change between add_request and scheduling.
+        #
+        # The HTTP layer runs ``preflight_or_raise`` before wrapping the
+        # response in a StreamingResponse so the 413 reaches the client
+        # cleanly. This synchronous in-add_request check is the
+        # defense-in-depth path for callers that bypass the server
+        # preflight (direct engine API, future endpoints).
+        rejection = self._preflight_memory_check(request)
+        if rejection is not None:
+            # Prefix-cache / SpecPrefill lookups above may have bumped
+            # block refs and primed the draft prefix cache; release
+            # both before raising so a rejection storm can't pin paged
+            # cache state.
+            self._release_paged_cache_for_request(request.request_id)
+
+            logger.warning(
+                f"Request {request.request_id} rejected by prefill memory "
+                f"guard (sync): {rejection.message}"
+            )
+            try:
+                from .server_metrics import get_server_metrics
+
+                get_server_metrics().record_preflight_rejection("hard_limit")
+            except Exception:
+                pass
+            raise PrefillMemoryExceededError(
+                message=rejection.message,
+                request_id=request.request_id,
+                estimated_bytes=rejection.estimated_bytes,
+                limit_bytes=rejection.limit_bytes,
+            )
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -4662,7 +4750,124 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _preflight_memory_check(self, request: "Request") -> str | None:
+    def _preflight_memory_check_tokens(
+        self, num_prompt_tokens: int, cached_tokens: int = 0
+    ) -> "_PreflightRejection | None":
+        """Token-count form of the prefill memory guard — see
+        ``_preflight_memory_check`` for the rejection rationale.
+
+        Decoupled from ``Request`` so the server layer can run an early
+        admission check immediately after tokenization, before wrapping
+        the response in a ``StreamingResponse`` (whose
+        ``http.response.start`` lands before any route-handler exception
+        can adjust the status code, locking the client to HTTP 200).
+
+        Returns a ``_PreflightRejection`` carrying the diagnostic
+        message, estimated peak bytes, and the hard limit bytes if
+        rejection is warranted, or None if the request fits. Returning a
+        structured value lets callers populate
+        ``PrefillMemoryExceededError.estimated_bytes`` / ``limit_bytes``
+        without parsing the human-readable string.
+
+        Reads the (guard, hard_limit) pair from ``_memory_state`` as a
+        single atomic snapshot. Going through individual properties
+        would do separate bundle loads — under PEP 703 free-threading
+        the writer's bundle reassignment between the two reads could
+        produce a mixed (guard=True, hard_limit=0) view that slips a
+        too-large request past rejection. See ``_MemoryLimitState``
+        and ``ProcessMemoryEnforcer._propagate_memory_limit``.
+        """
+        state = self._memory_state
+        if not state.prefill_memory_guard:
+            return None
+        hard_limit = state.memory_hard_limit_bytes
+        if hard_limit <= 0:
+            return None
+        if self.memory_monitor is None:
+            return None
+
+        new_tokens = max(num_prompt_tokens - cached_tokens, 0)
+        if new_tokens == 0:
+            return None
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, cached_tokens, self.config.prefill_step_size
+        )
+        if peak == 0:
+            return None  # can't estimate, skip
+
+        current = max(mx.get_active_memory(), get_phys_footprint())
+        estimated = current + peak
+
+        if estimated > hard_limit:
+            from .utils.hardware import format_bytes
+
+            msg = (
+                f"Prefill would require ~{format_bytes(estimated)} peak "
+                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+                f"but limit is {format_bytes(hard_limit)}. "
+                f"Reduce context length or increase --max-process-memory."
+            )
+            return _PreflightRejection(
+                message=msg,
+                estimated_bytes=estimated,
+                limit_bytes=hard_limit,
+            )
+        return None
+
+    def preflight_or_raise(
+        self,
+        num_prompt_tokens: int,
+        cached_tokens: int = 0,
+        request_id: str | None = None,
+    ) -> None:
+        """Run the prefill memory check and raise PrefillMemoryExceededError
+        on rejection. No-op when the guard is disabled or the request
+        would fit.
+
+        Called from the API server layer BEFORE the response is wrapped
+        in a StreamingResponse, so the typed exception can be mapped to
+        HTTP 413 by the registered FastAPI handler. The synchronous
+        re-check inside ``add_request`` and the async re-check inside
+        ``_schedule_waiting`` remain as defense-in-depth for callers
+        that bypass the server preflight (direct engine API, future
+        endpoints).
+        """
+        rej = self._preflight_memory_check_tokens(num_prompt_tokens, cached_tokens)
+        if rej is None:
+            return
+        from .exceptions import PrefillMemoryExceededError
+
+        # Stable, unique label per rejection — caller-supplied if
+        # available, otherwise a short uuid so operators can correlate
+        # the log line below with the FastAPI handler trace and the
+        # client-side error body. Avoids the prior default of literal
+        # "preflight" for every rejection, which was useless for tracing.
+        if not request_id:
+            import uuid as _uuid
+
+            request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+        logger.warning(
+            f"Preflight rejected ({num_prompt_tokens} tokens, "
+            f"cached={cached_tokens}, request_id={request_id}): "
+            f"{rej.message}"
+        )
+        try:
+            from .server_metrics import get_server_metrics
+
+            get_server_metrics().record_preflight_rejection("hard_limit")
+        except Exception:
+            pass
+        raise PrefillMemoryExceededError(
+            message=rej.message,
+            request_id=request_id,
+            estimated_bytes=rej.estimated_bytes,
+            limit_bytes=rej.limit_bytes,
+        )
+
+    def _preflight_memory_check(
+        self, request: "Request"
+    ) -> "_PreflightRejection | None":
         """
         Estimate whether prefill would exceed memory limits.
 
@@ -4681,42 +4886,13 @@ class Scheduler:
         and ``ProcessMemoryEnforcer._propagate_memory_limit``.
 
         Returns:
-            Error message string if request should be rejected, None if OK.
+            ``_PreflightRejection`` if the request should be rejected,
+            None if OK.
         """
-        state = self._memory_state
-        if not state.prefill_memory_guard:
-            return None
-        hard_limit = state.memory_hard_limit_bytes
-        if hard_limit <= 0:
-            return None
-        if self.memory_monitor is None:
-            return None
-
-        prompt_tokens = request.num_prompt_tokens
-        cached_tokens = request.cached_tokens or 0
-        new_tokens = max(prompt_tokens - cached_tokens, 0)
-
-        if new_tokens == 0:
-            return None
-
-        peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, cached_tokens, self.config.prefill_step_size
+        return self._preflight_memory_check_tokens(
+            num_prompt_tokens=request.num_prompt_tokens,
+            cached_tokens=request.cached_tokens or 0,
         )
-        if peak == 0:
-            return None  # can't estimate, skip
-
-        current = max(mx.get_active_memory(), get_phys_footprint())
-
-        if current + peak > hard_limit:
-            from .utils.hardware import format_bytes
-
-            return (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but limit is {format_bytes(hard_limit)}. "
-                f"Reduce context length or increase --max-process-memory."
-            )
-        return None
 
     def _schedule_waiting(
         self,
@@ -4879,11 +5055,11 @@ class Scheduler:
 
             # Pre-flight memory guard: estimate peak memory for this request
             # and reject if it would exceed the hard limit.
-            preflight_error = self._preflight_memory_check(request)
-            if preflight_error:
+            preflight_rejection = self._preflight_memory_check(request)
+            if preflight_rejection is not None:
                 logger.warning(
                     f"Request {request.request_id} rejected by prefill "
-                    f"memory guard: {preflight_error}"
+                    f"memory guard: {preflight_rejection.message}"
                 )
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
@@ -4904,7 +5080,7 @@ class Scheduler:
                         request_id=request.request_id,
                         finished=True,
                         finish_reason="error",
-                        error=preflight_error,
+                        error=preflight_rejection.message,
                     )
                 )
                 continue
@@ -5161,7 +5337,7 @@ class Scheduler:
                         done = self._step_prefill_chunk(state)
                     except _PrefillAbortedError:
                         raise
-                    except RuntimeError as e:
+                    except (RuntimeError, PrefillMemoryExceededError) as e:
                         logger.error(
                             "Chunked prefill (first chunk) failed for "
                             "%s: %s",
@@ -5198,7 +5374,7 @@ class Scheduler:
                         cache_to_use,
                         vlm_embeds=vlm_embeds,
                     )
-                except RuntimeError as e:
+                except (RuntimeError, PrefillMemoryExceededError) as e:
                     logger.error(
                         "Non-chunked prefill failed for %s: %s",
                         request.request_id,
