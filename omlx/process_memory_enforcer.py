@@ -98,6 +98,11 @@ class ProcessMemoryEnforcer:
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
+        # Engine types we've already complained about in
+        # _propagate_memory_limit's "scheduler unreachable" path. Prevents
+        # the per-poll warning from spamming logs while keeping the first
+        # occurrence loud enough to alert CI / oncall.
+        self._scheduler_resolve_warned: set[str] = set()
 
     @property
     def max_bytes(self) -> int:
@@ -136,26 +141,25 @@ class ProcessMemoryEnforcer:
         )
 
     def _get_hard_limit_bytes(self) -> int:
-        """Hard limit for inline prefill check.
+        """Hard limit propagated to scheduler._memory_hard_limit_bytes for the
+        prefill peak check. Returns the user-configured max_bytes directly.
 
-        - User-explicit max (CLI/env/settings.json): the user value IS the
-          ceiling. They asked for this number to be respected.
-        - Auto mode: system_ram - 4GB so the kernel keeps headroom for
-          itself and prefill gets room above the enforcer's soft/hard
-          watermarks.
+        Previously this returned max(system_ram - 4GB, max_bytes) on the
+        assumption that the prefill peak is transient and the enforcer's
+        soft/hard watermarks (`_soft_bytes` / `_hard_bytes`) would catch any
+        actual OOM through LRU eviction. On head_dim>128 SDPA-fallback paths
+        (e.g. Qwen3.6-VL with head_dim=256) the peak is large enough that a
+        100k-token prefill bursts the user's max_bytes by ~10 GiB during the
+        last chunk and Metal aborts before eviction can recover — the
+        process exits with kIOGPUCommandBufferCallbackErrorOutOfMemory.
+        Tightening to max_bytes lets the scheduler reject upfront with a
+        clear message instead.
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
-
-        Note: distinct from `_soft_bytes` / `_hard_bytes` which are
-        max_bytes * threshold and drive LRU eviction / admission pause.
         """
         if self._max_bytes <= 0:
             return 0
-        if self._user_explicit_max:
-            return self._max_bytes
-        from .settings import get_system_memory
-
-        return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
+        return self._max_bytes
 
     @property
     def _soft_bytes(self) -> int:
@@ -220,40 +224,113 @@ class ProcessMemoryEnforcer:
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
     @staticmethod
-    def _resolve_scheduler(entry: Any) -> Any | None:
-        """Resolve the Scheduler instance from an EnginePool entry.
+    def _resolve_scheduler(engine):
+        """Return the real Scheduler instance for an EnginePool entry.
 
-        Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
-        as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
-        EngineCore → Scheduler). Some non-streaming engines may expose
-        ``entry.engine.scheduler`` directly. Returns None if neither
-        path resolves.
+        Both BatchedEngine and VLMBatchedEngine in the live engine pool
+        store the scheduler at ``self._engine.engine.scheduler`` (the outer
+        wrapper holds an AsyncEngineCore at ``_engine`` whose ``.engine``
+        is the EngineCore that actually owns the scheduler). Neither
+        exposes a top-level ``.scheduler`` attribute, so the previous
+        ``getattr(engine, "scheduler", None)`` always returned None for
+        real engines and the propagation silently no-op'd — including the
+        prefill memory guard flag, which meant the guard was dead at
+        runtime regardless of the user's setting. Test mocks set
+        ``.scheduler`` directly, so the wrapper-traversal fallback only
+        kicks in for real engines.
         """
-        eng = entry.engine
-        if eng is None:
-            return None
-        sched = getattr(eng, "scheduler", None)
+        sched = getattr(engine, "scheduler", None)
         if sched is not None:
             return sched
-        inner = getattr(eng, "_engine", None)
+        inner = getattr(engine, "_engine", None)
         if inner is None:
             return None
-        inner_engine = getattr(inner, "engine", None)
-        if inner_engine is None:
-            return None
-        return getattr(inner_engine, "scheduler", None)
+        return getattr(getattr(inner, "engine", None), "scheduler", None)
 
     def _propagate_memory_limit(self) -> None:
-        """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
+        """Propagate soft/hard memory limits to schedulers for inline prefill checking.
+
+        Invariant: this method is synchronous (no ``await``) so it runs to
+        completion within a single event-loop tick. ``EnginePool._load_engine``
+        / ``_unload_engine`` / ``EnginePool.discover_models()`` mutate the
+        mapping but all run on the same event loop and cannot interleave
+        with this loop today. The iteration uses ``list(values())`` so a
+        future refactor that moves an EnginePool mutator to a worker
+        thread cannot trigger ``RuntimeError: dictionary changed size``
+        or — worse — silently miss an engine and leave it without the
+        propagated guard / hard limit, regressing the dead-guard bug
+        this method exists to fix. The snapshot cost is one cheap copy
+        of value references.
+
+        Cross-thread visibility — the API hot-path reader
+        (``Scheduler._preflight_memory_check_tokens``) consumes the
+        guard / hard_limit pair as a logical bundle (guard True implies
+        hard_limit > 0). To make the publication atomic regardless of
+        Python memory model — including PEP 703 free-threading where
+        per-attribute STORE_ATTRs are no longer GIL-serialized into a
+        consistent order from another thread's perspective — the bundled
+        state is published as a single reference store of an immutable
+        ``_MemoryLimitState``. The reader does one ``state =
+        scheduler._memory_state`` then accesses fields off the local
+        snapshot, never observing a partially-updated combination.
+
+        Secondary readers (``_do_external_prefill``,
+        ``_step_prefill_chunk``, ``_schedule_waiting``) and ad-hoc
+        test setattrs go through the four ``@property`` accessors on
+        ``Scheduler`` (``_memory_limit_bytes``,
+        ``_memory_hard_limit_bytes``, ``_prefill_memory_guard``,
+        ``_admission_paused``), all backed by ``_memory_state``.
+        Setting one property rebuilds the bundle via
+        ``dataclasses.replace`` — still a single atomic ref store —
+        so the publication needs only the one bundled assignment
+        below for both readers and writers.
+
+        ``batch_generator`` is a separate object whose memory limits
+        are NOT backed by the bundle (it has no equivalent reader-
+        atomicity requirement), so it keeps its plain attribute
+        writes.
+        """
+        from .scheduler import _MemoryLimitState
+
         hard_limit = self._get_hard_limit_bytes()
         admission_paused = self._pressure_level != "ok"
-        for entry in self._engine_pool._entries.values():
-            scheduler = self._resolve_scheduler(entry)
-            if scheduler is not None:
-                scheduler._memory_limit_bytes = self._max_bytes
-                scheduler._memory_hard_limit_bytes = hard_limit
-                scheduler._prefill_memory_guard = self._prefill_memory_guard
-                scheduler._admission_paused = admission_paused
+        guard_enabled = self._prefill_memory_guard
+        new_state = _MemoryLimitState(
+            memory_limit_bytes=self._max_bytes,
+            memory_hard_limit_bytes=hard_limit,
+            prefill_memory_guard=guard_enabled,
+            admission_paused=admission_paused,
+        )
+        # Snapshot to a list so a future EnginePool mutator on a worker
+        # thread cannot interleave — see method docstring.
+        for entry in list(self._engine_pool._entries.values()):
+            if entry.engine is not None:
+                scheduler = self._resolve_scheduler(entry.engine)
+                if scheduler is None:
+                    # Rate-limited per-engine-type so a wrapper-chain
+                    # change is loud once instead of every poll. Silent
+                    # no-op was the failure mode that originally hid the
+                    # dead memory guard — surface it now.
+                    engine_type = type(entry.engine).__name__
+                    if engine_type not in self._scheduler_resolve_warned:
+                        self._scheduler_resolve_warned.add(engine_type)
+                        logger.warning(
+                            "ProcessMemoryEnforcer: could not resolve "
+                            "scheduler for engine type %s — prefill memory "
+                            "guard will not propagate to this engine. "
+                            "Verify the wrapper chain "
+                            "(engine._engine.engine.scheduler) still holds.",
+                            engine_type,
+                        )
+                    continue
+                # Atomic publication: single reference store. Under any
+                # Python memory model the reader either sees the old
+                # bundle in full or the new bundle in full — never a
+                # mixed (guard=True, hard_limit=0) snapshot. The four
+                # ``@property`` accessors on Scheduler read from this
+                # bundle, so the secondary readers and any test that
+                # sets individual fields still see coherent values.
+                scheduler._memory_state = new_state
                 scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
                 scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
                 bg = getattr(scheduler, "batch_generator", None)
@@ -270,8 +347,10 @@ class ProcessMemoryEnforcer:
         `_propagate_memory_limit` to avoid double-stepping the cap when
         a transition fires.
         """
-        for entry in self._engine_pool._entries.values():
-            scheduler = self._resolve_scheduler(entry)
+        for entry in list(self._engine_pool._entries.values()):
+            if entry.engine is None:
+                continue
+            scheduler = self._resolve_scheduler(entry.engine)
             if scheduler is None:
                 continue
             adjust = getattr(scheduler, "adjust_store_cache_cap", None)
@@ -344,11 +423,20 @@ class ProcessMemoryEnforcer:
         else:
             new_level = "hard"
 
-        # Update cached level and propagate admission_paused immediately so
-        # the scheduler stops admitting new prefills before we start evicting.
+        # Propagate every poll iteration so engines loaded AFTER enforcer.start()
+        # (i.e. lazy-loaded on first request, which is the normal case for the
+        # paged-SSD engine pool) pick up the limits and prefill_memory_guard
+        # flag within one poll interval — not only when pressure level happens
+        # to change. Without this the first heavy request arrives at a
+        # scheduler with _prefill_memory_guard=False / _memory_hard_limit_bytes=0
+        # (their defaults) and the guard short-circuits, letting the request
+        # enter prefill and hit the underlying Apple IOGPUFamily kernel bug
+        # (#1146 / FB22091885). Observed 2026-05-15: 110k-token Qwen3.6-VL
+        # prefill rebooted the host because propagation hadn't reached the
+        # freshly-loaded engine yet.
+        self._pressure_level = new_level
+        self._propagate_memory_limit()
         if new_level != prev_level:
-            self._pressure_level = new_level
-            self._propagate_memory_limit()
             logger.info(
                 f"Memory pressure level: {prev_level} -> {new_level} "
                 f"(current={_format_gb(current)}, "

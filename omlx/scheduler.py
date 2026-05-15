@@ -21,7 +21,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -623,6 +623,31 @@ class SchedulerConfig:
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
 
+@dataclass(frozen=True, slots=True)
+class _MemoryLimitState:
+    """Immutable bundle of memory-guard fields published by ProcessMemoryEnforcer.
+
+    The four fields form a logical group that the API hot-path
+    preflight check (``_preflight_memory_check_tokens``) must observe
+    consistently — guard True implies hard_limit > 0, the soft limit
+    matches the configured ceiling, and admission_paused tracks the
+    enforcer's pressure level. Bundling them into a single frozen
+    object lets the writer publish via a single reference store, which
+    is atomic regardless of Python memory model (CPython GIL today,
+    PEP 703 free-threading tomorrow).
+
+    The reader does ``state = self._memory_state`` once and accesses
+    fields off the local snapshot; it can never observe a mixed
+    (guard=True, hard_limit=0) combination that would slip a too-large
+    request past the rejection check.
+    """
+
+    memory_limit_bytes: int = 0
+    memory_hard_limit_bytes: int = 0
+    prefill_memory_guard: bool = False
+    admission_paused: bool = False
+
+
 @dataclass
 class SchedulerOutput:
     """
@@ -779,13 +804,28 @@ class Scheduler:
 
         # Memory limits for inline prefill checking.
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
-        self._memory_limit_bytes: int = 0  # soft limit
-        self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
-        self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
-        # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
-        # soft_threshold. Schedulers stop admitting new prefills while this is
-        # set; in-flight requests proceed.
-        self._admission_paused: bool = False
+        # Both limits are gated by ProcessMemoryEnforcer.max_bytes — the
+        # user-configured max_process_memory ceiling. The hard limit is
+        # the absolute reject/abort threshold (preflight + in-flight mid-
+        # prefill checks at ``_do_external_prefill`` / ``_step_prefill_chunk``
+        # both compare current_usage + peak against this value).
+        # Atomic-publication bundle for the four memory-guard fields.
+        # The properties below (``_memory_limit_bytes``,
+        # ``_memory_hard_limit_bytes``, ``_prefill_memory_guard``,
+        # ``_admission_paused``) all read from / write to this bundle,
+        # so the API-hot-path reader (``_preflight_memory_check``) can
+        # snapshot the (guard, hard_limit) pair via a single attribute
+        # load and never observe a partially-published combination —
+        # important under PEP 703 free-threading where per-attribute
+        # writes are no longer GIL-serialized into a coherent order
+        # from another thread's perspective.
+        #
+        # Published as a single reference store by
+        # ``ProcessMemoryEnforcer._propagate_memory_limit`` (the
+        # writer assigns ``scheduler._memory_state = new_state``
+        # directly and skips the per-field writes since the
+        # properties would just rebuild the same bundle).
+        self._memory_state: _MemoryLimitState = _MemoryLimitState()
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
         self._prefill_safe_zone_ratio: float = 0.80
@@ -859,7 +899,20 @@ class Scheduler:
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
-        self.memory_monitor: MemoryMonitor | None = None
+        # Prefill-peak estimator used by _preflight_memory_check. Only
+        # the estimator path is exercised here (it reads head_dim /
+        # num_attention_heads / num_kv_cache_layers populated by
+        # _set_model_info_for_monitor()). The other MemoryMonitor methods
+        # — estimate_blocks_to_free, _check_memory_pressure — are dormant
+        # in paged-SSD-only mode. ``eviction_enabled=False`` makes that
+        # explicit: any future caller that wires eviction back up will
+        # fail loudly here rather than silently using a placeholder
+        # max_kv_cache_memory.
+        self.memory_monitor: MemoryMonitor | None = MemoryMonitor(
+            max_kv_cache_memory=None,
+            eviction_enabled=False,
+        )
+        self._set_model_info_for_monitor()
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -997,6 +1050,72 @@ class Scheduler:
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+
+    # ------------------------------------------------------------------
+    # Memory-guard fields (backed by _memory_state bundle).
+    #
+    # The four properties below expose ``_memory_state`` as four
+    # individual attributes for backwards compat with the dozens of
+    # call sites and tests that read or set them by name. Setting any
+    # of them rebuilds the bundle via ``replace`` (frozen dataclass),
+    # so a single field assignment remains an atomic single-reference
+    # store of the new bundle.
+    #
+    # Production publication still goes through
+    # ``ProcessMemoryEnforcer._propagate_memory_limit`` which assigns
+    # the entire bundle in one ``scheduler._memory_state = new_state``
+    # — the property setters here are for ad-hoc field updates from
+    # tests and any future caller that needs to mutate one field.
+    # ------------------------------------------------------------------
+
+    def _current_memory_state(self) -> _MemoryLimitState:
+        """Return ``_memory_state`` or a fresh default. Property setters
+        invoked before ``__init__`` finishes (e.g. tests that build
+        Schedulers via ``__new__`` and then set fields one at a time)
+        would otherwise hit AttributeError on the first read of
+        ``_memory_state`` inside ``replace``.
+        """
+        return getattr(self, "_memory_state", _MemoryLimitState())
+
+    @property
+    def _memory_limit_bytes(self) -> int:
+        return self._current_memory_state().memory_limit_bytes
+
+    @_memory_limit_bytes.setter
+    def _memory_limit_bytes(self, value: int) -> None:
+        self._memory_state = replace(
+            self._current_memory_state(), memory_limit_bytes=int(value)
+        )
+
+    @property
+    def _memory_hard_limit_bytes(self) -> int:
+        return self._current_memory_state().memory_hard_limit_bytes
+
+    @_memory_hard_limit_bytes.setter
+    def _memory_hard_limit_bytes(self, value: int) -> None:
+        self._memory_state = replace(
+            self._current_memory_state(), memory_hard_limit_bytes=int(value)
+        )
+
+    @property
+    def _prefill_memory_guard(self) -> bool:
+        return self._current_memory_state().prefill_memory_guard
+
+    @_prefill_memory_guard.setter
+    def _prefill_memory_guard(self, value: bool) -> None:
+        self._memory_state = replace(
+            self._current_memory_state(), prefill_memory_guard=bool(value)
+        )
+
+    @property
+    def _admission_paused(self) -> bool:
+        return self._current_memory_state().admission_paused
+
+    @_admission_paused.setter
+    def _admission_paused(self, value: bool) -> None:
+        self._memory_state = replace(
+            self._current_memory_state(), admission_paused=bool(value)
+        )
 
     @contextmanager
     def _phase_timer(self, phase: str):
@@ -2452,19 +2571,7 @@ class Scheduler:
                 continue
             except RuntimeError as e:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
-                self._prefill_states.pop(rid, None)
-                self.requests.pop(rid, None)
-                get_prefill_tracker().remove(rid)
-                # Surface the failure to the engine. Without this, the
-                # request is silently dropped and the client hangs.
-                rejected.append(
-                    RequestOutput(
-                        request_id=rid,
-                        finished=True,
-                        finish_reason="error",
-                        error=str(e),
-                    )
-                )
+                self._fail_prefill_request(rid, e, rejected)
                 continue
 
             if not done:
@@ -4567,12 +4674,20 @@ class Scheduler:
         the full attention matrix [B, n_q, chunk, kv_len] in float32.
         For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
 
+        Reads the (guard, hard_limit) pair from ``_memory_state`` as a
+        single atomic snapshot — the API hot-path must never observe a
+        mixed (guard=True, hard_limit=0) combination, which would let a
+        too-large request slip past rejection. See ``_MemoryLimitState``
+        and ``ProcessMemoryEnforcer._propagate_memory_limit``.
+
         Returns:
             Error message string if request should be rejected, None if OK.
         """
-        if not self._prefill_memory_guard:
+        state = self._memory_state
+        if not state.prefill_memory_guard:
             return None
-        if self._memory_hard_limit_bytes <= 0:
+        hard_limit = state.memory_hard_limit_bytes
+        if hard_limit <= 0:
             return None
         if self.memory_monitor is None:
             return None
@@ -4585,20 +4700,20 @@ class Scheduler:
             return None
 
         peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
+            new_tokens, cached_tokens, self.config.prefill_step_size
         )
         if peak == 0:
             return None  # can't estimate, skip
 
         current = max(mx.get_active_memory(), get_phys_footprint())
 
-        if current + peak > self._memory_hard_limit_bytes:
+        if current + peak > hard_limit:
             from .utils.hardware import format_bytes
 
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
+                f"but limit is {format_bytes(hard_limit)}. "
                 f"Reduce context length or increase --max-process-memory."
             )
         return None
@@ -4770,7 +4885,20 @@ class Scheduler:
                     f"Request {request.request_id} rejected by prefill "
                     f"memory guard: {preflight_error}"
                 )
+                self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
+                # Best-effort metric — guarded by try so a missing
+                # server_metrics module (e.g. embedded scheduler tests
+                # constructing the scheduler without the FastAPI app)
+                # doesn't break the rejection path.
+                try:
+                    from .server_metrics import get_server_metrics
+
+                    get_server_metrics().record_preflight_rejection(
+                        "hard_limit"
+                    )
+                except Exception:
+                    pass
                 rejected_outputs.append(
                     RequestOutput(
                         request_id=request.request_id,
@@ -5034,26 +5162,14 @@ class Scheduler:
                     except _PrefillAbortedError:
                         raise
                     except RuntimeError as e:
-                        # Hard memory limit hit on the first chunk.
-                        # _step_prefill_chunk updates the PrefillProgressTracker
-                        # before the limit check, so without this catch the
-                        # tracker entry leaks and stays in the dashboard
-                        # forever (#1405). Mirrors the cleanup in
-                        # _advance_chunked_prefills (d736bfd).
                         logger.error(
-                            "Chunked prefill (first chunk) failed for %s: %s",
+                            "Chunked prefill (first chunk) failed for "
+                            "%s: %s",
                             request.request_id,
                             e,
                         )
-                        self.requests.pop(request.request_id, None)
-                        get_prefill_tracker().remove(request.request_id)
-                        rejected_outputs.append(
-                            RequestOutput(
-                                request_id=request.request_id,
-                                finished=True,
-                                finish_reason="error",
-                                error=str(e),
-                            )
+                        self._fail_prefill_request(
+                            request.request_id, e, rejected_outputs
                         )
                         continue
 
@@ -5083,25 +5199,16 @@ class Scheduler:
                         vlm_embeds=vlm_embeds,
                     )
                 except RuntimeError as e:
-                    # Hard memory limit hit during external prefill. Without
-                    # this catch, the exception bubbles up to step() and then
-                    # engine_core's fail_all_requests(), which pops
-                    # self.requests but cannot reach the PrefillProgressTracker
-                    # singleton, so the dashboard entry leaks across model
-                    # reload (#1405). Mirrors the cleanup in
-                    # _advance_chunked_prefills (d736bfd).
-                    logger.error("Prefill failed for %s: %s", request.request_id, e)
-                    self.uid_to_request_id.pop(temp_uid, None)
-                    self.request_id_to_uid.pop(request.request_id, None)
-                    self.requests.pop(request.request_id, None)
-                    get_prefill_tracker().remove(request.request_id)
-                    rejected_outputs.append(
-                        RequestOutput(
-                            request_id=request.request_id,
-                            finished=True,
-                            finish_reason="error",
-                            error=str(e),
-                        )
+                    logger.error(
+                        "Non-chunked prefill failed for %s: %s",
+                        request.request_id,
+                        e,
+                    )
+                    self._fail_prefill_request(
+                        request.request_id,
+                        e,
+                        rejected_outputs,
+                        temp_uid=temp_uid,
                     )
                     continue
 
@@ -5452,6 +5559,61 @@ class Scheduler:
             outputs.append(output)
 
         return outputs, finished_ids
+
+    def _fail_prefill_request(
+        self,
+        request_id: str,
+        error: BaseException,
+        rejected_outputs: list,
+        *,
+        temp_uid: int | None = None,
+    ) -> None:
+        """Tear down all per-request state for a prefill that raised
+        before insert, and append a rejected ``RequestOutput`` so the
+        engine surfaces the error to the consumer instead of silently
+        dropping the request.
+        """
+        self._prefill_states.pop(request_id, None)
+        if temp_uid is not None:
+            self.uid_to_request_id.pop(temp_uid, None)
+            self.request_id_to_uid.pop(request_id, None)
+        self._release_paged_cache_for_request(request_id)
+        self.requests.pop(request_id, None)
+        get_prefill_tracker().remove(request_id)
+        rejected_outputs.append(
+            RequestOutput(
+                request_id=request_id,
+                finished=True,
+                finish_reason="error",
+                error=str(error),
+            )
+        )
+
+    def _release_paged_cache_for_request(self, request_id: str) -> None:
+        """Drop a request's paged-cache footprint on the rejection paths.
+
+        ``add_request`` routes through ``block_aware_cache.fetch_cache``
+        which increments ref counts on every prefix-matched block and
+        creates a ``block_table`` in the paged cache. The normal
+        completion path releases that state in ``_cleanup_finished``;
+        the prefill-rejection paths must do the same or rejected
+        requests leak block refs (pinning the paged cache and
+        compounding the very memory pressure that triggered the
+        rejection) and orphan ``request_tables`` entries.
+
+        When SpecPrefill is configured, ``_try_specprefill_scoring``
+        also primes the draft prefix cache via its own ``fetch_cache``
+        which lives in an independent ``_request_tables`` and paged
+        block pool; release that too so the rejection symmetry holds
+        on both caches.
+        """
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.release_cache(request_id)
+        elif self.paged_cache_manager is not None:
+            self.paged_cache_manager.delete_block_table(request_id)
+        draft_cache = getattr(self, "_draft_prefix_cache", None)
+        if draft_cache is not None:
+            draft_cache.release_cache(request_id)
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
@@ -6229,6 +6391,26 @@ class Scheduler:
                 logger.debug("Could not extract model config for memory estimation")
                 return
 
+            # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+            # language-model dimensions under a sub-config. Prefer
+            # text_config / language_config / llm_config when ANY of them
+            # exposes the LM layer count, even if the top-level config also
+            # has one — on some VLM packs (older Gemma-3, certain Llava / HF
+            # auto-wrappers) the top-level field refers to the *vision
+            # encoder*, not the LM, and accepting it silently miscalibrates
+            # the SDPA-peak estimate by a constant factor. Probe both
+            # ``num_hidden_layers`` and the legacy ``n_layer`` alias so a
+            # GPT-style nested config is also picked up. Falls back to the
+            # top-level config only when no sub-config has either field.
+            for sub_attr in ("text_config", "language_config", "llm_config"):
+                sub = getattr(config, sub_attr, None)
+                if sub is not None and (
+                    getattr(sub, "num_hidden_layers", None)
+                    or getattr(sub, "n_layer", None)
+                ):
+                    config = sub
+                    break
+
             # Extract KV cache dimensions
             num_layers = getattr(config, "num_hidden_layers", None) or getattr(
                 config, "n_layer", None
@@ -6401,6 +6583,12 @@ class Scheduler:
         """
         if self.paged_cache_manager is None or self.memory_monitor is None:
             return 0
+        # Dormant in paged-SSD-only mode: the MemoryMonitor is constructed
+        # with eviction_enabled=False so estimate_blocks_to_free would
+        # raise. Return 0 cleanly until a future paged-SSD eviction path
+        # rewires real KV-cache budget into the monitor.
+        if not self.memory_monitor.eviction_enabled:
+            return 0
 
         # Estimate how many blocks to evict
         block_size = self.config.paged_cache_block_size
@@ -6453,6 +6641,9 @@ class Scheduler:
             return 0
 
         if self.memory_monitor is None:
+            return 0
+        if not self.memory_monitor.eviction_enabled:
+            # See _evict_blocks_permanently — dormant in paged-SSD-only mode.
             return 0
 
         # Estimate how many blocks to evict
