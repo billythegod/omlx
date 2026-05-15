@@ -2547,6 +2547,8 @@ def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
     protocol structure (thinking tags, channel markers, etc.) and patches
     the user's grammar into the output slot.
     """
+    from omlx._torch_stub import install as _install_torch_stub
+    _install_torch_stub()
     import xgrammar as xgr
 
     reasoning = not (
@@ -2609,16 +2611,19 @@ def _compile_grammar_for_request(
             from omlx.utils.install import get_install_method
 
             method = get_install_method()
-            if method == "dmg":
-                detail = (
-                    "Structured output is not available in the DMG version. "
-                    "xgrammar requires torch which significantly increases app size. "
-                    "Use the pip or Homebrew version for structured output support."
-                )
-            elif method == "homebrew":
+            if method == "homebrew":
                 detail = (
                     "Structured output requires xgrammar. "
                     "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            elif method == "dmg":
+                # DMG bundles xgrammar with a torch stub; reaching this
+                # branch means the bundled load failed (e.g. native binding
+                # incompatibility). Surface it instead of pointing users to
+                # a different install method.
+                detail = (
+                    "Structured output is unavailable: xgrammar failed to "
+                    "load in this build. Please report this issue."
                 )
             else:
                 detail = (

@@ -560,6 +560,11 @@ def build_venvstacks():
     # huggingface_hub) are already in the framework layer.
     _install_paroquant(EXPORT_DIR)
 
+    # Install xgrammar + apache-tvm-ffi --no-deps; oMLX uses the non-torch
+    # paths only, and _torch_stub.py satisfies xgrammar's import-time
+    # references to torch so the runtime torch dep is unnecessary.
+    _install_xgrammar(EXPORT_DIR)
+
     # Bundle spacy language model for Kokoro TTS.
     # misaki's en.G2P tries spacy.cli.download() at runtime, which fails in
     # the code-signed app bundle (read-only site-packages).
@@ -650,6 +655,110 @@ def _install_paroquant(export_dir: Path):
 
     shutil.rmtree(paro_wheels)
     print("  ✓ paroquant installed")
+
+
+# xgrammar / tvm-ffi versions — single source of truth lives in
+# omlx/_torch_stub.py (the stub MUST track the actually-installed versions
+# or imports fail). Importing keeps the two files from drifting apart.
+try:
+    from omlx._torch_stub import (
+        _TARGET_TVM_FFI_VERSIONS,
+        _TARGET_XGRAMMAR_VERSIONS,
+    )
+
+    _XGRAMMAR_VERSION = _TARGET_XGRAMMAR_VERSIONS[0]
+    _TVM_FFI_VERSION = _TARGET_TVM_FFI_VERSIONS[0]
+except Exception:  # pragma: no cover — build runs may not have omlx on path yet
+    _XGRAMMAR_VERSION = "0.2.0"
+    _TVM_FFI_VERSION = "0.1.11"
+
+
+def _install_xgrammar(export_dir: Path):
+    """Install xgrammar + apache-tvm-ffi --no-deps into framework site-packages.
+
+    xgrammar declares torch>=1.10.0 as a runtime dep, but oMLX only exercises
+    its non-torch paths (numpy bitmasks + MLX kernel). Shipping torch would
+    add ~500 MB to the bundle. omlx/_torch_stub.py satisfies xgrammar's
+    import-time torch references so the package loads without real torch.
+
+    Idempotent: a sentinel file is written after the last extract; if it's
+    present we skip. Trusting both ``xgrammar/`` and ``tvm_ffi/`` to exist
+    isn't enough — an interruption between the two extracts would otherwise
+    leave a half-installed state the next run accepts.
+    """
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    sentinel = fw_site / (
+        f"_omlx_xgrammar_{_XGRAMMAR_VERSION}_tvmffi_{_TVM_FFI_VERSION}.installed"
+    )
+    if sentinel.exists():
+        print("  ✓ xgrammar + apache-tvm-ffi already installed, skipping")
+        return
+
+    print("\n  Downloading xgrammar wheels...")
+    xgr_wheels = SCRIPT_DIR / "_xgrammar_wheels"
+    if xgr_wheels.exists():
+        shutil.rmtree(xgr_wheels)
+    xgr_wheels.mkdir()
+
+    # Explicit platform tags so the build host's Python version doesn't matter.
+    run_cmd([
+        sys.executable, "-m", "pip", "download",
+        "--no-deps", "--dest", str(xgr_wheels),
+        "--python-version", "3.11",
+        "--platform", "macosx_11_0_arm64",
+        "--only-binary=:all:",
+        f"xgrammar=={_XGRAMMAR_VERSION}",
+        f"apache-tvm-ffi=={_TVM_FFI_VERSION}",
+    ])
+
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+    for whl in xgr_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    shutil.rmtree(xgr_wheels)
+
+    # Integrity check before sentinel-write: zipfile.extractall is not
+    # atomic per file, so a build-host interrupt (SIGKILL, ENOSPC,
+    # inode exhaustion) mid-extract can leave truncated __init__.py
+    # files on disk. ``sentinel.exists()`` would still accept the next
+    # run, masking the partial install. Verify the package roots
+    # exist with non-empty __init__.py before writing the sentinel.
+    integrity_checks = (
+        ("xgrammar", fw_site / "xgrammar" / "__init__.py"),
+        ("tvm_ffi", fw_site / "tvm_ffi" / "__init__.py"),
+    )
+    for pkg_name, init_path in integrity_checks:
+        if not init_path.exists() or init_path.stat().st_size == 0:
+            print(
+                f"  ✗ {pkg_name} install incomplete ({init_path}); refusing "
+                "to write sentinel — next run will retry"
+            )
+            return
+
+    # Atomic sentinel write: write to a tmp file in the same directory
+    # then ``os.replace`` (POSIX-atomic on the same filesystem). A bare
+    # ``Path.write_text`` is open+write+close and can itself be interrupted
+    # mid-write, leaving a zero-length sentinel that ``sentinel.exists()``
+    # would still accept — exactly the failure mode this sentinel is
+    # supposed to guard against.
+    sentinel_tmp = sentinel.with_suffix(sentinel.suffix + ".tmp")
+    sentinel_tmp.write_text(
+        f"xgrammar=={_XGRAMMAR_VERSION}\napache-tvm-ffi=={_TVM_FFI_VERSION}\n"
+    )
+    os.replace(sentinel_tmp, sentinel)
+    print("  ✓ xgrammar + apache-tvm-ffi installed")
 
 
 # spacy language model — required by misaki (Kokoro TTS G2P)
@@ -747,6 +856,25 @@ def _strip_unused_packages(export_dir: Path):
             print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
 
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
+
+    # Post-strip invariant: no torch artifact must survive. A partial torch
+    # (some files but not enough for xgrammar) would be the worst possible
+    # outcome — _torch_stub.find_spec("torch") would return a real spec,
+    # install() would short-circuit, and xgrammar would import the broken
+    # half-torch and fail at runtime with confusing errors. Fail fast.
+    surviving_torch = [
+        p.name for p in fw_site.iterdir()
+        if p.name == "torch"
+        or p.name.startswith("torch-")
+        or p.name.startswith("torch_")
+    ]
+    if surviving_torch:
+        raise RuntimeError(
+            "Torch artifacts survived the strip step — refusing to build "
+            f"a half-torch bundle: {surviving_torch!r}. Either expand "
+            "_STRIP_PACKAGES / _STRIP_DIST_PREFIXES, or remove them from "
+            "the venvstacks export."
+        )
 
 
 def _create_c_launcher(macos_dir: Path, app_name: str):
@@ -1069,8 +1197,37 @@ def create_app_bundle():
     # Create placeholder icon
     create_placeholder_icon(resources_dir)
 
+    # Apache-2.0 attribution for bundled third-party components. NOTICE
+    # placement under Contents/Resources is conventional for macOS app
+    # bundles distributing third-party Apache-2.0 code.
+    _write_third_party_notices(resources_dir)
+
     print(f"  ✓ Created {app_dir}")
     return app_dir
+
+
+def _write_third_party_notices(resources_dir: Path) -> None:
+    """Write a NOTICE file listing bundled Apache-2.0 dependencies.
+
+    Apache-2.0 §4(d) requires that we propagate copyright notices and
+    distribute the license text alongside binary redistributions.
+    Bundling xgrammar / apache-tvm-ffi in the DMG is exactly such a
+    redistribution.
+    """
+    notice_text = (
+        "oMLX bundles the following third-party components under the\n"
+        "Apache License, Version 2.0. See https://www.apache.org/licenses/LICENSE-2.0\n"
+        "for the full license text.\n"
+        "\n"
+        f"  - xgrammar {_XGRAMMAR_VERSION} — https://github.com/mlc-ai/xgrammar\n"
+        f"  - apache-tvm-ffi {_TVM_FFI_VERSION} — https://github.com/apache/tvm-ffi\n"
+        "  - transformers — https://github.com/huggingface/transformers\n"
+        "  - mlx-vlm — https://github.com/Blaizzy/mlx-vlm\n"
+        "\n"
+        "Each component retains its original copyright. This NOTICE file\n"
+        "is provided alongside the bundle in compliance with Apache-2.0 §4.\n"
+    )
+    (resources_dir / "NOTICE-third-party.txt").write_text(notice_text)
 
 
 def _create_composite_svg(dark_svg: Path) -> str:
@@ -1339,6 +1496,10 @@ def main():
         elif not EXPORT_DIR.exists():
             print("Warning: No existing envs found, building venvstacks...")
             build_venvstacks()
+
+        # Idempotent post-export installs that must run even when reusing an
+        # existing _export/ via --skip-venv.
+        _install_xgrammar(EXPORT_DIR)
 
         # Swap mlx/mlx-metal wheels for target macOS version
         if args.macos_target:

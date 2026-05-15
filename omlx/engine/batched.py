@@ -149,10 +149,12 @@ class BatchedEngine(BaseEngine):
 
             method = get_install_method()
             if method == "dmg":
-                logger.info(
-                    "Structured output is not available in the DMG version "
-                    "(xgrammar requires torch which significantly increases app size). "
-                    "Use the pip or Homebrew version for structured output support."
+                logger.warning(
+                    "GrammarCompiler initialization failed for %s on the "
+                    "DMG build. The bundle ships xgrammar against a torch "
+                    "stub; this usually means the bundled xgrammar / tvm-"
+                    "ffi version drifted past what the stub covers.",
+                    self._model_name,
                 )
             elif method == "homebrew":
                 logger.info(
