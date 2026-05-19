@@ -16,6 +16,7 @@ from omlx.settings import (
     ClaudeCodeSettings,
     GlobalSettings,
     HuggingFaceSettings,
+    IntegrationSettings,
     LoggingSettings,
     MCPSettings,
     MemorySettings,
@@ -1703,6 +1704,104 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict(data)
         assert settings.mode == "cloud"
         assert settings.opus_model is None
+
+
+class TestIntegrationSettings:
+    """Tests for IntegrationSettings dataclass."""
+
+    def test_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.codex_model is None
+        assert settings.opencode_model is None
+        assert settings.openclaw_model is None
+        assert settings.hermes_model is None
+        assert settings.pi_model is None
+        assert settings.copilot_model is None
+        assert settings.openclaw_tools_profile == "coding"
+
+    def test_to_dict_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.to_dict() == {
+            "codex_model": None,
+            "opencode_model": None,
+            "openclaw_model": None,
+            "hermes_model": None,
+            "pi_model": None,
+            "copilot_model": None,
+            "openclaw_tools_profile": "coding",
+        }
+
+    def test_to_dict_custom(self):
+        settings = IntegrationSettings(
+            codex_model="qwen-coder-30b",
+            opencode_model="qwen-coder-7b",
+            openclaw_model="qwen-coder-3b",
+            hermes_model="hermes-3-8b",
+            pi_model="qwen-3-4b",
+            copilot_model="qwen-coder-1.5b",
+            openclaw_tools_profile="creative",
+        )
+        assert settings.to_dict() == {
+            "codex_model": "qwen-coder-30b",
+            "opencode_model": "qwen-coder-7b",
+            "openclaw_model": "qwen-coder-3b",
+            "hermes_model": "hermes-3-8b",
+            "pi_model": "qwen-3-4b",
+            "copilot_model": "qwen-coder-1.5b",
+            "openclaw_tools_profile": "creative",
+        }
+
+    def test_from_dict_full(self):
+        data = {
+            "codex_model": "a",
+            "opencode_model": "b",
+            "openclaw_model": "c",
+            "hermes_model": "d",
+            "pi_model": "e",
+            "copilot_model": "f",
+            "openclaw_tools_profile": "writing",
+        }
+        settings = IntegrationSettings.from_dict(data)
+        assert settings.codex_model == "a"
+        assert settings.opencode_model == "b"
+        assert settings.openclaw_model == "c"
+        assert settings.hermes_model == "d"
+        assert settings.pi_model == "e"
+        assert settings.copilot_model == "f"
+        assert settings.openclaw_tools_profile == "writing"
+
+    def test_from_dict_empty(self):
+        """Empty dict yields all defaults."""
+        settings = IntegrationSettings.from_dict({})
+        assert settings.codex_model is None
+        assert settings.pi_model is None
+        assert settings.openclaw_tools_profile == "coding"
+
+    def test_from_dict_partial(self):
+        """Missing keys fall back to dataclass defaults."""
+        settings = IntegrationSettings.from_dict({"pi_model": "qwen-3-4b"})
+        assert settings.pi_model == "qwen-3-4b"
+        assert settings.codex_model is None
+        assert settings.copilot_model is None
+        assert settings.openclaw_tools_profile == "coding"
+
+    def test_from_dict_explicit_null_overrides_default(self):
+        """Explicit None for a *_model field must be preserved."""
+        settings = IntegrationSettings.from_dict(
+            {"codex_model": None, "pi_model": "x"}
+        )
+        assert settings.codex_model is None
+        assert settings.pi_model == "x"
+
+    def test_round_trip(self):
+        """to_dict → from_dict → to_dict is identity."""
+        original = IntegrationSettings(
+            codex_model="m1",
+            pi_model="m2",
+            openclaw_tools_profile="custom",
+        )
+        round_tripped = IntegrationSettings.from_dict(original.to_dict())
+        assert round_tripped.to_dict() == original.to_dict()
 
 
 class TestClaudeCodeValidation:
