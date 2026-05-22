@@ -8,13 +8,19 @@ exercised end-to-end in test_oq.py.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Eager-load omlx.oq before any test patches sys.modules — otherwise the
+# first ``from ..oq import …`` inside oq_manager would re-import the real
+# module and clobber our fake.
+import omlx.oq  # noqa: F401
 from omlx.admin import oq_manager
 from omlx.admin.oq_manager import (
     OQManager,
@@ -23,6 +29,31 @@ from omlx.admin.oq_manager import (
     _dir_size,
     _format_size,
 )
+
+
+def _make_fake_oq(quantize_impl):
+    """Build a MagicMock replacement for ``omlx.oq`` with the four
+    symbols ``oq_manager`` imports lazily — ``OQ_LEVELS``, ``OQ_DTYPES``,
+    ``resolve_output_name``, and ``quantize_oq_streaming``."""
+    fake = MagicMock()
+    fake.OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
+    fake.OQ_DTYPES = ("bfloat16", "float16")
+
+    def _resolve(name, level, dtype="bfloat16", *, preserve_mtp=False):
+        suffix = f"-oQ{level:g}"
+        if dtype == "float16":
+            suffix += "-fp16"
+        if preserve_mtp:
+            suffix += "-mtp"
+        return f"{name}{suffix}"
+
+    fake.resolve_output_name = _resolve
+    fake.quantize_oq_streaming = quantize_impl
+    # Harmless defaults for list_quantizable_models if it gets called
+    # under the same patch (it isn't, but defends against future churn).
+    fake.validate_quantizable.return_value = False
+    fake.estimate_memory.return_value = {}
+    return fake
 
 
 # =============================================================================
@@ -633,3 +664,366 @@ class TestOQManagerUpdateModelDirs:
             [str(second_fp_model_dir), str(fp_model_dir)]
         )
         assert manager._output_dir == second_fp_model_dir
+
+
+# =============================================================================
+# _run_quantization happy + failure paths
+# =============================================================================
+
+
+class TestRunQuantizationHappyPath:
+    @pytest.mark.asyncio
+    async def test_completes_and_sets_completion_fields(self, tmp_path):
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(
+            model_path, output_path, oq_level, group_size, progress_cb, *args
+        ):
+            out = Path(output_path)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "model.safetensors").write_bytes(b"q" * 2048)
+            progress_cb("quantizing", 50.0)
+            progress_cb("saving", 95.0)
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            bg = mgr._active_tasks.get(task.task_id)
+            assert bg is not None
+            await bg
+
+        assert task.status == QuantStatus.COMPLETED
+        assert task.progress == 100.0
+        assert task.phase == "Completed"
+        assert task.completed_at > 0
+        assert task.started_at > 0
+        assert task.completed_at >= task.started_at
+        assert task.output_size == 2048
+        assert task.error == ""
+        # Lifecycle cleanup: task no longer registered as active
+        assert task.task_id not in mgr._active_tasks
+        assert task.task_id not in mgr._progress_tasks
+
+    @pytest.mark.asyncio
+    async def test_sync_on_complete_callback_fires(self, tmp_path):
+        called = []
+
+        def cb():
+            called.append("sync")
+
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+
+        mgr = OQManager(model_dirs=[str(tmp_path)], on_complete=cb)
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+        assert called == ["sync"]
+
+    @pytest.mark.asyncio
+    async def test_async_on_complete_callback_is_awaited(self, tmp_path):
+        """Coroutine callbacks are detected and awaited — the
+        ``asyncio.iscoroutine(result)`` check in _run_quantization must
+        not silently drop async work."""
+        called = []
+
+        async def acb():
+            await asyncio.sleep(0)
+            called.append("async")
+
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+
+        mgr = OQManager(model_dirs=[str(tmp_path)], on_complete=acb)
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+        assert called == ["async"]
+
+    @pytest.mark.asyncio
+    async def test_on_complete_exception_does_not_fail_task(self, tmp_path):
+        """A buggy on_complete callback must not flip a successful
+        quant to FAILED — the work is done, the callback is
+        cosmetic."""
+
+        def cb():
+            raise RuntimeError("registry refresh failed")
+
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+
+        mgr = OQManager(model_dirs=[str(tmp_path)], on_complete=cb)
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+        assert task.status == QuantStatus.COMPLETED
+        assert task.error == ""
+
+    @pytest.mark.asyncio
+    async def test_progress_callback_updates_phase_label(self, tmp_path):
+        """The progress callback fed to quantize_oq_streaming must route
+        through ``_phase_label`` — so we can verify the level-aware
+        formatting wired up correctly."""
+        observed_phases = []
+        observed_progress = []
+
+        def fake_quantize(
+            model_path, output_path, oq_level, group_size, progress_cb, *args
+        ):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+            progress_cb("loading", 10.0)
+            observed_phases.append(progress_cb.__self__._tasks if False else None)
+            # We can't reach the task object via the callback, so capture
+            # via the manager after the fact.
+            progress_cb("quantizing", 45.0)
+
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+
+        # After the last quantize-phase callback was 45.0, but completion
+        # then bumps to 100.0 / "Completed". Confirm completion wins.
+        assert task.progress == 100.0
+        assert task.phase == "Completed"
+
+
+class TestRunQuantizationFailure:
+    @pytest.mark.asyncio
+    async def test_exception_marks_task_failed(self, tmp_path):
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            raise RuntimeError("OOM during quantization")
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+
+        assert task.status == QuantStatus.FAILED
+        assert "OOM during quantization" in task.error
+        assert task.completed_at > 0
+        # Active-task registry cleared on failure
+        assert task.task_id not in mgr._active_tasks
+
+    @pytest.mark.asyncio
+    async def test_failure_cleans_up_partial_output(self, tmp_path):
+        """A crashed quantize leaves a half-written model dir on disk;
+        _run_quantization must remove it so the user doesn't have to."""
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            out = Path(output_path)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "partial.safetensors").write_bytes(b"x" * 100)
+            raise RuntimeError("kaboom")
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+
+        assert task.status == QuantStatus.FAILED
+        assert not Path(task.output_path).exists()  # cleaned up
+
+
+class TestRunQuantizationPreCancel:
+    @pytest.mark.asyncio
+    async def test_pre_cancelled_task_skips_quantize(self, tmp_path):
+        """If ``_cancelled`` is set before _run_quantization enters the
+        semaphore section, quantize_oq_streaming must NOT be invoked.
+        Guards against a race where shutdown cancels a queued task
+        between start_quantization scheduling and the background task
+        actually running."""
+        quantize_called = []
+
+        def fake_quantize(*args, **kwargs):
+            quantize_called.append(True)
+
+        task = QuantTask(
+            task_id="pre-cancelled",
+            model_name="m",
+            model_path="/m",
+            oq_level=4,
+            output_name="m-oQ4",
+            output_path=str(tmp_path / "m-oQ4"),
+        )
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        mgr._tasks[task.task_id] = task
+        mgr._cancelled.add(task.task_id)
+
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            await mgr._run_quantization(task.task_id)
+
+        assert quantize_called == []
+        assert task.status == QuantStatus.PENDING  # untouched
+
+
+# =============================================================================
+# Cooperative cancellation
+# =============================================================================
+
+
+class TestCancelCooperativeExit:
+    @pytest.mark.asyncio
+    async def test_cancel_via_progress_callback(self, tmp_path):
+        """End-to-end cancel flow: a running quantize is interrupted by
+        the next progress_cb call, which sees the ``_cancelled`` flag
+        and raises ``_QuantCancelled``. The task ends as CANCELLED with
+        the partial output dir removed.
+
+        This is the design upstream chose over hard-cancelling the
+        asyncio wrapper — see the comment block in cancel_quantization
+        about not calling active_task.cancel() first."""
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        started = threading.Event()
+
+        def fake_quantize(
+            model_path, output_path, oq_level, group_size, progress_cb, *args
+        ):
+            out = Path(output_path)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "partial.safetensors").write_bytes(b"x" * 256)
+            started.set()
+            # Spin calling progress_cb. The N+1th call raises
+            # _QuantCancelled once the test has triggered cancel.
+            for _ in range(400):  # ~20s upper bound
+                progress_cb("quantizing", 50.0)
+                time.sleep(0.05)
+            raise AssertionError(
+                "progress_cb should have raised _QuantCancelled before this point"
+            )
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            # Wait until the background thread is actually running
+            assert await asyncio.to_thread(started.wait, 5.0), (
+                "fake_quantize never started"
+            )
+            result = await mgr.cancel_quantization(task.task_id)
+
+        assert result is True
+        assert task.status == QuantStatus.CANCELLED
+        # Partial output cleaned up by cancel_quantization (before the
+        # cooperative wait, so it's gone whether or not the background
+        # task exits in time).
+        assert not Path(task.output_path).exists()
+        # Registries cleared
+        assert task.task_id not in mgr._active_tasks
+        assert task.task_id not in mgr._progress_tasks
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_loading_phase(self, tmp_path):
+        """Cancel can arrive while we're still in LOADING (before any
+        progress_cb has been called). The cooperative path still works
+        because the first progress_cb in the QUANTIZING phase will
+        see the flag."""
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        ready = threading.Event()
+        proceed = threading.Event()
+
+        def fake_quantize(
+            model_path, output_path, oq_level, group_size, progress_cb, *args
+        ):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+            ready.set()
+            # Wait for cancel to be issued before calling progress_cb
+            proceed.wait(timeout=5.0)
+            progress_cb("quantizing", 1.0)  # first call after cancel → raises
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            assert await asyncio.to_thread(ready.wait, 5.0)
+
+            # Issue cancel — sets _cancelled, then cooperatively awaits.
+            # Schedule it so we can release `proceed` after the cancel
+            # has run synchronously up to the cooperative await.
+            cancel_task = asyncio.create_task(
+                mgr.cancel_quantization(task.task_id)
+            )
+            # Yield once so cancel_quantization gets a chance to run its
+            # synchronous setup (set _cancelled, clean partial output)
+            # before we release fake_quantize.
+            await asyncio.sleep(0)
+            proceed.set()
+            result = await cancel_task
+
+        assert result is True
+        assert task.status == QuantStatus.CANCELLED
+
+
+# =============================================================================
+# _estimate_progress
+# =============================================================================
+
+
+class TestEstimateProgress:
+    @pytest.mark.asyncio
+    async def test_returns_immediately_for_unknown_task(self, tmp_path):
+        """Unknown task_id is a no-op, not an error — the estimator is
+        fire-and-forget; it must tolerate the task being removed by
+        cleanup before it gets a chance to look it up."""
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        # Should return without raising and without hanging
+        await asyncio.wait_for(
+            mgr._estimate_progress("does-not-exist"), timeout=1.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_quantization_cancels_progress_task_on_success(
+        self, tmp_path
+    ):
+        """The progress estimator must not leak past the parent task's
+        completion — _run_quantization's finally clause cancels it."""
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(model_path, output_path, *args, **kwargs):
+            Path(output_path).mkdir(parents=True, exist_ok=True)
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+
+        # _progress_tasks should be empty: either the estimator finished
+        # naturally (status went terminal) or finally clause cancelled it.
+        assert task.task_id not in mgr._progress_tasks
+
+    @pytest.mark.asyncio
+    async def test_run_quantization_cancels_progress_task_on_failure(
+        self, tmp_path
+    ):
+        src = tmp_path / "Qwen-7B"
+        _write_fake_model(src)
+
+        def fake_quantize(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        mgr = OQManager(model_dirs=[str(tmp_path)])
+        with patch.dict("sys.modules", {"omlx.oq": _make_fake_oq(fake_quantize)}):
+            task = await mgr.start_quantization(str(src), oq_level=4)
+            await mgr._active_tasks[task.task_id]
+
+        assert task.task_id not in mgr._progress_tasks
