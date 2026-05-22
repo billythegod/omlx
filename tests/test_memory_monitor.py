@@ -298,17 +298,17 @@ class TestEstimatePrefillPeakBytes:
 
     def test_returns_zero_when_model_info_missing(self):
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
-        assert m.estimate_prefill_peak_bytes(32768, 0, 2048) == 0
+        assert m.estimate_prefill_peak_bytes(32768, 2048) == 0
 
     def test_returns_zero_when_no_new_tokens(self):
         # Fully-prefix-cached request: nothing to prefill, peak is 0.
         m = self._make_monitor()
-        assert m.estimate_prefill_peak_bytes(0, 32768, 2048) == 0
+        assert m.estimate_prefill_peak_bytes(0, 2048, cached_tokens=32768) == 0
 
     def test_fused_kernel_below_head_dim_128(self):
         # head_dim<=128 → fused tiled kernel, SDPA peak is just output buffer
         m = self._make_monitor(head_dim=128, n_attn=32, n_kv=4, n_layers=62)
-        peak = m.estimate_prefill_peak_bytes(32768, 0, 2048)
+        peak = m.estimate_prefill_peak_bytes(32768, 2048)
         # KV: 62 layers * 4 kv_heads * 128 dim * 2 bytes * 2 (k+v) * 32768 ≈ 4.0 GB
         # SDPA fused: n_attn * chunk * head_dim * 4 = 32*2048*128*4 ≈ 32 MB
         # Total ≈ 4 GB
@@ -317,7 +317,7 @@ class TestEstimatePrefillPeakBytes:
     def test_fallback_path_above_head_dim_128(self):
         # head_dim>128 → full attention matrix materialized in float32
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
-        peak = m.estimate_prefill_peak_bytes(32768, 0, 2048)
+        peak = m.estimate_prefill_peak_bytes(32768, 2048)
         # SDPA fallback: n_attn * chunk * total_tokens * 4 = 8*2048*32768*4 = 2 GB
         # + output buffer 8*2048*256*4 ≈ 16 MB
         # KV: 48 * 4 * 256 * 2 * 2 * 32768 ≈ 6 GB
@@ -334,8 +334,10 @@ class TestEstimatePrefillPeakBytes:
         # Same total prompt (100k), different cache split:
         # - All-new: cached=0, new=100k
         # - Heavy cache: cached=99k, new=1k
-        all_new = m.estimate_prefill_peak_bytes(100 * 1024, 0, 2048)
-        heavy_cache = m.estimate_prefill_peak_bytes(1024, 99 * 1024, 2048)
+        all_new = m.estimate_prefill_peak_bytes(100 * 1024, 2048)
+        heavy_cache = m.estimate_prefill_peak_bytes(
+            1024, 2048, cached_tokens=99 * 1024
+        )
         # The heavy-cache case must still report a substantial SDPA peak:
         # n_attn * eff_chunk(=1024) * full_kv(=100k) * 4 bytes ≈ 3 GB.
         # The KV addition for 1k new tokens is small (~50 MB), so the
@@ -353,8 +355,8 @@ class TestEstimatePrefillPeakBytes:
 
     def test_scales_linearly_with_token_count(self):
         m = self._make_monitor()
-        p8k = m.estimate_prefill_peak_bytes(8 * 1024, 0, 2048)
-        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 0, 2048)
+        p8k = m.estimate_prefill_peak_bytes(8 * 1024, 2048)
+        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
         # KV grows linearly with tokens; SDPA fused doesn't depend on
         # total_tokens. KV dominates here, so 32k/8k ≈ 4x.
         assert p32k > p8k
@@ -366,8 +368,8 @@ class TestEstimatePrefillPeakBytes:
         # When chunk is fixed (2048), peak grows linearly with total_tokens
         # plus KV grows linearly too. Doubling tokens should ~double peak.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
-        p16k = m.estimate_prefill_peak_bytes(16 * 1024, 0, 2048)
-        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 0, 2048)
+        p16k = m.estimate_prefill_peak_bytes(16 * 1024, 2048)
+        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
         ratio = p32k / p16k
         assert 1.8 < ratio < 2.2
 
@@ -381,7 +383,7 @@ class TestEstimatePrefillPeakBytes:
         # 100-token prompt; chunk_size=2048. eff_chunk should be 100,
         # not 2048 — so SDPA scores ≈ 8 * 100 * 100 * 4 = 320 KB, not
         # 8 * 2048 * 100 * 4 = 6.5 MB.
-        peak = m.estimate_prefill_peak_bytes(100, 0, 2048)
+        peak = m.estimate_prefill_peak_bytes(100, 2048)
         # KV: 48*4*256*2*2*100 ≈ 19 MB. SDPA ≪ KV here. Total < 25 MB.
         assert peak < 25 * 1024**2, (
             f"short-prompt peak suggests chunk wasn't clamped: "
@@ -394,7 +396,7 @@ class TestEstimatePrefillPeakBytes:
         # If a small prompt returns >2 GB on a small model, that's a sign
         # someone added back the magic constants.
         m = self._make_monitor(head_dim=128, n_attn=8, n_kv=2, n_layers=8)
-        peak = m.estimate_prefill_peak_bytes(512, 0, 2048)
+        peak = m.estimate_prefill_peak_bytes(512, 2048)
         # KV: 8*2*128*2*2*512 ≈ 4 MB. SDPA fused: 8*512*128*4 ≈ 2 MB. Total ≈ 6 MB.
         assert peak < 100 * 1024**2, f"unexpected large peak: {peak / 1024**2:.1f} MB"
 

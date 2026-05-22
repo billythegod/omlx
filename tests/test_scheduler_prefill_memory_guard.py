@@ -80,7 +80,7 @@ def test_scheduler_init_populates_estimator_dims():
 def test_estimator_produces_nonzero_peak_after_init():
     scheduler = _make_scheduler()
     assert scheduler.memory_monitor is not None
-    peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(65536, 0, 2048)
+    peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(65536, 2048)
     assert peak > 0
 
 
@@ -228,7 +228,7 @@ def test_vlm_estimator_produces_nonzero_peak():
     assert scheduler.memory_monitor is not None
     # 90k tokens at head_dim=256 / n_q=16 should yield a multi-GiB peak via
     # the SDPA-fallback branch.
-    peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(90000, 0, 2048)
+    peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(90000, 2048)
     assert peak > 10 * 1024 * 1024 * 1024  # > 10 GiB
 
 

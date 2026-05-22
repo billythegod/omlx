@@ -387,7 +387,7 @@ class MemoryMonitor:
         return num_tokens * per_token
 
     def estimate_prefill_peak_bytes(
-        self, new_tokens: int, cached_tokens: int, chunk_size: int
+        self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
     ) -> int:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
@@ -426,13 +426,18 @@ class MemoryMonitor:
 
         Args:
             new_tokens: Tokens being prefilled this request (prompt minus
-                what the prefix cache already covers).
-            cached_tokens: Tokens served from prefix cache. Added to
-                ``new_tokens`` for the SDPA scores K-dim because those
-                positions still participate in attention.
+                what the prefix cache already covers). Drives newly
+                allocated KV and the last chunk's query length.
             chunk_size: Prefill step size (default 2048). Effective chunk
                 is ``min(chunk_size, new_tokens)`` since the last chunk
                 cannot be larger than the remaining new tokens.
+            cached_tokens: Tokens served from prefix cache. Added to
+                ``new_tokens`` for the SDPA scores K-dim because those
+                positions still participate in attention. Keyword-only with
+                a default of 0 so callers that don't know the cache state
+                still typecheck — but they get the under-counting behavior
+                this method was designed to fix, so always pass it when the
+                value is available.
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
