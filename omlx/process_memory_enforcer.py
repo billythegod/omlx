@@ -266,14 +266,6 @@ class ProcessMemoryEnforcer:
         propagated guard / hard limit, regressing the dead-guard bug
         this method exists to fix. The snapshot cost is one cheap copy
         of value references.
-
-        The four guard fields (``_memory_limit_bytes``,
-        ``_memory_hard_limit_bytes``, ``_prefill_memory_guard``,
-        ``_admission_paused``) are written as direct attributes. On
-        current CPython the GIL serializes the per-attribute STORE_ATTRs
-        within a single enforcer poll, so the hot-path reader
-        (``Scheduler._preflight_memory_check_tokens``) sees a coherent
-        (guard, hard_limit) pair.
         """
         hard_limit = self._get_hard_limit_bytes()
         admission_paused = self._pressure_level != "ok"
