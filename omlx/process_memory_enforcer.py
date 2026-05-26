@@ -142,24 +142,29 @@ class ProcessMemoryEnforcer:
 
     def _get_hard_limit_bytes(self) -> int:
         """Hard limit propagated to scheduler._memory_hard_limit_bytes for the
-        prefill peak check. Returns the user-configured max_bytes directly.
+        prefill peak check.
 
-        Previously this returned max(system_ram - 4GB, max_bytes) on the
-        assumption that the prefill peak is transient and the enforcer's
-        soft/hard watermarks (`_soft_bytes` / `_hard_bytes`) would catch any
-        actual OOM through LRU eviction. On head_dim>128 SDPA-fallback paths
-        (e.g. Qwen3.6-VL with head_dim=256) the peak is large enough that a
-        100k-token prefill bursts the user's max_bytes by ~10 GiB during the
-        last chunk and Metal aborts before eviction can recover — the
-        process exits with kIOGPUCommandBufferCallbackErrorOutOfMemory.
-        Tightening to max_bytes lets the scheduler reject upfront with a
-        clear message instead.
+        - User-explicit max (CLI/env/settings.json): the user value IS the
+          ceiling. They asked for this number to be respected, even on big
+          systems where ``system_ram - 4GB`` would otherwise win.
+        - Auto mode: ``system_ram - 4GB`` so the kernel keeps headroom for
+          itself and prefill gets room above the enforcer's soft/hard
+          watermarks. The adaptive prefill throttle
+          (``_prefill_safe_zone_ratio`` / ``_prefill_min_chunk_tokens``)
+          shrinks the per-chunk transient as we approach the cap, so the
+          head_dim>128 SDPA-fallback bursts that previously motivated
+          unconditional ``max_bytes`` are now bounded by the throttle
+          before they reach Metal.
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
         """
         if self._max_bytes <= 0:
             return 0
-        return self._max_bytes
+        if self._user_explicit_max:
+            return self._max_bytes
+        from .settings import get_system_memory
+
+        return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
 
     @property
     def _soft_bytes(self) -> int:

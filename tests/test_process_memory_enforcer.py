@@ -58,6 +58,10 @@ def enforcer(mock_engine_pool):
     Soft/hard thresholds set to 1.0 so legacy single-threshold tests keep
     treating max_bytes as the single trip point. Dedicated 2-watermark
     tests construct their own enforcer with default thresholds.
+
+    ``user_explicit_max=True`` pins ``_get_hard_limit_bytes()`` to
+    ``max_bytes`` so propagation tests can assert the exact value without
+    being entangled with the host's actual system memory.
     """
     return ProcessMemoryEnforcer(
         engine_pool=mock_engine_pool,
@@ -65,6 +69,7 @@ def enforcer(mock_engine_pool):
         poll_interval=0.1,
         soft_threshold=1.0,
         hard_threshold=1.0,
+        user_explicit_max=True,
     )
 
 
@@ -348,24 +353,6 @@ class TestPrefillMemoryGuardToggle:
 
 class TestHardLimitCalculation:
     """Tests for _get_hard_limit_bytes calculation."""
-
-    def test_hard_limit_equals_max_bytes(self, enforcer):
-        """Hard limit propagated to schedulers equals max_bytes — the user's
-        configured ceiling. Previously this returned max(system_ram-4GB,
-        max_bytes), which on a 48 GiB Mac16,8 with max_bytes=40 GiB gave a
-        ~44 GiB threshold and let Qwen3.6-VL head_dim=256 prefills (28 GiB
-        baseline + ~14 GiB SDPA peak ≈ 42 GiB) slip past the rejection check
-        before Metal aborted at kIOGPUCommandBufferCallbackErrorOutOfMemory
-        mid-chunk. The fix tightens the threshold so the user's configured
-        max_bytes is the actual ceiling for the prefill peak check.
-        """
-        enforcer._max_bytes = 10 * 1024**3
-        # system memory does not influence the returned value any more
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3
-            assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
-            mock_mem.return_value = 16 * 1024**3
-            assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
 
     def test_hard_limit_zero_when_disabled(self, mock_engine_pool):
         """Hard limit is 0 when max_bytes <= 0 (disabled)."""
