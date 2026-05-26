@@ -677,9 +677,12 @@ class TestMemorySettings:
         d = settings.to_dict()
         assert d == {
             "max_process_memory": "75%",
+            "max_process_memory_is_explicit": False,
             "prefill_memory_guard": True,
             "soft_threshold": 0.85,
             "hard_threshold": 0.95,
+            "prefill_safe_zone_ratio": 0.8,
+            "prefill_min_chunk_tokens": 32,
         }
 
     def test_to_dict_guard_disabled(self):
