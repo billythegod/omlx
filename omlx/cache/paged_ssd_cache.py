@@ -1187,6 +1187,25 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["hits"] += 1
                 return True
 
+        # Cold-store saturation short-circuit: when hot cache is disabled
+        # the write queue is the only buffer between save_block and the
+        # writer thread. If the writer is already saturated, dropping here
+        # avoids the GPU tensor-extraction + size-enforcement work we'd
+        # otherwise throw away at the put step a few hundred lines down.
+        # Inline-LRU-unlinks already let eviction free queue capacity;
+        # this guard handles the case where the writer (not eviction) is
+        # the bottleneck. In hot-cache mode the LRU spill path through
+        # _enqueue_ssd_write has its own timeout-put + drop accounting,
+        # so we don't short-circuit there.
+        if not self._hot_cache_enabled and self._write_queue.full():
+            self._stats["ssd_write_drops"] += 1
+            logger.warning(
+                f"SSD cache write queue saturated (cap={_MAX_PENDING_WRITES}); "
+                f"dropping save for {block_hash.hex()[:16]} before tensor "
+                f"extraction — writer is falling behind"
+            )
+            return False
+
         file_path = self._get_file_path(block_hash)
 
         try:
