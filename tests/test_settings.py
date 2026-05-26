@@ -1710,17 +1710,15 @@ class TestClaudeCodeSettings:
 
 
 class TestIntegrationSettings:
-    """Tests for IntegrationSettings dataclass."""
+    """Tests for IntegrationSettings dataclass.
 
-    def test_defaults(self):
-        settings = IntegrationSettings()
-        assert settings.codex_model is None
-        assert settings.opencode_model is None
-        assert settings.openclaw_model is None
-        assert settings.hermes_model is None
-        assert settings.pi_model is None
-        assert settings.copilot_model is None
-        assert settings.openclaw_tools_profile == "coding"
+    Upstream ``tests/test_integrations.py::TestIntegrationSettings`` already
+    covers defaults, basic to_dict, and full/empty from_dict. The tests
+    here are the additive coverage: exact dict-shape pinning (so a future
+    field addition that forgets to_dict raises a loud test failure — see
+    81dc2d5 for the MemorySettings case), partial-dict fallback,
+    explicit-null override semantics, and round-trip identity.
+    """
 
     def test_to_dict_defaults(self):
         settings = IntegrationSettings()
@@ -1753,32 +1751,6 @@ class TestIntegrationSettings:
             "copilot_model": "qwen-coder-1.5b",
             "openclaw_tools_profile": "creative",
         }
-
-    def test_from_dict_full(self):
-        data = {
-            "codex_model": "a",
-            "opencode_model": "b",
-            "openclaw_model": "c",
-            "hermes_model": "d",
-            "pi_model": "e",
-            "copilot_model": "f",
-            "openclaw_tools_profile": "writing",
-        }
-        settings = IntegrationSettings.from_dict(data)
-        assert settings.codex_model == "a"
-        assert settings.opencode_model == "b"
-        assert settings.openclaw_model == "c"
-        assert settings.hermes_model == "d"
-        assert settings.pi_model == "e"
-        assert settings.copilot_model == "f"
-        assert settings.openclaw_tools_profile == "writing"
-
-    def test_from_dict_empty(self):
-        """Empty dict yields all defaults."""
-        settings = IntegrationSettings.from_dict({})
-        assert settings.codex_model is None
-        assert settings.pi_model is None
-        assert settings.openclaw_tools_profile == "coding"
 
     def test_from_dict_partial(self):
         """Missing keys fall back to dataclass defaults."""
