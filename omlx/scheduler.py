@@ -4760,6 +4760,7 @@ class Scheduler:
                     f"Request {request.request_id} rejected by prefill "
                     f"memory guard: {preflight_error}"
                 )
+                self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
                 rejected_outputs.append(
                     RequestOutput(

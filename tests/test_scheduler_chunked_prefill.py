@@ -771,3 +771,30 @@ class TestPrefillRejectionReleasesPagedCache:
         sched.block_aware_cache.release_cache.assert_called_once_with(
             "oom-first-chunk"
         )
+
+    def test_schedule_waiting_preflight_rejection_releases(self):
+        """_preflight_memory_check rejection (the non-RuntimeError path
+        inside _schedule_waiting) must also release the paged-cache
+        footprint. Same leak shape as the RuntimeError rejections — the
+        request reached this point via add_request → fetch_cache so
+        _request_tables is populated and prefix block refs are held."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(5)))
+        req = _make_request("oom-preflight", n_tokens=5)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        with patch.object(
+            sched, "_preflight_memory_check",
+            return_value="Memory limit exceeded by preflight estimate",
+        ):
+            scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == "oom-preflight"
+        assert rejected[0].finish_reason == "error"
+        sched.block_aware_cache.release_cache.assert_called_once_with(
+            "oom-preflight"
+        )
