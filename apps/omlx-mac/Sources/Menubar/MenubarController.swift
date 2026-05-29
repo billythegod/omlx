@@ -34,6 +34,9 @@ final class MenubarController: NSObject {
     private let menu = NSMenu()
 
     private var statsPoller: MenubarStatsPoller?
+    /// Endpoint the live `statsPoller` was started against, so a runtime
+    /// host/port change can detect divergence and re-point the poller.
+    private var statsPollerBaseURL: URL?
     private var visibilityWatcher: MenubarVisibilityWatcher?
 
     // Strong refs to dynamic menu items so refreshMenuState() can edit
@@ -291,9 +294,10 @@ final class MenubarController: NSObject {
                 .systemBlue
             )
         case .running(let pid):
+            let port = MenubarController.displayPort(server: server, fallback: config.port)
             return (
                 String(localized: "menubar.header.running",
-                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(config.port))",
+                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(port))",
                        comment: "Menubar status header when the server is running; placeholders are PID and port (rendered as plain integers, no grouping)"),
                 .systemGreen
             )
@@ -395,9 +399,30 @@ final class MenubarController: NSObject {
 
     // MARK: - Pollers
 
+    /// Bind endpoint the stats poller should hit. Sourced from the live
+    /// `ServerProcess` (which `reconfigure(host:port:)` keeps current) so a
+    /// runtime port/host change re-points the poller, falling back to the
+    /// config snapshot only when there is no server. Mirrors the
+    /// `displayPort`/`displayHost` resolution used for the visible items.
+    private func liveBaseURL() -> URL? {
+        let host = MenubarController.displayHost(server: server, fallback: config.host)
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
+        return URL(string: "http://\(host):\(port)")
+    }
+
     private func startStatsPoller() {
-        guard let baseURL = config.baseURL,
+        guard let baseURL = liveBaseURL(),
               let key = config.apiKey, !key.isEmpty else { return }
+        // Tear down any existing poller (and its observer) first so a
+        // re-point doesn't leave a second instance polling the old endpoint.
+        if let existing = statsPoller {
+            existing.stop()
+            NotificationCenter.default.removeObserver(
+                self,
+                name: MenubarStatsPoller.didUpdateNotification,
+                object: existing
+            )
+        }
         let p = MenubarStatsPoller(baseURL: baseURL, apiKey: key)
         NotificationCenter.default.addObserver(
             self,
@@ -407,6 +432,18 @@ final class MenubarController: NSObject {
         )
         p.start()
         self.statsPoller = p
+        self.statsPollerBaseURL = baseURL
+    }
+
+    /// A port/host change via Server screen's Apply restarts the server on a
+    /// new bind, but the stats poller was created once at init with the old
+    /// baseURL and would keep polling the dead endpoint (stats freeze after
+    /// a port change). Re-point it when the live endpoint diverges from what
+    /// the poller currently targets.
+    private func refreshStatsPollerEndpoint() {
+        guard let want = liveBaseURL() else { return }
+        if statsPollerBaseURL == want { return }
+        startStatsPoller()
     }
 
     private func startVisibilityWatcher() {
@@ -432,6 +469,7 @@ final class MenubarController: NSObject {
     @objc private func serverStateChanged(_ note: Notification) {
         refreshMenuState()
         rebuildStatsSubmenu()
+        refreshStatsPollerEndpoint()
     }
 
     @objc private func statsDidUpdate(_ note: Notification) {
@@ -478,8 +516,9 @@ final class MenubarController: NSObject {
     private func presentPortConflictAlert(_ conflict: PortConflict) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
         alert.messageText = String(localized: "menubar.alert.port_in_use.title",
-                                   defaultValue: "Port \(String(config.port)) is in use.",
+                                   defaultValue: "Port \(String(port)) is in use.",
                                    comment: "Title of the port-conflict alert; placeholder is the port number (plain integer, no grouping)")
         let pidStr = conflict.pid.map {
             String(localized: "menubar.alert.pid_known",
@@ -493,7 +532,7 @@ final class MenubarController: NSObject {
                      defaultValue: "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
                      comment: "Port-conflict alert body when the conflicting process is another oMLX instance")
             : String(localized: "menubar.alert.port_in_use.other",
-                     defaultValue: "Another process (\(pidStr)) is listening on port \(String(config.port)). Choose a different port in Settings or terminate that process.",
+                     defaultValue: "Another process (\(pidStr)) is listening on port \(String(port)). Choose a different port in Settings or terminate that process.",
                      comment: "Port-conflict alert body when an unrelated process owns the port")
         alert.addButton(withTitle: String(localized: "menubar.alert.ok",
                                           defaultValue: "OK",
@@ -510,7 +549,9 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openChat() {
-        guard let url = URL(string: "http://\(config.host):\(config.port)/admin/chat") else { return }
+        let host = MenubarController.displayHost(server: server, fallback: config.host)
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
+        guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -557,6 +598,30 @@ final class MenubarController: NSObject {
     private func tps(_ value: Double?) -> String {
         guard let v = value else { return "—" }
         return String(format: "%.1f tok/s", v)
+    }
+}
+
+// MARK: - Live endpoint resolution
+
+extension MenubarController {
+    /// Source-of-truth port for any menubar item that renders the
+    /// current bind port (status header, port-conflict alert, Chat URL).
+    /// The running server is authoritative — `config` here is just the
+    /// snapshot we were constructed with and goes stale after the user
+    /// changes the port via Server screen's Apply, which calls
+    /// `server.reconfigure(port:)` and updates `AppServices.config` but
+    /// not the menubar's local `config` copy.
+    ///
+    /// Internal access (not private) so `MenubarControllerPortTests`
+    /// can exercise it without instantiating the full controller (which
+    /// requires a live `NSStatusBar`).
+    static func displayPort(server: ServerProcess?, fallback: Int) -> Int {
+        server?.port ?? fallback
+    }
+
+    /// Companion to `displayPort(server:fallback:)` — same rationale.
+    static func displayHost(server: ServerProcess?, fallback: String) -> String {
+        server?.host ?? fallback
     }
 }
 

@@ -4610,6 +4610,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    # Sort case-insensitively by name for a stable, user-friendly order.
+    models.sort(key=lambda m: m["name"].lower())
     return {"models": models}
 
 
