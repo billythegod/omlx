@@ -148,63 +148,60 @@ def _safe_sync_stream(stream=None):
 
 
 class _StoreCacheGate:
-    """Bounded gate that throttles store-cache submissions.
+    """Non-blocking counter that bounds in-flight store-cache submissions.
 
-    Caps how many KV caches can be alive in the post-completion store-cache
-    pipeline at once. _cleanup_finished acquires a slot before handing work
-    to _store_cache_executor; the future's done callback releases it.
+    Tracks how many KV caches are alive in the post-completion store-cache
+    pipeline. _cleanup_finished records each submission with note_submitted()
+    and the future's done callback clears it with note_done(); neither blocks
+    the generation step. Backpressure is applied at admission instead —
+    _schedule_waiting declines to admit new prefills while in_flight >= cap
+    (see has_capacity), so token generation never stalls waiting for an SSD
+    write (#1496).
 
-    cap is adjusted at runtime from ProcessMemoryEnforcer so the pipeline
-    shrinks under memory pressure on smaller systems (#1383).
+    cap still bounds the concurrent extracted-KV count, which is the OOM
+    guard for the burst-finish RAM growth reported in #1383. It is adjusted
+    at runtime from ProcessMemoryEnforcer so the pipeline shrinks under
+    memory pressure on smaller systems.
     """
 
     def __init__(self, cap: int) -> None:
         self._cap = max(1, cap)
         self._in_flight = 0
-        self._cond = threading.Condition()
-        self._shutdown = False
+        self._lock = threading.Lock()
 
-    def acquire(self) -> bool:
-        """Block until in_flight < cap. Returns False if shut down."""
-        with self._cond:
-            while not self._shutdown and self._in_flight >= self._cap:
-                self._cond.wait()
-            if self._shutdown:
-                return False
+    def note_submitted(self) -> None:
+        """Record a store-cache job handed to the executor (never blocks)."""
+        with self._lock:
             self._in_flight += 1
-            return True
 
-    def release(self) -> None:
-        with self._cond:
+    def note_done(self) -> None:
+        """Record a store-cache job finished (future done callback)."""
+        with self._lock:
             if self._in_flight > 0:
                 self._in_flight -= 1
-            self._cond.notify_all()
 
     def set_cap(self, cap: int) -> None:
-        with self._cond:
-            new_cap = max(1, cap)
-            if new_cap == self._cap:
-                return
-            grew = new_cap > self._cap
-            self._cap = new_cap
-            if grew:
-                self._cond.notify_all()
+        with self._lock:
+            self._cap = max(1, cap)
 
     @property
     def cap(self) -> int:
-        with self._cond:
+        with self._lock:
             return self._cap
 
     @property
     def in_flight(self) -> int:
-        with self._cond:
+        with self._lock:
             return self._in_flight
 
-    def shutdown(self) -> None:
-        """Wake all waiters and refuse further acquires."""
-        with self._cond:
-            self._shutdown = True
-            self._cond.notify_all()
+    @property
+    def has_capacity(self) -> bool:
+        """True when another submission would stay within cap.
+
+        Read by _schedule_waiting to decide whether to admit a new prefill.
+        """
+        with self._lock:
+            return self._in_flight < self._cap
 
 
 # Import tiered cache components
@@ -4631,6 +4628,25 @@ class Scheduler:
                 )
                 break
 
+            # Store-cache backpressure: when the post-completion pipeline is
+            # at its in-flight cap, defer admitting new prefills instead of
+            # blocking the generation step on the store-cache write (#1496).
+            # The cap bounds concurrent extracted-KV copies (the #1383 OOM
+            # guard) and shrinks under memory pressure via
+            # adjust_store_cache_cap. In-flight requests keep generating;
+            # the first request always passes (self.running is empty) so a
+            # lone slow SSD write cannot deadlock admission.
+            gate = self._store_cache_gate
+            if gate is not None and self.running and not gate.has_capacity:
+                logger.debug(
+                    "Admission deferred: store-cache pipeline full "
+                    "(in_flight=%d cap=%d), %d running",
+                    gate.in_flight,
+                    gate.cap,
+                    len(self.running),
+                )
+                break
+
             # Generation memory guard: when requests are already running,
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
@@ -5569,39 +5585,22 @@ class Scheduler:
                                         mx.async_eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
-                                # Gate acquire blocks if too many KV caches
-                                # are already alive in the post-completion
-                                # pipeline (#1383). Falls back to sync run
-                                # only when the gate is shut down (close).
+                                # Hand the store-cache write to the background
+                                # executor without ever blocking the generation
+                                # step. The gate only counts in-flight writes;
+                                # backpressure is applied at admission in
+                                # _schedule_waiting (in_flight >= cap defers new
+                                # prefills) so cache persistence never stalls
+                                # token generation (#1496). note_submitted is
+                                # called before submit so a fast worker whose
+                                # done callback fires immediately still
+                                # decrements a counted slot.
                                 gate = self._store_cache_gate
-                                acquired = gate.acquire() if gate is not None else True
-                                if acquired:
-                                    try:
-                                        store_future = self._store_cache_executor.submit(
-                                            self._async_store_cache_worker,
-                                            request_id,
-                                            token_sequence_to_store,
-                                            cache_to_store,
-                                            model_cache_config,
-                                            intermediate_snapshots,
-                                            request.vlm_extra_keys_for_cache,
-                                            request.vlm_extra_key_token_start_for_cache,
-                                            request.vlm_extra_key_ranges_for_cache,
-                                        )
-                                    except BaseException:
-                                        if gate is not None:
-                                            gate.release()
-                                        raise
-                                    if gate is not None:
-                                        store_future.add_done_callback(
-                                            lambda _f, g=gate: g.release()
-                                        )
-                                    self._inflight_store_futures[request_id] = store_future
-                                else:
-                                    # Gate is shutting down — run synchronously
-                                    # so the cache write still lands on disk
-                                    # before the process exits.
-                                    self._async_store_cache_worker(
+                                if gate is not None:
+                                    gate.note_submitted()
+                                try:
+                                    store_future = self._store_cache_executor.submit(
+                                        self._async_store_cache_worker,
                                         request_id,
                                         token_sequence_to_store,
                                         cache_to_store,
@@ -5611,6 +5610,15 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                     )
+                                except BaseException:
+                                    if gate is not None:
+                                        gate.note_done()
+                                    raise
+                                if gate is not None:
+                                    store_future.add_done_callback(
+                                        lambda _f, g=gate: g.note_done()
+                                    )
+                                self._inflight_store_futures[request_id] = store_future
                             else:
                                 # Executor unavailable — synchronous fallback.
                                 self._async_store_cache_worker(
@@ -6177,10 +6185,9 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
-        # Wake any step-thread caller currently blocked on the gate so the
-        # shutdown path can drain in-flight futures without deadlocking.
-        if self._store_cache_gate is not None:
-            self._store_cache_gate.shutdown()
+        # The store-cache gate is a non-blocking counter (#1496), so there is
+        # no step-thread caller to wake here. Inflight futures are drained
+        # below before the executor is joined.
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
