@@ -229,9 +229,7 @@ class TestExecuteMcpTool:
         ``tool`` alias for compatibility with some external MCP clients;
         without this test a future refactor could silently drop it.
         """
-        result = MCPToolResult(
-            tool_name="srv__add", content="ok", is_error=False
-        )
+        result = MCPToolResult(tool_name="srv__add", content="ok", is_error=False)
         mgr = MagicMock()
         mgr.execute_tool = AsyncMock(return_value=result)
         mcp_routes.set_mcp_manager_getter(lambda: mgr)

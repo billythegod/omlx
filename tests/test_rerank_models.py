@@ -56,9 +56,7 @@ class TestRerankRequest:
         assert req.documents[0]["image"].startswith("data:image/png")
 
     def test_top_n_accepts_int(self):
-        req = RerankRequest(
-            model="m", query="q", documents=["a", "b", "c"], top_n=2
-        )
+        req = RerankRequest(model="m", query="q", documents=["a", "b", "c"], top_n=2)
         assert req.top_n == 2
 
     def test_missing_model_rejected(self):

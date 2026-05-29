@@ -129,21 +129,17 @@ class TestValidateConfigServerLoading:
                 {"servers": {"fs": {"transport": "stdio", "command": "x", "bogus": 1}}}
             )
 
-    def test_claude_desktop_mcpServers_format_accepted(self):
+    def test_claude_desktop_mcpServers_format_accepted(self):  # noqa: N802
         """Upstream chose to accept Claude Desktop's ``mcpServers`` key
         as an alias for oMLX's ``servers``. Drop this and Claude users
         lose drop-in compatibility."""
         cfg = validate_config(
-            {
-                "mcpServers": {
-                    "claude-srv": {"transport": "stdio", "command": "npx"}
-                }
-            }
+            {"mcpServers": {"claude-srv": {"transport": "stdio", "command": "npx"}}}
         )
         assert "claude-srv" in cfg.servers
         assert cfg.servers["claude-srv"].command == "npx"
 
-    def test_servers_takes_precedence_over_mcpServers(self):
+    def test_servers_takes_precedence_over_mcpServers(self):  # noqa: N802
         """When both keys are present, ``servers`` wins — the ``or``
         operator in load returns the first truthy value. This isn't
         merging; it's an either/or."""
@@ -155,7 +151,7 @@ class TestValidateConfigServerLoading:
         )
         assert set(cfg.servers.keys()) == {"a"}
 
-    def test_empty_mcpServers_falls_through_to_servers(self):
+    def test_empty_mcpServers_falls_through_to_servers(self):  # noqa: N802
         """If ``servers`` is missing and ``mcpServers`` is empty, the
         result is an empty servers dict, not an error."""
         cfg = validate_config({"mcpServers": {}})
@@ -168,15 +164,21 @@ class TestValidateConfigGlobalOptions:
         assert cfg.max_tool_calls == 5
 
     def test_max_tool_calls_zero_rejected(self):
-        with pytest.raises(ValueError, match="'max_tool_calls' must be a positive integer"):
+        with pytest.raises(
+            ValueError, match="'max_tool_calls' must be a positive integer"
+        ):
             validate_config({"max_tool_calls": 0})
 
     def test_max_tool_calls_negative_rejected(self):
-        with pytest.raises(ValueError, match="'max_tool_calls' must be a positive integer"):
+        with pytest.raises(
+            ValueError, match="'max_tool_calls' must be a positive integer"
+        ):
             validate_config({"max_tool_calls": -1})
 
     def test_max_tool_calls_non_int_rejected(self):
-        with pytest.raises(ValueError, match="'max_tool_calls' must be a positive integer"):
+        with pytest.raises(
+            ValueError, match="'max_tool_calls' must be a positive integer"
+        ):
             validate_config({"max_tool_calls": 3.5})
 
     def test_max_tool_calls_bool_rejected_in_practice(self):
@@ -195,15 +197,21 @@ class TestValidateConfigGlobalOptions:
         assert cfg.default_timeout == 45.5
 
     def test_default_timeout_zero_rejected(self):
-        with pytest.raises(ValueError, match="'default_timeout' must be a positive number"):
+        with pytest.raises(
+            ValueError, match="'default_timeout' must be a positive number"
+        ):
             validate_config({"default_timeout": 0})
 
     def test_default_timeout_negative_rejected(self):
-        with pytest.raises(ValueError, match="'default_timeout' must be a positive number"):
+        with pytest.raises(
+            ValueError, match="'default_timeout' must be a positive number"
+        ):
             validate_config({"default_timeout": -1.0})
 
     def test_default_timeout_string_rejected(self):
-        with pytest.raises(ValueError, match="'default_timeout' must be a positive number"):
+        with pytest.raises(
+            ValueError, match="'default_timeout' must be a positive number"
+        ):
             validate_config({"default_timeout": "30s"})
 
 
@@ -242,7 +250,9 @@ class TestEnvVarPath:
         cfg = load_mcp_config()
         assert isinstance(cfg, MCPConfig)
 
-    def test_env_var_missing_file_falls_through(self, isolated_env, monkeypatch, caplog):
+    def test_env_var_missing_file_falls_through(
+        self, isolated_env, monkeypatch, caplog
+    ):
         """If OMLX_MCP_CONFIG points at a nonexistent file, the loader
         logs a warning but continues to the search-path fallback rather
         than aborting — broken env vars must not kill the server."""
@@ -332,9 +342,7 @@ class TestFileFormats:
     def test_yml_extension_also_treated_as_yaml(self, isolated_env):
         pytest.importorskip("yaml")
         cfg_path = isolated_env / "mcp.yml"
-        cfg_path.write_text(
-            "servers:\n  fs:\n    transport: stdio\n    command: x\n"
-        )
+        cfg_path.write_text("servers:\n  fs:\n    transport: stdio\n    command: x\n")
         cfg = load_mcp_config(cfg_path)
         assert "fs" in cfg.servers
 

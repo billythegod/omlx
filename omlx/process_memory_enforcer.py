@@ -336,15 +336,15 @@ class ProcessMemoryEnforcer:
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
-        # Engine types we've already complained about in
-        # _propagate_memory_limit's "scheduler unreachable" path. Prevents
-        # the per-poll warning from spamming logs while keeping the first
-        # occurrence loud enough to alert CI / oncall.
-        self._scheduler_resolve_warned: set[str] = set()
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
+        # Engine types we've already complained about in
+        # ``_propagate_memory_limit``'s "scheduler unreachable" path.
+        # Prevents the per-poll warning from spamming logs while keeping
+        # the first occurrence loud enough to alert CI / oncall.
+        self._scheduler_resolve_warned: set[str] = set()
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -553,51 +553,57 @@ class ProcessMemoryEnforcer:
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
     @staticmethod
-    def _resolve_scheduler(engine):
-        """Return the real Scheduler instance for an EnginePool entry.
+    def _resolve_scheduler(entry: Any) -> Any | None:
+        """Resolve the Scheduler instance from an EnginePool entry.
 
-        Both BatchedEngine and VLMBatchedEngine in the live engine pool
-        store the scheduler at ``self._engine.engine.scheduler`` (the outer
-        wrapper holds an AsyncEngineCore at ``_engine`` whose ``.engine``
-        is the EngineCore that actually owns the scheduler). Neither
-        exposes a top-level ``.scheduler`` attribute, so the previous
-        ``getattr(engine, "scheduler", None)`` always returned None for
-        real engines and the propagation silently no-op'd — including the
-        prefill memory guard flag, which meant the guard was dead at
-        runtime regardless of the user's setting. Test mocks set
-        ``.scheduler`` directly, so the wrapper-traversal fallback only
-        kicks in for real engines.
+        Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
+        as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
+        EngineCore → Scheduler). Some non-streaming engines may expose
+        ``entry.engine.scheduler`` directly. Returns None if neither
+        path resolves.
         """
-        sched = getattr(engine, "scheduler", None)
+        eng = entry.engine
+        if eng is None:
+            return None
+        sched = getattr(eng, "scheduler", None)
         if sched is not None:
             return sched
-        inner = getattr(engine, "_engine", None)
+        inner = getattr(eng, "_engine", None)
         if inner is None:
             return None
-        return getattr(getattr(inner, "engine", None), "scheduler", None)
+        inner_engine = getattr(inner, "engine", None)
+        if inner_engine is None:
+            return None
+        return getattr(inner_engine, "scheduler", None)
 
     def _propagate_memory_limit(self) -> None:
         """Propagate ceiling-derived watermarks to all schedulers.
 
         Called on every enforcer tick so the dynamic ceiling reaches the
-        schedulers as fast as the poll interval allows. Iterates a
-        ``list(values())`` snapshot so a future refactor that moves an
-        EnginePool mutator off the loop cannot silently miss an engine
-        and regress the dead-guard bug this method exists to fix.
+        schedulers as fast as the poll interval allows.
         """
         ceiling = self._get_hard_limit_bytes()
         soft_limit = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
         admission_paused = self._pressure_level != "ok"
-        for entry in list(self._engine_pool._entries.values()):
-            if entry.engine is None:
-                continue
-            scheduler = self._resolve_scheduler(entry.engine)
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
             if scheduler is None:
-                # Rate-limited per-engine-type so a wrapper-chain
-                # change is loud once instead of every poll. Silent
-                # no-op was the failure mode that originally hid the
-                # dead memory guard — surface it now.
-                engine_type = type(entry.engine).__name__
+                engine = getattr(entry, "engine", None)
+                if engine is None:
+                    # Discovered-but-not-loaded entry. There is no
+                    # scheduler to propagate to yet and that is normal,
+                    # not a wrapper break, so skip silently. Warning here
+                    # would fire on a routine startup before any model is
+                    # loaded and turn the signal into noise.
+                    continue
+                # Silent no-op was the failure mode that originally hid
+                # the dead memory guard: a wrapper-chain change made
+                # ``_resolve_scheduler()`` return None on a loaded engine
+                # and the loop kept iterating without complaining. Surface
+                # it now — once per engine type per enforcer lifetime so
+                # the regression is loud in CI / oncall but a misconfigured
+                # engine polled every second doesn't spam.
+                engine_type = type(engine).__name__
                 if engine_type not in self._scheduler_resolve_warned:
                     self._scheduler_resolve_warned.add(engine_type)
                     logger.warning(
@@ -629,10 +635,8 @@ class ProcessMemoryEnforcer:
         `_propagate_memory_limit` to avoid double-stepping the cap when
         a transition fires.
         """
-        for entry in list(self._engine_pool._entries.values()):
-            if entry.engine is None:
-                continue
-            scheduler = self._resolve_scheduler(entry.engine)
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
             if scheduler is None:
                 continue
             adjust = getattr(scheduler, "adjust_store_cache_cap", None)
@@ -711,6 +715,8 @@ class ProcessMemoryEnforcer:
             new_level = "hard"
 
         if new_level != prev_level:
+            self._pressure_level = new_level
+            self._propagate_memory_limit()
             logger.info(
                 f"Memory pressure level: {prev_level} -> {new_level} "
                 f"(current={_format_gb(current)}, "
@@ -719,16 +725,6 @@ class ProcessMemoryEnforcer:
             )
 
         if new_level == "ok":
-            # Reflect the recovery so admission unpauses and the dashboard
-            # status reads "ok" again. Without this, the eviction branch
-            # below is the only path that updates ``_pressure_level``, so a
-            # soft → ok transition leaves the level stuck at "soft". The
-            # re-propagation pushes ``admission_paused=False`` down to the
-            # schedulers — the call at the top of this method ran while
-            # ``_pressure_level`` was still the prior (soft / hard) value.
-            if new_level != prev_level:
-                self._pressure_level = "ok"
-                self._propagate_memory_limit()
             # Still walk the store-cache cap so it can recover toward
             # max_num_seqs while pressure stays low (#1383).
             self._walk_store_cache_caps()

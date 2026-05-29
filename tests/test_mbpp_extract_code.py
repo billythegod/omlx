@@ -43,7 +43,7 @@ Right:
 def f():
     return 42
 ```"""
-        assert _extract_code(response) == 'def f():\n    return 42'
+        assert _extract_code(response) == "def f():\n    return 42"
 
     def test_multiline_fenced_block(self):
         response = """```python
