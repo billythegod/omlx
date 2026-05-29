@@ -588,15 +588,22 @@ class ProcessMemoryEnforcer:
         for entry in self._engine_pool._entries.values():
             scheduler = self._resolve_scheduler(entry)
             if scheduler is None:
+                engine = getattr(entry, "engine", None)
+                if engine is None:
+                    # Discovered-but-not-loaded entry. There is no
+                    # scheduler to propagate to yet and that is normal,
+                    # not a wrapper break, so skip silently. Warning here
+                    # would fire on a routine startup before any model is
+                    # loaded and turn the signal into noise.
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
-                # ``_resolve_scheduler()`` return None and the loop kept
-                # iterating without complaining. Surface it now — once
-                # per engine type per enforcer lifetime so the regression
-                # is loud in CI / oncall but a misconfigured engine
-                # polled every second doesn't spam.
-                engine = getattr(entry, "engine", None)
-                engine_type = type(engine).__name__ if engine is not None else "None"
+                # ``_resolve_scheduler()`` return None on a loaded engine
+                # and the loop kept iterating without complaining. Surface
+                # it now — once per engine type per enforcer lifetime so
+                # the regression is loud in CI / oncall but a misconfigured
+                # engine polled every second doesn't spam.
+                engine_type = type(engine).__name__
                 if engine_type not in self._scheduler_resolve_warned:
                     self._scheduler_resolve_warned.add(engine_type)
                     logger.warning(

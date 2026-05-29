@@ -965,6 +965,28 @@ class TestUnresolvableSchedulerWarning:
         assert scheduler_b._memory_limit_bytes == 10 * 1024**3
         assert scheduler_b._prefill_memory_guard is True
 
+    def test_no_warning_for_unloaded_engine(self, enforcer, caplog):
+        """A discovered-but-unloaded entry (``engine is None``) is a normal
+        state, not a wrapper break, so it must not emit the warning. The
+        pool keeps these entries for every model it has discovered but not
+        yet loaded, so warning here would fire on a routine startup."""
+        entry = _make_entry("model-unloaded", engine=None)
+        enforcer._engine_pool._entries = {"model-unloaded": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == [], (
+            f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
+        )
+
 
 class TestStoreCacheCapWalk:
     """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""
