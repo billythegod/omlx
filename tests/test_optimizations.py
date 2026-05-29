@@ -18,6 +18,9 @@ from omlx.optimizations import (
     get_optimization_status,
     get_system_memory_gb,
 )
+from omlx.utils.hardware import HardwareInfo as CanonicalInfo
+from omlx.utils.hardware import detect_hardware as canonical_detect
+from omlx.utils.hardware import get_total_memory_gb
 
 
 class TestReExports:
@@ -25,17 +28,12 @@ class TestReExports:
         """The module's docstring promises these names. Removing one
         would silently break ``from omlx.optimizations import ...``
         used by external scripts."""
-        from omlx.utils.hardware import detect_hardware as canonical_detect
-        from omlx.utils.hardware import HardwareInfo as CanonicalInfo
-
         assert detect_hardware is canonical_detect
         assert HardwareInfo is CanonicalInfo
 
     def test_get_system_memory_gb_aliases_get_total_memory_gb(self):
         """The re-export renames ``get_total_memory_gb`` →
         ``get_system_memory_gb``. The alias must stay in place."""
-        from omlx.utils.hardware import get_total_memory_gb
-
         assert get_system_memory_gb is get_total_memory_gb
 
     def test_all_lists_documented_surface(self):
@@ -96,9 +94,7 @@ class TestGetOptimizationStatus:
         fake_fast = MagicMock(spec=[])  # spec=[] → no attributes
         with patch.object(mx, "fast", fake_fast):
             status = get_optimization_status()
-        assert (
-            status["mlx_lm_features"]["flash_attention"] == "not available"
-        )
+        assert status["mlx_lm_features"]["flash_attention"] == "not available"
 
     def test_active_bytes_reflects_real_mlx_state(self):
         """Verify the value isn't hardcoded — allocating an array

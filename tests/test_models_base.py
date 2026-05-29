@@ -50,10 +50,9 @@ class TestMeanPooling:
     def test_uniform_mask_averages_all_positions(self):
         """When every position is unmasked, mean pooling = simple mean."""
         # batch=1, seq=4, hidden=3
-        hs = mx.array([[[1.0, 2.0, 3.0],
-                        [2.0, 4.0, 6.0],
-                        [3.0, 6.0, 9.0],
-                        [4.0, 8.0, 12.0]]])
+        hs = mx.array(
+            [[[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [3.0, 6.0, 9.0], [4.0, 8.0, 12.0]]]
+        )
         mask = mx.array([[1.0, 1.0, 1.0, 1.0]])
         pooled = mean_pooling(hs, mask)
         # Mean across seq axis: (1+2+3+4)/4=2.5, (2+4+6+8)/4=5, (3+6+9+12)/4=7.5
@@ -67,10 +66,16 @@ class TestMeanPooling:
         """Padded positions (mask=0) must not contribute to the mean.
         This is the load-bearing invariant — pre-mask sums would let
         padding tokens corrupt the embedding for short inputs."""
-        hs = mx.array([[[1.0, 1.0],
-                        [2.0, 2.0],
-                        [99.0, 99.0],   # padded — must NOT be counted
-                        [99.0, 99.0]]])
+        hs = mx.array(
+            [
+                [
+                    [1.0, 1.0],
+                    [2.0, 2.0],
+                    [99.0, 99.0],  # padded — must NOT be counted
+                    [99.0, 99.0],
+                ]
+            ]
+        )
         mask = mx.array([[1.0, 1.0, 0.0, 0.0]])
         pooled = mean_pooling(hs, mask)
         # Only first two positions count: mean(1,2)=1.5
@@ -92,10 +97,12 @@ class TestMeanPooling:
     def test_batch_dimension_preserved(self):
         """Batch dim should pass through — each row pooled
         independently."""
-        hs = mx.array([
-            [[1.0, 0.0], [3.0, 0.0]],
-            [[2.0, 0.0], [4.0, 0.0]],
-        ])
+        hs = mx.array(
+            [
+                [[1.0, 0.0], [3.0, 0.0]],
+                [[2.0, 0.0], [4.0, 0.0]],
+            ]
+        )
         mask = mx.array([[1.0, 1.0], [1.0, 1.0]])
         pooled = mean_pooling(hs, mask)
         assert pooled.shape == (2, 2)
@@ -125,8 +132,7 @@ class TestNormalizeEmbeddings:
         """The ``axis=-1`` is load-bearing — normalizing across the
         wrong axis would silently destroy similarity comparisons. Test
         with shape (batch=2, hidden=3)."""
-        emb = mx.array([[1.0, 0.0, 0.0],
-                        [3.0, 4.0, 0.0]])
+        emb = mx.array([[1.0, 0.0, 0.0], [3.0, 4.0, 0.0]])
         out = normalize_embeddings(emb)
         # Row 0 was already unit length
         # Row 1 should become (3/5, 4/5, 0)
