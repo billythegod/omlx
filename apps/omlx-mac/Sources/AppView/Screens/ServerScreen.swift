@@ -778,10 +778,10 @@ final class ServerScreenVM: ObservableObject {
     /// Page-wide Apply. Validates every dirty Apply-managed field upfront
     /// (bail loudly on bad input — no partial patches), bundles the
     /// non-storage changes into a single `GlobalSettingsPatch`, then runs
-    /// the storage move flow if needed. Storage moves restart the server,
-    /// which picks up the new port from settings.json that we PATCHed
-    /// first — so we only invoke `applyServerEndpoint` for port-only
-    /// changes.
+    /// the storage move flow if needed. A bundled port change rides along
+    /// with the storage move's single restart (passed as `port:`); a
+    /// port-only change with no storage move goes through
+    /// `applyServerEndpoint` instead.
     func applyServerSettings(services: AppServices) {
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         var patch = GlobalSettingsPatch()
@@ -899,9 +899,14 @@ final class ServerScreenVM: ObservableObject {
                     _ = try await client.updateGlobalSettings(patch)
                 }
                 if diff.hasChanges {
+                    // Hand the bundled port to the storage flow so its single
+                    // restart binds the new port. Without this the restart
+                    // reuses the cached --port args and silently keeps the old
+                    // port even though we just PATCHed the new one.
                     try await services.applyStorageChanges(
                         basePath: diff.baseChanged ? diff.normalizedBase : nil,
-                        modelDir: diff.dirChanged ? diff.normalizedModelDir : nil
+                        modelDir: diff.dirChanged ? diff.normalizedModelDir : nil,
+                        port: nextPort
                     )
                     self.basePathText = services.config.basePath
                     self.modelDirText = services.config.modelDir
