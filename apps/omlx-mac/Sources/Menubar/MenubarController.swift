@@ -34,6 +34,9 @@ final class MenubarController: NSObject {
     private let menu = NSMenu()
 
     private var statsPoller: MenubarStatsPoller?
+    /// Endpoint the live `statsPoller` was started against, so a runtime
+    /// host/port change can detect divergence and re-point the poller.
+    private var statsPollerBaseURL: URL?
     private var visibilityWatcher: MenubarVisibilityWatcher?
 
     // Strong refs to dynamic menu items so refreshMenuState() can edit
@@ -396,9 +399,30 @@ final class MenubarController: NSObject {
 
     // MARK: - Pollers
 
+    /// Bind endpoint the stats poller should hit. Sourced from the live
+    /// `ServerProcess` (which `reconfigure(host:port:)` keeps current) so a
+    /// runtime port/host change re-points the poller, falling back to the
+    /// config snapshot only when there is no server. Mirrors the
+    /// `displayPort`/`displayHost` resolution used for the visible items.
+    private func liveBaseURL() -> URL? {
+        let host = MenubarController.displayHost(server: server, fallback: config.host)
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
+        return URL(string: "http://\(host):\(port)")
+    }
+
     private func startStatsPoller() {
-        guard let baseURL = config.baseURL,
+        guard let baseURL = liveBaseURL(),
               let key = config.apiKey, !key.isEmpty else { return }
+        // Tear down any existing poller (and its observer) first so a
+        // re-point doesn't leave a second instance polling the old endpoint.
+        if let existing = statsPoller {
+            existing.stop()
+            NotificationCenter.default.removeObserver(
+                self,
+                name: MenubarStatsPoller.didUpdateNotification,
+                object: existing
+            )
+        }
         let p = MenubarStatsPoller(baseURL: baseURL, apiKey: key)
         NotificationCenter.default.addObserver(
             self,
@@ -408,6 +432,18 @@ final class MenubarController: NSObject {
         )
         p.start()
         self.statsPoller = p
+        self.statsPollerBaseURL = baseURL
+    }
+
+    /// A port/host change via Server screen's Apply restarts the server on a
+    /// new bind, but the stats poller was created once at init with the old
+    /// baseURL and would keep polling the dead endpoint (stats freeze after
+    /// a port change). Re-point it when the live endpoint diverges from what
+    /// the poller currently targets.
+    private func refreshStatsPollerEndpoint() {
+        guard let want = liveBaseURL() else { return }
+        if statsPollerBaseURL == want { return }
+        startStatsPoller()
     }
 
     private func startVisibilityWatcher() {
@@ -433,6 +469,7 @@ final class MenubarController: NSObject {
     @objc private func serverStateChanged(_ note: Notification) {
         refreshMenuState()
         rebuildStatsSubmenu()
+        refreshStatsPollerEndpoint()
     }
 
     @objc private func statsDidUpdate(_ note: Notification) {
