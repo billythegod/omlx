@@ -24,6 +24,7 @@ class ContentBlockText(BaseModel):
 
     type: Literal["text"] = "text"
     text: str
+    cache_control: dict[str, str] | None = None
 
 
 class ContentBlockImage(BaseModel):
@@ -49,6 +50,7 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: str | list[dict[str, Any]] | dict[str, Any] | list[Any] | Any
     is_error: bool | None = None
+    cache_control: dict[str, str] | None = None
 
 
 class ContentBlockThinking(BaseModel):

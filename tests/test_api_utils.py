@@ -1575,6 +1575,22 @@ class TestRequestHasCacheControl:
         req = self._req(messages=[AnthropicMessage(role="user", content=[doc])])
         assert request_has_cache_control(req) is True
 
+    def test_text_block_with_cache_control(self):
+        """A cache_control breakpoint set purely on a message text block must
+        be detected, even when system / tools carry no breakpoint (#1487)."""
+        block = ContentBlockText(text="big prefix", cache_control={"type": "ephemeral"})
+        req = self._req(messages=[AnthropicMessage(role="user", content=[block])])
+        assert request_has_cache_control(req) is True
+
+    def test_tool_result_block_with_cache_control(self):
+        block = ContentBlockToolResult(
+            tool_use_id="tu_1",
+            content="result",
+            cache_control={"type": "ephemeral"},
+        )
+        req = self._req(messages=[AnthropicMessage(role="user", content=[block])])
+        assert request_has_cache_control(req) is True
+
     def test_string_content_message_never_signals(self):
         """Plain-string message content can't carry cache_control."""
         req = self._req(messages=[AnthropicMessage(role="user", content="just text")])
