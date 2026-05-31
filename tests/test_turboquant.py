@@ -137,6 +137,28 @@ def test_batch_tq_merge_extract():
     assert e2.offset == 4
 
 
+def test_batch_tq_merge_preserves_empty_rows():
+    """Regression: mixed empty/non-empty rows must keep the batch dimension."""
+    full = TurboQuantKVCache(bits=4.0)
+    full.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    mx.eval(full.keys, full.values)
+
+    for caches, expected_padding, expected_offsets in (
+        ([TurboQuantKVCache(bits=4.0), full], [4, 0], [0, 4]),
+        ([full, TurboQuantKVCache(bits=4.0)], [0, 4], [4, 0]),
+    ):
+        batch = BatchTurboQuantKVCache.merge(caches)
+        assert batch.left_padding.tolist() == expected_padding
+        assert batch.offset.tolist() == expected_offsets
+        assert batch.keys.norms.shape[0] == 2
+
+        batch.update_and_fetch(
+            mx.random.normal((2, 2, 1, 32)), mx.random.normal((2, 2, 1, 32))
+        )
+
+
 def test_batch_tq_continuous_batching_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
     b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))

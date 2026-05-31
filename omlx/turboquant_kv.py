@@ -373,9 +373,27 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
         key_states = []
         value_states = []
+        reference_key_state = None
+        reference_value_state = None
+        for c in caches:
+            ks, vs = c.state
+            if ks is not None:
+                reference_key_state = (
+                    ks._state if isinstance(ks, _QuantizedStateProxy) else ks
+                )
+                reference_value_state = (
+                    vs._state if isinstance(vs, _QuantizedStateProxy) else vs
+                )
+                break
+
         for p, c in zip(padding, caches):
             ks, vs = c.state
             if ks is None:
+                if max_length > 0 and reference_key_state is not None:
+                    key_states.append(_allocate_state_like(reference_key_state, max_length))
+                    value_states.append(
+                        _allocate_state_like(reference_value_state, max_length)
+                    )
                 continue
             ks = ks._state if isinstance(ks, _QuantizedStateProxy) else ks
             vs = vs._state if isinstance(vs, _QuantizedStateProxy) else vs
