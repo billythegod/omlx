@@ -287,9 +287,9 @@ class ProcessMemoryEnforcer:
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
-        soft_threshold: float = 0.85,
+        soft_threshold: float = 0.90,
         hard_threshold: float = 0.95,
-        prefill_safe_zone_ratio: float = 0.80,
+        prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 32,
     ):
         """
