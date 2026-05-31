@@ -159,6 +159,40 @@ def test_batch_tq_merge_preserves_empty_rows():
         )
 
 
+def test_batch_tq_extend_preserves_empty_rows():
+    """Regression: extend() can mix initialized and empty batch rows."""
+    def full_batch():
+        full = BatchTurboQuantKVCache.merge([TurboQuantKVCache(bits=4.0)])
+        full.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+        )
+        mx.eval(full.keys, full.values)
+        return full
+
+    for left, right, expected_padding, expected_offsets in (
+        (
+            BatchTurboQuantKVCache([0], bits=4.0),
+            full_batch(),
+            [4, 0],
+            [0, 4],
+        ),
+        (
+            full_batch(),
+            BatchTurboQuantKVCache([0], bits=4.0),
+            [0, 4],
+            [4, 0],
+        ),
+    ):
+        left.extend(right)
+        assert left.left_padding.tolist() == expected_padding
+        assert left.offset.tolist() == expected_offsets
+        assert left.keys.norms.shape[0] == 2
+
+        left.update_and_fetch(
+            mx.random.normal((2, 2, 1, 32)), mx.random.normal((2, 2, 1, 32))
+        )
+
+
 def test_batch_tq_continuous_batching_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
     b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))

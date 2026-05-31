@@ -173,6 +173,16 @@ def _pad_state_left(state, pad_length: int):
     return _concat_state(pad, state)
 
 
+def _empty_state_batch_like(state, batch_size: int):
+    """Allocate an empty token state with the requested batch size."""
+    if state is None:
+        return None
+    row = _filter_state(_allocate_state_like(state, 0), slice(0, 1))
+    if batch_size == 1:
+        return row
+    return _concat_state_batch([row] * batch_size)
+
+
 # ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
@@ -308,10 +318,21 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         s_idx = _state_length(self.keys) if self.keys is not None else 0
         o_idx = _state_length(other.keys) if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
+        ref_keys = self.keys if self.keys is not None else other.keys
+        ref_values = self.values if self.values is not None else other.values
 
         def _pad_and_trim(c, idx):
-            ks = _slice_state(c.keys, idx) if c.keys is not None else None
-            vs = _slice_state(c.values, idx) if c.values is not None else None
+            batch_size = int(c.offset.shape[0])
+            if c.keys is None:
+                if max_idx > 0 and ref_keys is not None:
+                    ks = _empty_state_batch_like(ref_keys, batch_size)
+                    vs = _empty_state_batch_like(ref_values, batch_size)
+                else:
+                    ks = None
+                    vs = None
+            else:
+                ks = _slice_state(c.keys, idx)
+                vs = _slice_state(c.values, idx)
             left = max_idx - idx
             if left > 0 and ks is not None:
                 ks = _pad_state_left(ks, left)
