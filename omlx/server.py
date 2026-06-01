@@ -1758,6 +1758,8 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
             ms = _server_state.settings_manager.get_settings(model_id)
+            if ms and ms.model_alias:
+                m["model_alias"] = ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         m["max_tokens"] = max_tokens
