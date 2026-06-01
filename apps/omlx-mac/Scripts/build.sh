@@ -33,6 +33,7 @@
 #   apps/omlx-mac/Scripts/build.sh debug              # Debug build instead
 #   apps/omlx-mac/Scripts/build.sh swift              # rebuild Swift app only; reuse existing _export/
 #   apps/omlx-mac/Scripts/build.sh swift debug        # Debug Swift app rebuild; reuse existing _export/
+#   apps/omlx-mac/Scripts/build.sh swift-fast         # like swift, but skip embedded native signing
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
@@ -51,10 +52,18 @@
 set -euo pipefail
 
 SWIFT_REBUILD=0
-if [ "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" = "swift" ]; then
-    SWIFT_REBUILD=1
-    shift
-fi
+SKIP_EMBEDDED_SIGN=0
+case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    swift)
+        SWIFT_REBUILD=1
+        shift
+        ;;
+    swift-fast)
+        SWIFT_REBUILD=1
+        SKIP_EMBEDDED_SIGN=1
+        shift
+        ;;
+esac
 
 CONFIG=Release
 if [ $# -gt 0 ]; then
@@ -63,7 +72,7 @@ if [ $# -gt 0 ]; then
         release) CONFIG=Release; shift ;;
         --*) ;;
         *)
-            echo "error: unknown configuration '$1' (expected swift|debug|release)" >&2
+            echo "error: unknown configuration '$1' (expected swift|swift-fast|debug|release)" >&2
             exit 2
             ;;
     esac
@@ -123,13 +132,21 @@ _sign_embedded_mach_o_files() {
     local count=0
 
     while IFS= read -r -d '' path; do
-        case "$path" in
-            *.dSYM/*) continue ;;
-        esac
         _is_mach_o_file "$path" || continue
         codesign --force --sign - "$path" >/dev/null 2>&1
         count=$((count + 1))
-    done < <(find "$root" -type f -print0)
+    done < <(
+        find "$root" \
+            \( -path "*/.dSYM/*" -o -path "*/__pycache__/*" \) -prune -o \
+            -type f \( \
+                -name "*.so" -o \
+                -name "*.dylib" -o \
+                -name "*.bundle" -o \
+                -perm -100 -o \
+                -perm -010 -o \
+                -perm -001 \
+            \) -print0
+    )
 
     ok "  + signed $count embedded Mach-O files"
 }
@@ -406,8 +423,12 @@ fi
 # libraries first, then seal the outer app bundle so TCC can match Full Disk
 # Access grants against the app identity instead of a bare linker signature.
 
-log "Ad-hoc signing embedded native code…"
-_sign_embedded_mach_o_files "$PYTHON_DIR"
+if [ "$SKIP_EMBEDDED_SIGN" -eq 1 ]; then
+    warn "swift-fast set: skipping embedded native code signing."
+else
+    log "Ad-hoc signing embedded native code…"
+    _sign_embedded_mach_o_files "$PYTHON_DIR"
+fi
 
 log "Ad-hoc resigning app bundle…"
 codesign --force --sign - "$STAGED_APP"
