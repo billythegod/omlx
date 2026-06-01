@@ -1,7 +1,6 @@
 // WelcomeViewModel drives the first-run wizard. The interesting behaviors
 // are validation gates (storage + api-key) feeding `lastError`, the
-// intro → setup → complete state, and `skipSnapshot()` which persists
-// Storage values without an unvalidated API key on early close.
+// intro → setup → complete state, and the Start Server validation path.
 
 import XCTest
 @testable import oMLX
@@ -10,8 +9,7 @@ import XCTest
 final class WelcomeViewModelTests: XCTestCase {
 
     // AppServices uses a weak reference to its services on WelcomeViewModel,
-    // so the test must keep a strong reference for the lifetime of each case
-    // — otherwise skipSnapshot() short-circuits to AppConfig.default.
+    // so the test must keep a strong reference for the lifetime of each case.
     private var services: AppServices!
 
     private func makeVM(basePath: String = "/Users/Fido/.omlx",
@@ -105,53 +103,5 @@ final class WelcomeViewModelTests: XCTestCase {
         vm.apiKey = "abcd\u{007F}"   // DEL char, outside printable ASCII
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "API key must contain only printable ASCII.")
-    }
-
-    // MARK: - skipSnapshot
-
-    func testSkipSnapshotPreservesStorageOnValidInputs() {
-        let vm = makeVM()
-        vm.basePath = "/tmp/custom-base"
-        vm.modelDir = "/tmp/custom-models"
-        vm.portText = "9090"
-
-        let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.basePath, "/tmp/custom-base")
-        XCTAssertEqual(snapshot.modelDir, "/tmp/custom-models")
-        XCTAssertEqual(snapshot.port,     9090)
-    }
-
-    func testSkipSnapshotDropsUnvalidatedApiKey() {
-        let vm = makeVM(apiKey: "previously-saved")
-        vm.apiKey = "ab"               // too short
-        let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.apiKey, "",
-                       "An invalid in-progress key should be dropped on skip, " +
-                       "not persisted over the saved value.")
-    }
-
-    func testSkipSnapshotKeepsValidatedApiKey() {
-        let vm = makeVM()
-        vm.apiKey = "secret-key"
-        let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.apiKey, "secret-key",
-                       "A fully-validated key should make it into the snapshot.")
-    }
-
-    func testSkipSnapshotDefaultsModelDirToBaseWhenBlank() {
-        let vm = makeVM(basePath: "/tmp/custom-base",
-                        modelDir: "/tmp/custom-models")
-        vm.modelDir = ""    // user hit Reset
-        let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.modelDir,
-                       AppConfig.defaultModelDir(forBasePath: snapshot.basePath))
-    }
-
-    func testSkipSnapshotIgnoresInvalidPort() {
-        let vm = makeVM(port: 8000)
-        vm.portText = "999999"   // out of range
-        let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.port, 8000,
-                       "Out-of-range port text should leave the existing port intact.")
     }
 }
