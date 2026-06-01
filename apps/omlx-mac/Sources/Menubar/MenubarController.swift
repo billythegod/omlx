@@ -313,7 +313,7 @@ final class MenubarController: NSObject {
             let port = MenubarController.displayPort(server: server, fallback: config.port)
             return (
                 String(localized: "menubar.header.running",
-                       defaultValue: "Server: running · :\(String(port))",
+                       defaultValue: "Server: running (port \(String(port)))",
                        comment: "Menubar status header when the server is running; placeholder is the port (rendered as a plain integer, no grouping)"),
                 .systemGreen
             )

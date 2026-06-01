@@ -2941,7 +2941,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: running · :%@"
+            "value" : "Server: running (port %@)"
           }
         }
       }
