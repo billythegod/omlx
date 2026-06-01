@@ -206,10 +206,11 @@ _ST_DTYPE_TO_NP = {
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     """Extract raw bytes from an evaluated mx.array.
 
-    Caller MUST ensure ``arr`` is already mx.eval'd before calling. This
-    function does NOT call mx.eval — it only reads the materialized buffer
-    via the Python buffer protocol. That keeps the call cross-thread safe
-    when the source array was evaluated on the inference thread.
+    Caller MUST ensure ``arr`` is already mx.eval'd before calling. For
+    ordinary dtypes this function only reads the materialized buffer via the
+    Python buffer protocol. For bfloat16, it explicitly evaluates the uint16
+    view created below; that is safe only because the source array has already
+    been materialized on the owning inference thread.
 
     For bfloat16 arrays, uses view(uint16) since the buffer protocol does
     not support bfloat16 directly. CAUTION: ``arr.view(mx.uint16)`` is a LAZY

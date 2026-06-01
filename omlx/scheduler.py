@@ -6114,14 +6114,15 @@ class Scheduler:
                                         mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
-                                # Hand the store-cache write to the background
-                                # executor without ever blocking the generation
-                                # step. The gate only counts in-flight writes;
-                                # backpressure is applied at admission in
-                                # _schedule_waiting (in_flight >= cap defers new
-                                # prefills) so cache persistence never stalls
-                                # token generation (#1496). note_submitted is
-                                # called before submit so a fast worker whose
+                                # Hand host memcpy and disk write to the
+                                # background executor after the owner thread
+                                # has materialized KV arrays. The gate only
+                                # counts in-flight writes; backpressure is
+                                # applied at admission in _schedule_waiting
+                                # (in_flight >= cap defers new prefills) so
+                                # cache persistence does not wait in the token
+                                # loop after submission (#1496). note_submitted
+                                # is called before submit so a fast worker whose
                                 # done callback fires immediately still
                                 # decrements a counted slot.
                                 gate = self._store_cache_gate
