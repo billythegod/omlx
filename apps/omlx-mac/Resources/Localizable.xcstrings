@@ -96,7 +96,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Native macOS app for the oMLX server"
+            "value" : "Local AI, no more waiting on your Mac."
           }
         }
       }
@@ -2935,13 +2935,13 @@
       }
     },
     "menubar.header.running" : {
-      "comment" : "Menubar status header when the server is running; placeholders are PID and port",
+      "comment" : "Menubar status header when the server is running; placeholder is the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: running · pid %1$@ · :%2$@"
+            "value" : "Server: running · :%@"
           }
         }
       }
@@ -2983,13 +2983,13 @@
       }
     },
     "menubar.header.unresponsive" : {
-      "comment" : "Menubar status header when the server is unresponsive; placeholder is PID",
+      "comment" : "Menubar status header when the server is unresponsive",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: unresponsive · pid %@ (auto-recover or Force Restart)"
+            "value" : "Server: unresponsive (auto-recover or Force Restart)"
           }
         }
       }
@@ -9936,7 +9936,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Session Stats"
+            "value" : "Serving Stats"
           }
         },
         "ja" : {
@@ -9965,6 +9965,66 @@
         }
       }
     },
+    "status.speed.prompt_processing" : {
+      "comment" : "Label for average prompt-processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing_note" : {
+      "comment" : "Note after prompt-processing speed label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing.tile" : {
+      "comment" : "Tile label for average prompt-processing speed excluding cached tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing (excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.section_label" : {
+      "comment" : "Header label above average serving speed metrics",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Speed"
+          }
+        }
+      }
+    },
+    "status.speed.token_generation" : {
+      "comment" : "Label for average token-generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token Generation"
+          }
+        }
+      }
+    },
     "status.system.subtitle" : {
       "comment" : "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers",
       "extractionState" : "extracted_with_value",
@@ -9983,7 +10043,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cached"
+            "value" : "Cached Tokens"
+          }
+        }
+      }
+    },
+    "status.tile.cache_efficiency" : {
+      "comment" : "Stat tile label for cache efficiency percentage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache Efficiency"
           }
         }
       }
@@ -10052,7 +10124,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Total Tokens"
+            "value" : "Total Prefill Tokens"
           }
         }
       }
@@ -10112,7 +10184,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Download in the background, install on next launch"
+            "value" : "Download in the background, then show Install & Restart"
           }
         }
       }
@@ -10361,7 +10433,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Enter your API key"
+            "value" : "Create an API key"
           }
         }
       }
@@ -10385,7 +10457,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "This key is also your Web Dashboard login password. Use something memorable, and keep it private."
+            "value" : "This key is also your Web Dashboard login password."
           }
         }
       }
@@ -10673,7 +10745,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Run an MLX server on your Mac. Keep agent context warm with smart caching, then plug Claude Code, OpenClaw, Cursor, and other tools into localhost."
+            "value" : "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90."
+          }
+        }
+      }
+    },
+    "welcome.header.subtitle" : {
+      "comment" : "Short tagline under the Welcome wizard's main heading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local AI, no more waiting."
           }
         }
       }
@@ -10697,7 +10781,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Local AI,\nno more waiting."
+            "value" : "oMLX"
           }
         }
       }
@@ -10781,7 +10865,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Where downloaded and imported models are stored."
+            "value" : "Where downloaded models are stored."
           }
         }
       }
