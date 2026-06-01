@@ -197,9 +197,7 @@ struct ServerHeroCard: View {
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text(String(localized: "server.hero.title",
-                                defaultValue: "oMLX Server",
-                                comment: "Hero card title on Server and Status screens"))
+                    Text(title)
                         .font(.omlxText(18, weight: .semibold))
                         .foregroundStyle(theme.text)
                     StatusPill(status: pillStatus)
@@ -322,6 +320,12 @@ struct ServerHeroCard: View {
     @ViewBuilder
     private var heroBackground: some View {
         theme.groupBg
+    }
+
+    private var title: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "oMLX" : "oMLX \(trimmed)"
     }
 }
 
