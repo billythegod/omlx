@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -295,6 +296,25 @@ async def verify_api_key(
     return True
 
 
+def _reset_boundary_snapshots_for_server() -> None:
+    """Reset ephemeral boundary snapshots at server lifecycle boundaries."""
+    engine_pool = _server_state.engine_pool
+    if engine_pool is None:
+        return
+
+    scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+    cache_dir = getattr(scheduler_config, "paged_ssd_cache_dir", None)
+    if not cache_dir:
+        return
+
+    try:
+        from .cache.boundary_snapshot_store import reset_boundary_snapshot_root
+
+        reset_boundary_snapshot_root(Path(cache_dir))
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning("Failed to reset boundary snapshot directory: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
@@ -324,6 +344,8 @@ async def lifespan(app: FastAPI):
                 logger.info("Auto-detected server aliases: %s", detected)
         except Exception as exc:  # pragma: no cover - never block startup
             logger.warning("Server alias auto-detection failed: %s", exc)
+
+    _reset_boundary_snapshots_for_server()
 
     # Startup: Preload pinned models
     if _server_state.engine_pool is not None:
@@ -410,6 +432,7 @@ async def lifespan(app: FastAPI):
         logger.info("MCP manager stopped")
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.shutdown()
+        _reset_boundary_snapshots_for_server()
         logger.info("Engine pool shutdown")
 
 
