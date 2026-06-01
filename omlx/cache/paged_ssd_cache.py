@@ -204,44 +204,29 @@ _ST_DTYPE_TO_NP = {
 
 
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
-    """Extract raw bytes from an evaluated mx.array.
+    """Extract raw bytes from an mx.array.
 
-    Caller MUST ensure ``arr`` is already mx.eval'd before calling. For
-    ordinary dtypes this function only reads the materialized buffer via the
-    Python buffer protocol. For bfloat16, it explicitly evaluates the uint16
-    view created below; that is safe only because the source array has already
-    been materialized on the owning inference thread.
+    Materialize the array at this last-mile boundary before touching the
+    Python buffer protocol. ``store_cache`` may create lazy block slices,
+    clones, or placeholder arrays after scheduler-side pre-eval collection,
+    and ``memoryview(arr)`` would otherwise trigger an implicit eval from the
+    background cache-store worker thread.
 
     For bfloat16 arrays, uses view(uint16) since the buffer protocol does
-    not support bfloat16 directly. CAUTION: ``arr.view(mx.uint16)`` is a LAZY
-    MLX op, and MLX streams are thread-local. If ``arr`` is a still-lazy op
-    bound to a stream created on another thread, materializing the view here
-    re-dispatches that op to a stream index that does not exist on the calling
-    thread -> "There is no Stream(gpu, N) in current thread" -> SIGABRT. The
-    contract for cross-thread safety is therefore: every source array reaching
-    this function must already be fully ``mx.eval``'d on the thread that owns
-    its stream (the inference/executor thread). The owner-side full eval is
-    enforced in scheduler._cleanup_finished (mx.eval(*pre_eval_arrays)) and in
-    scheduler._eval_snapshot_cache for boundary snapshots. With a concrete
-    source, the ``view`` op below consumes a materialized buffer and binds to
-    the always-present default stream (gpu,0); we mx.eval it explicitly so the
-    materialization is deterministic and happens inside the caller's held
-    _mx_buffer_access_lock rather than being deferred to the memoryview read.
+    not support bfloat16 directly. Materialize the view as well so the raw
+    buffer read never becomes an implicit MLX eval.
 
     Args:
-        arr: Evaluated MLX array (caller's responsibility — see above).
+        arr: MLX array to serialize.
 
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
     """
+    mx.eval(arr)
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
     if arr.dtype == mx.bfloat16:
         u16 = arr.view(mx.uint16)
-        # Explicit eval: with a concrete source this binds to the default
-        # stream (gpu,0) and completes the host-visible buffer before the
-        # memoryview read, keeping all materialization inside the worker's
-        # _mx_buffer_access_lock window (closes the mx.clear_cache race).
         mx.eval(u16)
         raw = bytes(memoryview(u16))
     else:
@@ -1380,20 +1365,13 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Cross-thread contract: caller (scheduler._cleanup_finished) does
-            # a FULL mx.eval on the inference thread for every real KV array
-            # that feeds this path (and _eval_snapshot_cache for boundary
-            # snapshots), so the block tensors sliced into ``arrays`` above
-            # consume already-concrete buffers. MLX streams are thread-local,
-            # so this is mandatory: a lazy op bound to the inference thread's
-            # generation_stream cannot be materialized on the omlx-store-cache
-            # worker thread (its stream index is absent there -> SIGABRT). The
-            # slice ops created on this worker, and the mx.zeros((1,))
-            # placeholders allocated above, have concrete inputs (or none) and
-            # therefore bind to the always-present default stream (gpu,0).
-            # _extract_tensor_bytes below mx.eval's the bf16 uint16 view
-            # explicitly under that default stream, inside the worker's held
-            # _mx_buffer_access_lock. Race history: #978/#1040/#1106/#1437.
+            # Last-mile materialization happens in _extract_tensor_bytes.
+            # scheduler._cleanup_finished still pre-dispatches real KV arrays,
+            # but store_cache creates additional lazy slices, clones, and
+            # placeholders here after that collection step. Evaluate those
+            # derived arrays before memoryview() so the buffer protocol never
+            # becomes the first MLX eval site on the store-cache worker thread.
+            # Race history: #978/#1040/#1106/#1437/#1558.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
