@@ -8,8 +8,8 @@
 //   • `WelcomeViewModel` is a @MainActor ObservableObject holding the wizard
 //     state across pages, the validation, and the "Start Server" action.
 //
-// First-run trigger lives in `AppDelegate` (PR 10 addition). When config.json
-// already exists (re-entry), the Welcome page is skipped via VM init state.
+// First-run trigger lives in `AppDelegate` (PR 10 addition). When settings.json
+// already exists (re-entry), the Welcome page is skipped via app boot flow.
 
 import AppKit
 import SwiftUI
@@ -25,18 +25,15 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     private weak var services: AppServices?
     private weak var server: ServerProcess?
     private let didFinish: (AppConfig, ServerProcess?) -> Void
-    private let didSkip: ((AppConfig) -> Void)?
 
     init(
         services: AppServices,
         server: ServerProcess?,
-        didFinish: @escaping (AppConfig, ServerProcess?) -> Void,
-        didSkip: ((AppConfig) -> Void)? = nil
+        didFinish: @escaping (AppConfig, ServerProcess?) -> Void
     ) {
         self.services = services
         self.server = server
         self.didFinish = didFinish
-        self.didSkip = didSkip
         super.init()
     }
 
@@ -69,13 +66,18 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
         let win = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 620),
-            styleMask: [.titled, .closable],
+            styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         win.title = String(localized: "welcome.window.title",
                            defaultValue: "Welcome to oMLX",
                            comment: "Window title bar text for the Welcome wizard")
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.titlebarSeparatorStyle = .none
+        win.backgroundColor = .windowBackgroundColor
+        win.isMovableByWindowBackground = true
         win.contentViewController = hosting
         win.center()
         win.delegate = self
@@ -100,17 +102,10 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Skip path: the user dismissed the wizard without running Start Server.
-    /// Spec §State machine says the current Storage values should be written
-    /// (with an empty API key when not validated) so the next launch lands
-    /// on AppView's API-key-not-configured banner instead of re-firing the
-    /// wizard. Triggered only when `vm.startCompleted` is false — otherwise
-    /// `onFinish` already wrote a complete config.
+    /// Closing before Start Server is cancellation, not partial setup. Do not
+    /// write settings.json or create the base path; AppDelegate will terminate
+    /// so the next launch starts from the Welcome intro again.
     private func handleWillClose() {
-        if let vm, !vm.startCompleted, let didSkip {
-            let snapshot = vm.skipSnapshot()
-            didSkip(snapshot)
-        }
         NotificationCenter.default.post(
             name: WelcomeWindowController.willCloseNotification,
             object: nil
@@ -398,36 +393,6 @@ final class WelcomeViewModel: ObservableObject {
         return true
     }
 
-    /// Spec §State machine — early close: write the current Storage values
-    /// (keep `apiKey` blank if not validated) so the user lands on AppView
-    /// with the API-key-not-configured banner instead of looping back into
-    /// the wizard. Called by `WelcomeWindowController` on `windowWillClose`
-    /// when `startCompleted` is false.
-    func skipSnapshot() -> AppConfig {
-        guard let services else { return AppConfig.default }
-        var cfg = services.config
-        let trimmedBase = ((basePath.trimmingCharacters(in: .whitespaces)
-                            as NSString).expandingTildeInPath as NSString)
-            .standardizingPath
-        if !trimmedBase.isEmpty { cfg.basePath = trimmedBase }
-        if let port = Int(portText.trimmingCharacters(in: .whitespaces)),
-           (1...65535).contains(port) {
-            cfg.port = port
-        }
-        let trimmedDir = modelDir.trimmingCharacters(in: .whitespaces)
-        cfg.modelDir = trimmedDir.isEmpty
-            ? AppConfig.defaultModelDir(forBasePath: cfg.basePath)
-            : trimmedDir
-        // Per spec: an unvalidated API key is dropped, so the user lands on
-        // the API-key-not-configured banner rather than persisting garbage.
-        if validateApiKey() {
-            cfg.apiKey = apiKey.trimmingCharacters(in: .whitespaces)
-        } else {
-            cfg.apiKey = ""
-        }
-        return cfg
-    }
-
     private func setupServerApiKey(client: OMLXClient, key: String) async -> Bool {
         // Try setup-api-key (fresh install). When the server already has a
         // key set, the endpoint returns 400 — we swallow that and let
@@ -461,6 +426,7 @@ struct WelcomeView: View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         ZStack {
             WelcomeBackdrop()
+                .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 Group {
@@ -474,7 +440,6 @@ struct WelcomeView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-
                 WelcomeFooter(vm: vm)
             }
         }
@@ -508,22 +473,29 @@ private struct WelcomeIntroBody: View {
             Spacer(minLength: 18)
             WelcomeIcon(size: 88)
 
-            VStack(spacing: 10) {
+            VStack(spacing: 14) {
                 Text(String(localized: "welcome.header.title",
-                            defaultValue: "Local AI,\nno more waiting.",
+                            defaultValue: "oMLX",
                             comment: "Main heading shown on the Welcome wizard"))
-                    .font(.omlxDisplay(34, weight: .semibold))
+                    .font(.omlxDisplay(48, weight: .semibold))
                     .foregroundStyle(WelcomeStyle.text)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(String(localized: "welcome.header.subtitle",
+                            defaultValue: "Local AI, no more waiting.",
+                            comment: "Short tagline under the Welcome wizard's main heading"))
+                    .font(.omlxDisplay(25, weight: .semibold))
+                    .foregroundStyle(WelcomeStyle.text)
+                    .multilineTextAlignment(.center)
                 Text(String(localized: "welcome.header.tagline",
-                            defaultValue: "Run an MLX server on your Mac. Keep agent context warm with smart caching, then plug Claude Code, OpenClaw, Cursor, and other tools into localhost.",
+                            defaultValue: "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90.",
                             comment: "Sub-tagline under the Welcome wizard's main heading"))
-                    .font(.omlxText(14))
+                    .font(.omlxText(15))
                     .foregroundStyle(WelcomeStyle.muted)
                     .multilineTextAlignment(.center)
-                    .lineSpacing(3)
-                    .frame(maxWidth: 500)
+                    .lineSpacing(5)
+                    .frame(maxWidth: 540)
+                    .padding(.top, 6)
             }
 
             HStack(spacing: 10) {
@@ -602,7 +574,7 @@ private struct WelcomeSetupBody: View {
                                       defaultValue: "Model Directory",
                                       comment: "Row label for the Model Directory picker in Welcome wizard"),
                         subtitle: String(localized: "welcome.storage.model_dir.sub",
-                                         defaultValue: "Where downloaded and imported models are stored.",
+                                         defaultValue: "Where downloaded models are stored.",
                                          comment: "Sublabel explaining the model directory")
                     ) {
                         HStack(spacing: 8) {
@@ -613,14 +585,18 @@ private struct WelcomeSetupBody: View {
                                 .foregroundStyle(WelcomeStyle.muted)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                                .frame(width: 176, alignment: .trailing)
-                            Button(String(localized: "welcome.button.browse",
-                                          defaultValue: "Browse...",
-                                          comment: "Folder picker trigger button in Welcome wizard")) {
+                                .frame(width: 232, alignment: .trailing)
+                            Button {
                                 vm.browseModelDirectory()
+                            } label: {
+                                Image(systemName: "folder")
+                                    .font(.system(size: 13, weight: .semibold))
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                             .disabled(vm.isStarting)
+                            .help(String(localized: "welcome.button.browse",
+                                         defaultValue: "Browse...",
+                                         comment: "Folder picker trigger button in Welcome wizard"))
                         }
                     }
 
@@ -632,7 +608,7 @@ private struct WelcomeSetupBody: View {
                                   defaultValue: "API Key",
                                   comment: "Row label for the primary API key field in Welcome wizard"),
                         subtitle: String(localized: "welcome.api_key.sub",
-                                         defaultValue: "This key is also your Web Dashboard login password. Use something memorable, and keep it private.",
+                                         defaultValue: "This key is also your Web Dashboard login password.",
                                          comment: "Sublabel explaining API key usage")
                     ) {
                         HStack(spacing: 8) {
@@ -680,7 +656,7 @@ private struct WelcomeSetupBody: View {
     @ViewBuilder
     private func keyField(_ binding: Binding<String>) -> some View {
         let placeholder = String(localized: "welcome.api_key.placeholder",
-                                 defaultValue: "Enter your API key",
+                                 defaultValue: "Create an API key",
                                  comment: "Placeholder text inside the API key text field")
         if keyVisible {
             TextInput(text: binding, placeholder: placeholder, mono: true, width: 210)
