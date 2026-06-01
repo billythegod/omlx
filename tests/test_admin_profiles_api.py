@@ -173,7 +173,18 @@ def test_all_model_settings_fields_classified():
     )
     from omlx.model_settings import ModelSettings
 
-    classified = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS) | EXCLUDED_FROM_PROFILES
+    universal = set(UNIVERSAL_PROFILE_FIELDS)
+    model_specific = set(MODEL_SPECIFIC_PROFILE_FIELDS)
+    excluded = set(EXCLUDED_FROM_PROFILES)
+    assert len(UNIVERSAL_PROFILE_FIELDS) == len(universal)
+    assert len(MODEL_SPECIFIC_PROFILE_FIELDS) == len(model_specific)
+    assert not (universal & model_specific)
+    assert not (universal & excluded)
+    assert not (model_specific & excluded)
+    assert "preserve_thinking" in universal
+    assert "preserve_thinking" not in excluded
+
+    classified = universal | model_specific | excluded
     all_fields = {f.name for f in fields(ModelSettings)}
     missing = all_fields - classified
     assert not missing, (

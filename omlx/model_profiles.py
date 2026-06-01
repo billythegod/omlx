@@ -31,7 +31,6 @@ UNIVERSAL_PROFILE_FIELDS = (
     "preserve_thinking",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
-    "preserve_thinking",
     "reasoning_parser",
     "guided_grammar_enabled",
     "guided_grammar",
@@ -81,7 +80,6 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_type_override",
     "active_profile_name",
     "ttl_seconds",
-    "preserve_thinking",
     # Security flag must be explicit per model — never propagated via profiles.
     "trust_remote_code",
 })
