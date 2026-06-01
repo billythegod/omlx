@@ -771,7 +771,6 @@ class TestBoundarySnapshotProvider:
             request_id="req-1",
             valid_tcs=[1024],
             in_memory_snapshots=snapshots,
-            extract_fn=_mock_extract_cache_states,
         )
 
         assert bool(provider)
@@ -784,24 +783,23 @@ class TestBoundarySnapshotProvider:
 
         store.shutdown()
 
-    def test_provider_falls_back_to_in_memory(self):
-        """Provider should extract from in-memory snapshots when value is not None."""
+    def test_provider_uses_pre_extracted_in_memory_snapshot(self):
+        """Provider should not extract raw cache objects from the worker path."""
         from omlx.scheduler import _BoundarySnapshotProvider
 
-        mock_cache = MagicMock()
-        snapshots = {1024: mock_cache}  # Not None = in-memory
+        extracted = [{"state": ("already",), "cache_type": "ArraysCache"}]
+        snapshots = {1024: extracted}
 
         provider = _BoundarySnapshotProvider(
             store=None,
             request_id="req-1",
             valid_tcs=[1024],
             in_memory_snapshots=snapshots,
-            extract_fn=_mock_extract_cache_states,
         )
 
         loaded = provider[1024]
-        assert loaded is not None
-        assert len(loaded) == 4
+        assert loaded is extracted
+        assert list(provider.iter_in_memory_extracted()) == [extracted]
 
     def test_provider_empty(self):
         """Empty provider should be falsy."""
@@ -812,7 +810,6 @@ class TestBoundarySnapshotProvider:
             request_id="req-1",
             valid_tcs=[],
             in_memory_snapshots={},
-            extract_fn=_mock_extract_cache_states,
         )
 
         assert not bool(provider)

@@ -1160,6 +1160,101 @@ class TestSchedulerBoundarySnapshots:
         assert kwargs["model_cache_config"] == "boundary-config"
         assert "req-partial" not in scheduler._boundary_cache_snapshots
 
+    def test_boundary_override_preextracts_in_memory_intermediate_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        """In-memory boundary snapshots must be extracted before worker access."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        request = Request(
+            request_id="req-hot-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests["req-hot-cache"] = request
+
+        raw_intermediate = object()
+        raw_latest = object()
+        extracted_intermediate = [{"state": ("intermediate",)}]
+        extracted_latest = [{"state": ("latest",)}]
+        scheduler._boundary_cache_snapshots["req-hot-cache"] = {
+            4: raw_intermediate,
+            8: raw_latest,
+        }
+
+        def extract(raw_cache):
+            if raw_cache is raw_latest:
+                return extracted_latest, "latest-config"
+            if raw_cache is raw_intermediate:
+                return extracted_intermediate, "intermediate-config"
+            raise AssertionError("unexpected raw cache")
+
+        with patch.object(scheduler, "_extract_cache_states", side_effect=extract) as ex:
+            result = scheduler._get_boundary_store_override(
+                "req-hot-cache", list(range(10))
+            )
+
+        assert result is not None
+        token_sequence, cache_to_store, model_config, provider = result
+        assert token_sequence == list(range(8))
+        assert cache_to_store is extracted_latest
+        assert model_config == "latest-config"
+        assert 4 in provider
+
+        ex.reset_mock()
+        assert provider[4] is extracted_intermediate
+        ex.assert_not_called()
+
+    def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        """Intermediate boundary snapshot arrays are materialized on engine thread."""
+        from omlx import scheduler as sched_mod
+
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        latest_arr = mx.zeros((1,))
+        intermediate_arr = mx.ones((1,))
+        latest_cache = [{"state": (latest_arr,), "cache_type": "ArraysCache"}]
+        intermediate_cache = [
+            {"state": (intermediate_arr,), "cache_type": "ArraysCache"}
+        ]
+        provider = sched_mod._BoundarySnapshotProvider(
+            store=None,
+            request_id="req-hot-cache",
+            valid_tcs=[4],
+            in_memory_snapshots={4: intermediate_cache},
+        )
+
+        request = Request(
+            request_id="req-hot-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7]
+        request._extracted_cache = [{"state": ("final",)}]
+        request._model_cache_config = None
+        scheduler.running["req-hot-cache"] = request
+        scheduler.requests["req-hot-cache"] = request
+
+        with patch.object(
+            scheduler,
+            "_get_boundary_store_override",
+            return_value=([1, 2, 3, 4], latest_cache, None, provider),
+        ), patch.object(sched_mod.mx, "async_eval") as async_eval, patch.object(
+            sched_mod, "_safe_sync_stream"
+        ):
+            scheduler._cleanup_finished({"req-hot-cache"})
+
+        async_eval.assert_called_once()
+        assert async_eval.call_args.args == (latest_arr, intermediate_arr)
+
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer
     ):

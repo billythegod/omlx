@@ -649,12 +649,13 @@ class SchedulerOutput:
 
 
 class _BoundarySnapshotProvider:
-    """Dict-like lazy loader for boundary snapshots.
+    """Dict-like loader for extracted boundary snapshots.
 
     Used by ``store_cache()`` to load snapshots from SSD one block at a time
-    instead of extracting all intermediate snapshots into memory at once.
-    Implements ``__bool__``, ``__contains__``, and ``__getitem__`` to be a
-    drop-in replacement for ``Dict[int, List[Dict[str, Any]]]``.
+    or serve pre-extracted in-memory snapshots. In-memory snapshots must already
+    be in the ``_extract_cache_states`` dict format so this provider can be used
+    safely from the async store-cache worker without touching raw MLX cache
+    objects on the wrong thread.
     """
 
     def __init__(
@@ -663,13 +664,11 @@ class _BoundarySnapshotProvider:
         request_id: str,
         valid_tcs: list[int],
         in_memory_snapshots: dict[int, Any],
-        extract_fn: Any,  # Callable — Scheduler._extract_cache_states
     ) -> None:
         self._store = store
         self._request_id = request_id
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
-        self._extract_fn = extract_fn
 
     def __contains__(self, tc: int) -> bool:
         return tc in self._valid_tcs
@@ -677,9 +676,7 @@ class _BoundarySnapshotProvider:
     def __getitem__(self, tc: int) -> Any:
         snap = self._in_memory.get(tc)
         if snap is not None:
-            # In-memory fallback (SSD write failed).
-            extracted, _ = self._extract_fn(snap)
-            return extracted
+            return snap
         if self._store is not None:
             return self._store.load(self._request_id, tc)
         return None
@@ -689,6 +686,13 @@ class _BoundarySnapshotProvider:
 
     def __bool__(self) -> bool:
         return bool(self._valid_tcs)
+
+    def iter_in_memory_extracted(self):
+        """Yield pre-extracted in-memory snapshots for pre-evaluation."""
+        for tc in sorted(self._valid_tcs):
+            snap = self._in_memory.get(tc)
+            if snap is not None:
+                yield snap
 
 
 class Scheduler:
@@ -3391,6 +3395,12 @@ class Scheduler:
             return None
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
+        #
+        # In-memory snapshots are raw mlx-lm cache objects. They must be
+        # converted to the extracted dict format here on the engine MLX thread.
+        # The async store-cache worker does not own the generation stream; if it
+        # touches raw Rotating/Arrays cache state, MLX can abort with
+        # "There is no Stream(gpu, X) in current thread" (#1568).
         latest_snapshot = snapshots[latest_tc]
         if latest_snapshot is None and self._boundary_snapshot_store is not None:
             # Offloaded to SSD — load back.
@@ -3411,16 +3421,29 @@ class Scheduler:
         else:
             return None
 
-        # Build lazy-loading provider for intermediate snapshots.
-        # Each snapshot is loaded from SSD one-at-a-time during
-        # store_cache() instead of extracting all at once.
+        # Build provider for intermediate snapshots. SSD-backed snapshots remain
+        # lazy-loaded, but in-memory snapshots are extracted eagerly on this
+        # engine thread before the provider is handed to the async worker.
         intermediate_tcs = [tc for tc in valid_counts if tc != latest_tc]
+        provider_tcs: list[int] = []
+        extracted_in_memory: dict[int, list[dict[str, Any]]] = {}
+        for tc in intermediate_tcs:
+            snap = snapshots.get(tc)
+            if snap is None:
+                if self._boundary_snapshot_store is not None:
+                    provider_tcs.append(tc)
+                continue
+
+            extracted_snapshot, _ = self._extract_cache_states(snap)
+            if extracted_snapshot:
+                extracted_in_memory[tc] = extracted_snapshot
+                provider_tcs.append(tc)
+
         intermediate_snapshots = _BoundarySnapshotProvider(
             store=self._boundary_snapshot_store,
             request_id=request_id,
-            valid_tcs=intermediate_tcs,
-            in_memory_snapshots=snapshots,
-            extract_fn=self._extract_cache_states,
+            valid_tcs=provider_tcs,
+            in_memory_snapshots=extracted_in_memory,
         )
 
         token_sequence = (
@@ -5917,6 +5940,15 @@ class Scheduler:
                                             cache_to_store
                                         )
                                     )
+                                    if intermediate_snapshots is not None:
+                                        for snapshot_cache in (
+                                            intermediate_snapshots.iter_in_memory_extracted()
+                                        ):
+                                            pre_eval_arrays.extend(
+                                                self._collect_arrays_from_extracted_cache(
+                                                    snapshot_cache
+                                                )
+                                            )
                                 with self._phase_timer("store_cache_main_dispatch"):
                                     if pre_eval_arrays:
                                         mx.async_eval(*pre_eval_arrays)
