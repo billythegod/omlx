@@ -6,6 +6,7 @@
 //   2. Bundle.main/Contents/Resources/Python/cpython-3.11/bin/python3 — production.
 //      Layout matches the venvstacks export tree, which
 //      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
+//   3. Legacy bundle layouts under Contents/Python or Contents/Frameworks.
 //
 // In the bundled case the spawn environment also sets:
 //   PYTHONHOME = Contents/Resources/Python/cpython-3.11
@@ -65,11 +66,20 @@ struct PythonRuntime {
 
         let bundleRoot = Bundle.main.bundleURL
         let resources = bundleRoot.appendingPathComponent("Contents/Resources")
-        let pythonRoot = resources.appendingPathComponent("Python")
-        let cpython = pythonRoot.appendingPathComponent("cpython-3.11")
-        let bundled = cpython.appendingPathComponent("bin/python3")
-        tried.append(bundled.path)
-        if FileManager.default.isExecutableFile(atPath: bundled.path) {
+        let pythonRoots = [
+            resources.appendingPathComponent("Python"),
+            bundleRoot.appendingPathComponent("Contents/Python"),
+            bundleRoot.appendingPathComponent("Contents/Frameworks"),
+        ]
+
+        for pythonRoot in pythonRoots {
+            let cpython = pythonRoot.appendingPathComponent("cpython-3.11")
+            let bundled = cpython.appendingPathComponent("bin/python3")
+            tried.append(bundled.path)
+            guard FileManager.default.isExecutableFile(atPath: bundled.path) else {
+                continue
+            }
+
             let mlxFramework = pythonRoot
                 .appendingPathComponent("framework-mlx-base/lib/python3.11/site-packages")
             return PythonRuntime(
