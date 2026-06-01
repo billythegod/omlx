@@ -1581,13 +1581,16 @@ class Scheduler:
         self._output_parser_sessions.pop(request_id, None)
 
     def _get_xtc_special_tokens(self) -> list[int]:
-        """Get special tokens to exclude from XTC sampling (newline + EOS).
+        """Get special tokens to exclude from XTC sampling.
 
-        Reuses _get_stop_tokens() for EOS coverage (includes generation_config.json
-        tokens) so XTC exclusions stay consistent with stop-token logic.
+        Parser-owned stop tokens stay out of BatchGenerator stop-token matching
+        so protocol parsers can handle them channel-aware, but XTC must still
+        protect them from diversity masking.
         """
         tokens = self.tokenizer.encode("\n")
         tokens.extend(self._get_stop_tokens())
+        if self._output_parser_factory is not None:
+            tokens.extend(self._output_parser_factory.stop_token_ids)
         return tokens
 
     def _create_batch_generator(

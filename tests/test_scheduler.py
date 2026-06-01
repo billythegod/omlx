@@ -865,6 +865,22 @@ class TestSchedulerXtcSpecialTokens:
 
         assert 2 in tokens
 
+    def test_includes_parser_stop_tokens_without_base_stop(
+        self, mock_model, mock_tokenizer
+    ):
+        """Parser stop tokens are XTC-protected but not BatchGenerator stops."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._output_parser_factory = _ParserStopFactory()
+        scheduler._output_parser_factory.stop_token_ids = {101, 102}
+
+        stop_tokens = scheduler._get_stop_tokens()
+        xtc_tokens = scheduler._get_xtc_special_tokens()
+
+        assert 101 not in stop_tokens
+        assert 102 not in stop_tokens
+        assert 101 in xtc_tokens
+        assert 102 in xtc_tokens
+
 
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
