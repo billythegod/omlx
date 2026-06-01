@@ -295,12 +295,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             didFinish: { [weak self] _, finishedServer in
                 // The wizard returns the spawned ServerProcess. Adopt it so
                 // applicationWillTerminate can clean up correctly.
-                self?.server = finishedServer
+                guard let self else { return }
+                self.server = finishedServer
                 if let proc = finishedServer {
                     SignalHandlers.shared.install { [weak proc] in
                         proc?.reapSync()
                     }
                 }
+                self.menubar = self.makeMenubar(
+                    server: finishedServer,
+                    config: self.services.config
+                )
             },
             didSkip: { [weak self] snapshot in
                 // Spec §State machine: write the current Storage values on

@@ -46,7 +46,7 @@ struct ServerScreen: View {
                                   defaultValue: "Port",
                                   comment: "Row label for the server port field"),
                     sublabel: String(localized: "server.row.port.sub",
-                                     defaultValue: "Default 8080. Server restarts on save.",
+                                     defaultValue: "Default 8000. Server restarts on save.",
                                      comment: "Sublabel under the Port field"),
                     isLast: true
                 ) {
@@ -668,7 +668,7 @@ private struct HintFooter: View {
 @MainActor
 final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
-    @Published var portText: String = "8080"
+    @Published var portText: String = "8000"
     @Published var logLevel: String = "info"
 
     // Phase 4 — Advanced disclosure.
@@ -694,7 +694,7 @@ final class ServerScreenVM: ObservableObject {
     /// Last applied (effective) values used to build endpoint URLs. Distinct
     /// from `host`/`portText` so the URLs don't flicker mid-edit.
     @Published var effectiveHost: String = "127.0.0.1"
-    @Published var effectivePort: Int = 8080
+    @Published var effectivePort: Int = 8000
 
     /// Apply-button baselines: snapshots of each Apply-managed draft taken
     /// after a successful `load()` or `applyServerSettings()`. The button's
@@ -703,7 +703,7 @@ final class ServerScreenVM: ObservableObject {
     ///
     /// Listen Address / Log Level / SSE Keep-Alive Mode auto-apply via the
     /// `bind()` wrapper and don't need baselines here.
-    private var baselinePortText: String = "8080"
+    private var baselinePortText: String = "8000"
     private var baselineSamplingContextText: String = "32768"
     private var baselineSamplingMaxTokensText: String = "32768"
     private var baselineSamplingTemperatureText: String = "1.0"
