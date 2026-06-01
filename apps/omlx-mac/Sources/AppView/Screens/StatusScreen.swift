@@ -851,7 +851,7 @@ final class StatusScreenVM: ObservableObject {
     var endpointText: String {
         guard let s = stats else { return "—" }
         let host = s.host ?? "127.0.0.1"
-        let port = s.port ?? 8080
+        let port = s.port ?? 8000
         return "\(host):\(port)"
     }
 

@@ -1,8 +1,7 @@
 // WelcomeViewModel drives the first-run wizard. The interesting behaviors
 // are validation gates (storage + api-key) feeding `lastError`, the
-// "Generate" button keeping `apiKey` and `apiKeyConfirm` in lockstep via
-// the shared APIKeyGenerator, and `skipSnapshot()` which persists Storage
-// values without an unvalidated API key on early close.
+// intro → setup → complete state, and `skipSnapshot()` which persists
+// Storage values without an unvalidated API key on early close.
 
 import XCTest
 @testable import oMLX
@@ -17,7 +16,7 @@ final class WelcomeViewModelTests: XCTestCase {
 
     private func makeVM(basePath: String = "/Users/Fido/.omlx",
                         modelDir: String  = "/Users/Fido/.omlx/models",
-                        port: Int = 8080,
+                        port: Int = 8000,
                         apiKey: String? = nil) -> WelcomeViewModel {
         let cfg = AppConfig(
             host: "127.0.0.1",
@@ -31,43 +30,33 @@ final class WelcomeViewModelTests: XCTestCase {
         return WelcomeViewModel(services: services, server: nil)
     }
 
-    // MARK: - generateApiKey
+    // MARK: - flow
 
-    func testGenerateApiKeyPopulatesBothFields() {
+    func testStartsOnIntroStep() {
         let vm = makeVM()
-        XCTAssertEqual(vm.apiKey, "")
-        XCTAssertEqual(vm.apiKeyConfirm, "")
-        vm.generateApiKey()
-        XCTAssertFalse(vm.apiKey.isEmpty)
-        XCTAssertEqual(vm.apiKey, vm.apiKeyConfirm,
-                       "Confirm field must mirror the generated key.")
+        XCTAssertEqual(vm.step, .intro)
     }
 
-    func testGenerateApiKeyMatchesSharedGeneratorShape() {
-        // Welcome must produce keys indistinguishable from the Security
-        // screen's regenerate flow — both go through APIKeyGenerator.
-        let vm = makeVM()
-        vm.generateApiKey()
-        XCTAssertTrue(vm.apiKey.hasPrefix(APIKeyGenerator.prefix))
-        XCTAssertEqual(vm.apiKey.count,
-                       APIKeyGenerator.prefix.count + APIKeyGenerator.bodyLength)
-    }
-
-    func testGenerateApiKeyClearsPriorError() {
+    func testBeginSetupAdvancesToSetupAndClearsError() {
         let vm = makeVM()
         vm.apiKey = "abc"
         XCTAssertFalse(vm.validateApiKey())
         XCTAssertNotNil(vm.lastError)
-        vm.generateApiKey()
-        XCTAssertNil(vm.lastError,
-                     "Generate should clear any prior validation error.")
+        vm.beginSetup()
+        XCTAssertEqual(vm.step, .setup)
+        XCTAssertNil(vm.lastError)
+    }
+
+    func testDefaultPortIs8000() {
+        let vm = makeVM()
+        XCTAssertEqual(vm.portText, "8000")
     }
 
     // MARK: - validateSetup
 
     func testValidateSetupHappyPath() {
         let vm = makeVM()
-        vm.generateApiKey()
+        vm.apiKey = "secret-key"
         XCTAssertTrue(vm.validateSetup())
         XCTAssertNil(vm.lastError)
     }
@@ -75,14 +64,14 @@ final class WelcomeViewModelTests: XCTestCase {
     func testValidateSetupFailsOnEmptyBase() {
         let vm = makeVM()
         vm.basePath = "   "
-        vm.generateApiKey()
+        vm.apiKey = "secret-key"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "Base directory is required.")
     }
 
     func testValidateSetupFailsOnInvalidPort() {
         let vm = makeVM()
-        vm.generateApiKey()
+        vm.apiKey = "secret-key"
         vm.portText = "0"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "Port must be a number between 1 and 65535.")
@@ -90,7 +79,7 @@ final class WelcomeViewModelTests: XCTestCase {
 
     func testValidateSetupFailsOnPortNonNumeric() {
         let vm = makeVM()
-        vm.generateApiKey()
+        vm.apiKey = "secret-key"
         vm.portText = "abc"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "Port must be a number between 1 and 65535.")
@@ -99,7 +88,6 @@ final class WelcomeViewModelTests: XCTestCase {
     func testValidateSetupFailsOnShortApiKey() {
         let vm = makeVM()
         vm.apiKey = "abc"
-        vm.apiKeyConfirm = "abc"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "API key must be at least 4 characters.")
     }
@@ -108,7 +96,6 @@ final class WelcomeViewModelTests: XCTestCase {
         let vm = makeVM()
         // 4+ chars but a space inside — server-side validator rejects.
         vm.apiKey = "ab cd"
-        vm.apiKeyConfirm = "ab cd"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "API key must not contain whitespace.")
     }
@@ -116,17 +103,8 @@ final class WelcomeViewModelTests: XCTestCase {
     func testValidateSetupFailsOnApiKeyNonPrintable() {
         let vm = makeVM()
         vm.apiKey = "abcd\u{007F}"   // DEL char, outside printable ASCII
-        vm.apiKeyConfirm = "abcd\u{007F}"
         XCTAssertFalse(vm.validateSetup())
         XCTAssertEqual(vm.lastError, "API key must contain only printable ASCII.")
-    }
-
-    func testValidateSetupFailsOnConfirmMismatch() {
-        let vm = makeVM()
-        vm.apiKey = "sk-omlx-AAAA"
-        vm.apiKeyConfirm = "sk-omlx-BBBB"
-        XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "API keys do not match.")
     }
 
     // MARK: - skipSnapshot
@@ -146,7 +124,6 @@ final class WelcomeViewModelTests: XCTestCase {
     func testSkipSnapshotDropsUnvalidatedApiKey() {
         let vm = makeVM(apiKey: "previously-saved")
         vm.apiKey = "ab"               // too short
-        vm.apiKeyConfirm = "ab"
         let snapshot = vm.skipSnapshot()
         XCTAssertEqual(snapshot.apiKey, "",
                        "An invalid in-progress key should be dropped on skip, " +
@@ -155,10 +132,9 @@ final class WelcomeViewModelTests: XCTestCase {
 
     func testSkipSnapshotKeepsValidatedApiKey() {
         let vm = makeVM()
-        vm.generateApiKey()
-        let generated = vm.apiKey
+        vm.apiKey = "secret-key"
         let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.apiKey, generated,
+        XCTAssertEqual(snapshot.apiKey, "secret-key",
                        "A fully-validated key should make it into the snapshot.")
     }
 
@@ -172,10 +148,10 @@ final class WelcomeViewModelTests: XCTestCase {
     }
 
     func testSkipSnapshotIgnoresInvalidPort() {
-        let vm = makeVM(port: 8080)
+        let vm = makeVM(port: 8000)
         vm.portText = "999999"   // out of range
         let snapshot = vm.skipSnapshot()
-        XCTAssertEqual(snapshot.port, 8080,
+        XCTAssertEqual(snapshot.port, 8000,
                        "Out-of-range port text should leave the existing port intact.")
     }
 }
