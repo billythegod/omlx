@@ -126,6 +126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installWindowObservers()
+        if !isRunningUnitTests {
+            do {
+                try ShellEnvWriter.ensureCLIShim()
+            } catch {
+                NSLog("oMLX: CLI shim setup failed — \(error)")
+            }
+        }
 
         let config = AppConfig.load()
         services.updateConfig(config)
@@ -143,6 +150,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             presentWelcome()
         }
+    }
+
+    private var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
     /// All three MenubarController construction sites (first-run, returning
