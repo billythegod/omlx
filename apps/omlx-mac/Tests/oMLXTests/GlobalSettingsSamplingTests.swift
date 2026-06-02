@@ -101,6 +101,16 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         ])
     }
 
+    func testPatchEncodesHfCacheEnabledAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.hfCacheEnabled = false
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["hf_cache_enabled"] as? Bool, false)
+    }
+
     func testPatchEncodesSamplingFieldsAsSnakeCaseFlatKeys() throws {
         // The Python `GlobalSettingsRequest` accepts the sampling defaults
         // as flat `sampling_*` keys (omlx/admin/routes.py:229-234), not
