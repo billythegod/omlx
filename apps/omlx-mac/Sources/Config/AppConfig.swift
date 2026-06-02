@@ -12,7 +12,7 @@
 //      we keep — its sole job is to tell us where settings.json lives.
 //   3. Default `~/.omlx`.
 //
-// Every other field (host, port, api_key, model_dir, hf_endpoint) lives
+// Every other field (host, port, api_key, model_dirs, hf_endpoint) lives
 // in `<basePath>/settings.json` — owned by the running Python server,
 // written by AppConfig.save() when the server is offline. Unknown keys
 // in settings.json (cache, integrations, ui, …) are preserved verbatim.
@@ -40,21 +40,63 @@ struct AppConfig: Sendable, Equatable, Codable {
     /// the user moves their data root.
     var basePath: String
     /// Always a literal path. Defaults to `<basePath>/models` and can be
-    /// pointed at any folder; never empty in memory or on disk.
+    /// pointed at any folder; never empty in memory or on disk. Kept as
+    /// the primary path for older call sites and the deprecated server key.
     var modelDir: String
+    /// Ordered model roots. The first path mirrors `modelDir`; additional
+    /// entries are scanned for local models but are not download targets.
+    var modelDirs: [String] = []
     /// HuggingFace endpoint override. Empty = default `huggingface.co`.
     var hfEndpoint: String
 
+    init(
+        bindAddress: String,
+        port: Int,
+        apiKey: String?,
+        basePath: String,
+        modelDir: String,
+        modelDirs: [String]? = nil,
+        hfEndpoint: String
+    ) {
+        self.bindAddress = bindAddress
+        self.port = port
+        self.apiKey = apiKey
+        self.basePath = basePath
+        self.modelDir = modelDir
+        let cleanedModelDirs = (modelDirs ?? [modelDir]).filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        self.modelDirs = cleanedModelDirs.isEmpty ? [modelDir] : cleanedModelDirs
+        if let primary = self.modelDirs.first {
+            self.modelDir = primary
+        }
+        self.hfEndpoint = hfEndpoint
+    }
+
     static var `default`: AppConfig {
         let base = currentBasePath()
+        let modelDir = defaultModelDir(forBasePath: base)
         return AppConfig(
             bindAddress: "127.0.0.1",
             port: 8000,
             apiKey: nil,
             basePath: base,
-            modelDir: defaultModelDir(forBasePath: base),
+            modelDir: modelDir,
+            modelDirs: [modelDir],
             hfEndpoint: ""
         )
+    }
+
+    var effectiveModelDirs: [String] {
+        let dirs = modelDirs.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return dirs.isEmpty ? [modelDir] : dirs
+    }
+
+    mutating func setModelDirs(_ dirs: [String]) {
+        let cleaned = dirs.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard let primary = cleaned.first else { return }
+        modelDirs = cleaned
+        modelDir = primary
     }
 
     /// `<basePath>/models` — the literal the server falls back to when the
@@ -192,10 +234,18 @@ struct AppConfig: Sendable, Equatable, Codable {
             if let h = slice.bindAddress { c.bindAddress = h }
             if let p = slice.port { c.port = p }
             if let k = slice.apiKey, !k.isEmpty { c.apiKey = k }
-            // settings.json may not have model_dir on a brand-new install;
-            // in that case `c.modelDir` keeps the `<basePath>/models`
+            // settings.json may not have model_dirs on a brand-new install;
+            // in that case `c.modelDirs` keeps the `<basePath>/models`
             // default that `Self.default` already populated.
-            if let m = slice.modelDir, !m.isEmpty { c.modelDir = m }
+            let dirs = (slice.modelDirs ?? [])
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            if let first = dirs.first {
+                c.modelDirs = dirs
+                c.modelDir = first
+            } else if let m = slice.modelDir, !m.isEmpty {
+                c.modelDir = m
+                c.modelDirs = [m]
+            }
             if let hf = slice.hfEndpoint { c.hfEndpoint = hf }
         }
 
@@ -238,10 +288,11 @@ struct AppConfig: Sendable, Equatable, Codable {
         json["auth"] = auth
 
         var model = (json["model"] as? [String: Any]) ?? [:]
-        // `modelDir` is always a literal path (never empty). On a basePath
-        // move, AppServices.relocate() rewrites it so the persisted value
-        // tracks the new root when modelDir lived inside basePath.
-        model["model_dir"] = modelDir
+        // `modelDirs` is always persisted as the canonical ordered list, with
+        // `model_dir` kept in sync for older server/app builds.
+        let dirs = effectiveModelDirs
+        model["model_dirs"] = dirs
+        model["model_dir"] = dirs[0]
         json["model"] = model
 
         var hf = (json["huggingface"] as? [String: Any]) ?? [:]
@@ -264,6 +315,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         var bindAddress: String?
         var port: Int?
         var apiKey: String?
+        var modelDirs: [String]?
         var modelDir: String?
         var hfEndpoint: String?
     }
@@ -291,6 +343,7 @@ struct AppConfig: Sendable, Equatable, Codable {
             bindAddress: bindAddr,
             port: server?["port"] as? Int,
             apiKey: auth?["api_key"] as? String,
+            modelDirs: model?["model_dirs"] as? [String],
             modelDir: model?["model_dir"] as? String,
             hfEndpoint: hf?["endpoint"] as? String
         )

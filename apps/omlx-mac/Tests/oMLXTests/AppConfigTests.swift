@@ -64,7 +64,9 @@ final class AppConfigTests: XCTestCase {
         XCTAssertNil((json["server"] as! [String: Any])["bind_address"])
         XCTAssertEqual((json["server"] as! [String: Any])["port"] as! Int, 9000)
         XCTAssertEqual((json["auth"] as! [String: Any])["api_key"] as! String, "secret")
-        XCTAssertEqual((json["model"] as! [String: Any])["model_dir"] as! String, "\(tempBase!)/models")
+        let model = json["model"] as! [String: Any]
+        XCTAssertEqual(model["model_dirs"] as! [String], ["\(tempBase!)/models"])
+        XCTAssertEqual(model["model_dir"] as! String, "\(tempBase!)/models")
         XCTAssertEqual((json["huggingface"] as! [String: Any])["endpoint"] as! String,
                        "https://hf-mirror.example")
         XCTAssertEqual(json["version"] as! String, "1.0")
@@ -82,7 +84,7 @@ final class AppConfigTests: XCTestCase {
             "ui": ["theme": "dark"],
             "server": ["host": "0.0.0.0", "bind_address": "0.0.0.0", "port": 1234],
             "model": [
-                "model_dirs": ["/some/where/else"],   // not owned by AppConfig
+                "model_dirs": ["/some/where/else"],
                 "model_dir": "/will-be-overwritten",
                 "max_model_memory": "auto"             // also unknown
             ],
@@ -115,8 +117,8 @@ final class AppConfigTests: XCTestCase {
         XCTAssertNil(server["bind_address"])
 
         let model = after["model"] as! [String: Any]
-        XCTAssertEqual(model["model_dirs"] as! [String], ["/some/where/else"],
-                       "model_dirs is Python-owned and must be preserved")
+        XCTAssertEqual(model["model_dirs"] as! [String], ["/new/models"],
+                       "model_dirs is AppConfig-owned and must stay in sync with model_dir")
         XCTAssertEqual(model["max_model_memory"] as! String, "auto")
         XCTAssertEqual(model["model_dir"] as! String, "/new/models",
                        "model_dir is AppConfig-owned and gets the new value")
@@ -162,6 +164,24 @@ final class AppConfigTests: XCTestCase {
         XCTAssertEqual(slice.port, 9000)
     }
 
+    func testLoadReadsModelDirsAndPrimaryModelDir() throws {
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let original: [String: Any] = [
+            "server": ["host": "127.0.0.1", "port": 9000],
+            "model": [
+                "model_dirs": ["/models/a", "/models/b"],
+                "model_dir": "/models/a"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: original, options: [.prettyPrinted])
+            .write(to: url)
+
+        let slice = try AppConfig.readSettingsForTests(basePath: tempBase)
+
+        XCTAssertEqual(slice.modelDirs ?? [], ["/models/a", "/models/b"])
+        XCTAssertEqual(slice.modelDir, "/models/a")
+    }
+
     // MARK: modelDir invariant
 
     func testDefaultConfigHasNonEmptyModelDir() {
@@ -169,6 +189,7 @@ final class AppConfigTests: XCTestCase {
         // must hand back a usable modelDir. Otherwise the UI shows a blank
         // field and the server falls through to its own default — diverging.
         XCTAssertFalse(AppConfig.default.modelDir.isEmpty)
+        XCTAssertFalse(AppConfig.default.effectiveModelDirs.isEmpty)
         XCTAssertTrue(AppConfig.default.modelDir.hasSuffix("/models"))
     }
 
