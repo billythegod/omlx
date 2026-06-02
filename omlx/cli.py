@@ -41,6 +41,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
         return True
+    if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
+        return True
     if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
         return True
     if hasattr(args, "http_proxy") and args.http_proxy is not None:
@@ -187,7 +189,7 @@ def serve_command(args):
         from .server import init_server
         from .config import parse_size
 
-        model_dirs = settings.model.get_model_dirs(settings.base_path)
+        model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
         print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
         print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
@@ -659,6 +661,13 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom HuggingFace Hub endpoint URL (e.g., https://hf-mirror.com)",
+    )
+    serve_parser.add_argument(
+        "--hf-cache",
+        dest="hf_cache_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Discover models from the standard HuggingFace Hub local cache (default: enabled)",
     )
 
     # ModelScope options

@@ -1243,6 +1243,8 @@ def init_server(
         dir_list = [model_dirs]
     else:
         dir_list = list(model_dirs)
+    if global_settings and hasattr(global_settings, "get_effective_model_dirs"):
+        dir_list = [str(d) for d in global_settings.get_effective_model_dirs()]
 
     # Create directories if needed
     for md in dir_list:

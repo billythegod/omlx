@@ -454,34 +454,47 @@ class TestHuggingFaceSettings:
         """Test default values."""
         settings = HuggingFaceSettings()
         assert settings.endpoint == ""
+        assert settings.hf_cache_enabled is True
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        settings = HuggingFaceSettings(
+            endpoint="https://hf-mirror.com",
+            hf_cache_enabled=False,
+        )
         assert settings.endpoint == "https://hf-mirror.com"
+        assert settings.hf_cache_enabled is False
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        settings = HuggingFaceSettings(
+            endpoint="https://hf-mirror.com",
+            hf_cache_enabled=False,
+        )
         result = settings.to_dict()
-        assert result == {"endpoint": "https://hf-mirror.com"}
+        assert result == {
+            "endpoint": "https://hf-mirror.com",
+            "hf_cache_enabled": False,
+        }
 
     def test_to_dict_empty(self):
         """Test conversion to dictionary with empty endpoint."""
         settings = HuggingFaceSettings()
         result = settings.to_dict()
-        assert result == {"endpoint": ""}
+        assert result == {"endpoint": "", "hf_cache_enabled": True}
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"endpoint": "https://hf-mirror.com"}
+        data = {"endpoint": "https://hf-mirror.com", "hf_cache_enabled": False}
         settings = HuggingFaceSettings.from_dict(data)
         assert settings.endpoint == "https://hf-mirror.com"
+        assert settings.hf_cache_enabled is False
 
     def test_from_dict_defaults(self):
         """Test creation from empty dictionary uses defaults."""
         settings = HuggingFaceSettings.from_dict({})
         assert settings.endpoint == ""
+        assert settings.hf_cache_enabled is True
 
 
 class TestNetworkSettings:
@@ -669,6 +682,39 @@ class TestGlobalSettings:
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
+
+    def test_get_effective_model_dirs_includes_hf_cache_between_dirs(self, tmp_path, monkeypatch):
+        """HF cache is inserted between primary and additional model dirs."""
+        primary = tmp_path / "primary"
+        additional = tmp_path / "additional"
+        hf_cache = tmp_path / "hf" / "hub"
+        primary.mkdir()
+        additional.mkdir()
+        hf_cache.mkdir(parents=True)
+        monkeypatch.setenv("HF_HUB_CACHE", str(hf_cache))
+
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.model.model_dirs = [str(primary), str(additional)]
+
+        assert settings.get_effective_model_dirs() == [
+            primary.resolve(),
+            hf_cache.resolve(),
+            additional.resolve(),
+        ]
+
+    def test_get_effective_model_dirs_skips_disabled_hf_cache(self, tmp_path, monkeypatch):
+        """Disabled HF cache is not included in discovery dirs."""
+        primary = tmp_path / "primary"
+        hf_cache = tmp_path / "hf" / "hub"
+        primary.mkdir()
+        hf_cache.mkdir(parents=True)
+        monkeypatch.setenv("HF_HUB_CACHE", str(hf_cache))
+
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.model.model_dirs = [str(primary)]
+        settings.huggingface.hf_cache_enabled = False
+
+        assert settings.get_effective_model_dirs() == [primary.resolve()]
 
     def test_load_from_file(self):
         """Test loading settings from JSON file."""

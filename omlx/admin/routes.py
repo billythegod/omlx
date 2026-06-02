@@ -233,6 +233,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # HuggingFace settings
     hf_endpoint: str | None = None
+    hf_cache_enabled: bool | None = None
 
     # ModelScope settings
     ms_endpoint: str | None = None
@@ -630,10 +631,8 @@ async def _reload_models() -> tuple[bool, str]:
     if settings_manager is not None:
         settings_manager._load()
 
-    # Get current model_dirs from global settings
-    model_dirs = global_settings.model.model_dirs or []
-    if not model_dirs and global_settings.model.model_dir:
-        model_dirs = [global_settings.model.model_dir]
+    # Get current effective model dirs from global settings
+    model_dirs = [str(d) for d in global_settings.get_effective_model_dirs()]
 
     # Unload all, re-discover, re-apply overrides
     success, msg = await _apply_model_dirs_runtime(model_dirs)
@@ -1642,6 +1641,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "config_model_type": model_info.get("config_model_type", ""),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
+            "source_type": model_info.get("source_type", "local"),
+            "source_repo_id": model_info.get("source_repo_id"),
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
@@ -2710,6 +2711,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 str(d) for d in global_settings.model.get_model_dirs(global_settings.base_path)
             ],
             "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
+            "effective_model_dirs": [
+                str(d) for d in global_settings.get_effective_model_dirs()
+            ],
             "model_fallback": global_settings.model.model_fallback,
         },
         "memory": {
@@ -2738,6 +2742,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
+            "hf_cache_enabled": global_settings.huggingface.hf_cache_enabled,
+            "hf_cache_path": str(global_settings.get_hf_cache_dir()),
         },
         "modelscope": {
             "endpoint": global_settings.modelscope.endpoint,
@@ -2893,7 +2899,10 @@ async def update_global_settings(
     if new_dirs is not None:
         old_dirs = global_settings.model.model_dirs
         if new_dirs != old_dirs:
-            success, msg = await _apply_model_dirs_runtime(new_dirs)
+            effective_dirs = [
+                str(d) for d in global_settings.get_effective_model_dirs(new_dirs)
+            ]
+            success, msg = await _apply_model_dirs_runtime(effective_dirs)
             if success:
                 global_settings.model.model_dirs = new_dirs
                 global_settings.model.model_dir = new_dirs[0] if new_dirs else None
@@ -3036,6 +3045,20 @@ async def update_global_settings(
             f"HuggingFace endpoint updated to: "
             f"{request.hf_endpoint or '(default)'}"
         )
+    if request.hf_cache_enabled is not None:
+        if global_settings.huggingface.hf_cache_enabled != request.hf_cache_enabled:
+            global_settings.huggingface.hf_cache_enabled = request.hf_cache_enabled
+            effective_dirs = [
+                str(d) for d in global_settings.get_effective_model_dirs()
+            ]
+            success, msg = await _apply_model_dirs_runtime(effective_dirs)
+            if not success:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to change HuggingFace cache discovery: {msg}",
+                )
+            runtime_applied.append("hf_cache_enabled")
+            logger.info(msg)
 
     # Apply ModelScope settings (Live - immediately applied via env var)
     if request.ms_endpoint is not None:
@@ -4605,9 +4628,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    snapshot_path, model_name = hf_resolved
-                    if (snapshot_path / "config.json").exists():
-                        _add_model(snapshot_path, model_name)
+                    if (hf_resolved.snapshot_path / "config.json").exists():
+                        _add_model(hf_resolved.snapshot_path, hf_resolved.model_id)
                     continue
 
                 # Level 2: organization folder — scan children
@@ -4735,7 +4757,8 @@ async def delete_hf_model(
         if settings_manager:
             settings_manager.delete_settings(model_name)
         engine_pool.discover_models(
-            [str(d) for d in model_dirs], pinned_models
+            [str(d) for d in global_settings.get_effective_model_dirs()],
+            pinned_models,
         )
         if settings_manager:
             engine_pool.apply_settings_overrides(settings_manager)

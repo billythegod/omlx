@@ -579,6 +579,7 @@ class TestServeCommandFunctions:
             "initial_cache_blocks": None,
             "mcp_config": None,
             "hf_endpoint": None,
+            "hf_cache_enabled": None,
             "ms_endpoint": None,
             "http_proxy": None,
             "https_proxy": None,
@@ -596,7 +597,7 @@ class TestServeCommandFunctions:
         settings = SimpleNamespace()
         settings.base_path = tmp_path
         settings.server = SimpleNamespace(host=host, port=port, log_level="info")
-        settings.huggingface = SimpleNamespace(endpoint=None)
+        settings.huggingface = SimpleNamespace(endpoint=None, hf_cache_enabled=True)
         settings.modelscope = SimpleNamespace(endpoint=None)
         settings.network = SimpleNamespace(
             http_proxy=None,
@@ -611,6 +612,7 @@ class TestServeCommandFunctions:
         settings.model = SimpleNamespace(
             get_model_dirs=lambda base_path: [tmp_path / "models"],
         )
+        settings.get_effective_model_dirs = lambda: [tmp_path / "models"]
         settings.memory = SimpleNamespace(memory_guard_tier="balanced")
         settings.mcp = SimpleNamespace(config_path=None)
         settings.cache = SimpleNamespace(
@@ -826,6 +828,11 @@ class TestHasCliOverrides:
     def test_embedding_batch_size_explicit(self):
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(embedding_batch_size=4)) is True
+
+    def test_hf_cache_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(hf_cache_enabled=False)) is True
+        assert _has_cli_overrides(self._make_args(hf_cache_enabled=True)) is True
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides
