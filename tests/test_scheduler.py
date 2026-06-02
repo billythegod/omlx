@@ -1289,13 +1289,13 @@ class TestSchedulerBoundarySnapshots:
             scheduler,
             "_get_boundary_store_override",
             return_value=([1, 2, 3, 4], latest_cache, None, provider),
-        ), patch.object(sched_mod.mx, "async_eval") as async_eval, patch.object(
+        ), patch.object(sched_mod.mx, "eval") as eval_, patch.object(
             sched_mod, "_safe_sync_stream"
         ):
             scheduler._cleanup_finished({"req-hot-cache"})
 
-        async_eval.assert_called_once()
-        assert async_eval.call_args.args == (latest_arr, intermediate_arr)
+        eval_.assert_called_once()
+        assert eval_.call_args.args == (latest_arr, intermediate_arr)
 
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer

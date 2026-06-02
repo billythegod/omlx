@@ -7,11 +7,11 @@
 //   • Stop Server     (RUNNING / STARTING / STOPPING / UNRESPONSIVE)
 //   • Start Server    (STOPPED / IDLE / FAILED)
 //   • Serving Stats     (Session + All-Time submenu)
-//   • Settings…         (Cmd-, — opens the SwiftUI AppView window via the
-//                        openAppView callback)
 //   • Open Web Dashboard (enabled when running — opens the web admin
 //                        dashboard in the browser via /admin/auto-login)
 //   • Chat with oMLX    (enabled when running — opens /admin/chat in browser)
+//   • Settings…         (Cmd-, — opens the SwiftUI AppView window via the
+//                        openAppView callback)
 //   • About oMLX
 //   • Quit oMLX       (Cmd-Q)
 //
@@ -28,6 +28,7 @@ final class MenubarController: NSObject {
 
     private let server: ServerProcess?
     private let config: AppConfig
+    private let updates: UpdateController?
     private let bootstrapError: Error?
     private let openAppView: () -> Void
     private let requestQuit: () -> Void
@@ -53,6 +54,7 @@ final class MenubarController: NSObject {
     private var adminPanelItem: NSMenuItem!
     private var webAdminItem: NSMenuItem!
     private var chatItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
 
     private let iconOutline: NSImage?
     private let iconFilled: NSImage?
@@ -62,12 +64,14 @@ final class MenubarController: NSObject {
     init(
         server: ServerProcess?,
         config: AppConfig,
+        updates: UpdateController? = nil,
         lastError: Error? = nil,
         openAppView: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
         self.config = config
+        self.updates = updates
         self.bootstrapError = lastError
         self.openAppView = openAppView
         self.requestQuit = requestQuit
@@ -104,6 +108,10 @@ final class MenubarController: NSObject {
         }
         statusItem.behavior = []
         statusItem.menu = menu
+        // This menu is state-driven by refreshMenuState(). If AppKit's
+        // automatic target/action enabling stays on, stopped-server items
+        // such as Web Dashboard and Chat can be re-enabled while opening.
+        menu.autoenablesItems = false
         menu.delegate = self
 
         buildMenu()
@@ -117,9 +125,21 @@ final class MenubarController: NSObject {
                 object: server
             )
         }
+        if let updates {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(updateStateChanged(_:)),
+                name: UpdateController.stateDidChangeNotification,
+                object: updates
+            )
+        }
 
         startStatsPoller()
         startVisibilityWatcher()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Menu construction
@@ -174,14 +194,6 @@ final class MenubarController: NSObject {
 
         menu.addItem(.separator())
 
-        adminPanelItem = item(String(localized: "menubar.item.settings",
-                                     defaultValue: "Settings…",
-                                     comment: "Menubar item that opens the native settings/preferences window"),
-                              action: #selector(openAdminPanel),
-                              symbol: "gearshape",
-                              keyEquivalent: ",")
-        menu.addItem(adminPanelItem)
-
         webAdminItem = item(String(localized: "menubar.item.web_dashboard",
                                    defaultValue: "Open Web Dashboard",
                                    comment: "Menubar item that opens the browser-based web admin dashboard with auto-login"),
@@ -197,6 +209,21 @@ final class MenubarController: NSObject {
         menu.addItem(chatItem)
 
         menu.addItem(.separator())
+
+        updateItem = item(String(localized: "menubar.item.update_available",
+                                 defaultValue: "Install Update…",
+                                 comment: "Menubar item shown when an app update is available"),
+                          action: #selector(installUpdate),
+                          symbol: "arrow.down.circle")
+        menu.addItem(updateItem)
+
+        adminPanelItem = item(String(localized: "menubar.item.settings",
+                                     defaultValue: "Settings…",
+                                     comment: "Menubar item that opens the native settings/preferences window"),
+                              action: #selector(openAdminPanel),
+                              symbol: "gearshape",
+                              keyEquivalent: ",")
+        menu.addItem(adminPanelItem)
 
         let about = item(String(localized: "menubar.item.about",
                                 defaultValue: "About oMLX",
@@ -237,8 +264,7 @@ final class MenubarController: NSObject {
 
     private func refreshMenuState() {
         let state = server?.state ?? .stopped
-        let isRunning: Bool
-        if case .running = state { isRunning = true } else { isRunning = false }
+        let isRunning = serverIsRunning
         let isStarting: Bool
         if case .starting = state { isStarting = true } else { isStarting = false }
         let isStopping: Bool
@@ -276,10 +302,36 @@ final class MenubarController: NSObject {
         webAdminItem.isEnabled = isRunning
         chatItem.isEnabled = isRunning
 
+        refreshUpdateMenuItem()
+
         // Icon swap — outline when not actively serving, filled otherwise
         let serving = state.isRunningLike
         statusItem.button?.image = serving ? iconFilled : iconOutline
         statusItem.button?.image?.isTemplate = true
+    }
+
+    private func refreshUpdateMenuItem() {
+        guard let updates else {
+            updateItem.isHidden = true
+            return
+        }
+        switch updates.state {
+        case .available(let info), .ready(let info):
+            updateItem.isHidden = false
+            updateItem.isEnabled = info.dmgURL != nil
+            updateItem.title = String(localized: "menubar.item.install_update_version",
+                                      defaultValue: "Install oMLX \(info.version)…",
+                                      comment: "Menubar update item when an app update is available; placeholder is the version")
+        case .downloading(let pct):
+            updateItem.isHidden = false
+            updateItem.isEnabled = false
+            updateItem.title = String(localized: "menubar.item.downloading_update",
+                                      defaultValue: "Downloading update… \(pct)%",
+                                      comment: "Menubar update item while an app update is downloading; placeholder is the percent")
+        default:
+            updateItem.isHidden = true
+            updateItem.isEnabled = false
+        }
     }
 
     private func headerDisplay(_ state: ServerProcess.State) -> (String, NSColor) {
@@ -306,12 +358,12 @@ final class MenubarController: NSObject {
                        comment: "Menubar status header while the server is starting"),
                 .systemBlue
             )
-        case .running(let pid):
+        case .running:
             let port = MenubarController.displayPort(server: server, fallback: config.port)
             return (
                 String(localized: "menubar.header.running",
-                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(port))",
-                       comment: "Menubar status header when the server is running; placeholders are PID and port (rendered as plain integers, no grouping)"),
+                       defaultValue: "Server: running (port \(String(port)))",
+                       comment: "Menubar status header when the server is running; placeholder is the port (rendered as a plain integer, no grouping)"),
                 .systemGreen
             )
         case .stopping:
@@ -321,11 +373,11 @@ final class MenubarController: NSObject {
                        comment: "Menubar status header while the server is stopping"),
                 .systemOrange
             )
-        case .unresponsive(let pid):
+        case .unresponsive:
             return (
                 String(localized: "menubar.header.unresponsive",
-                       defaultValue: "Server: unresponsive · pid \(String(pid)) (auto-recover or Force Restart)",
-                       comment: "Menubar status header when the server is unresponsive; placeholder is PID (plain integer, no grouping)"),
+                       defaultValue: "Server: unresponsive (auto-recover or Force Restart)",
+                       comment: "Menubar status header when the server is unresponsive"),
                 .systemOrange
             )
         case .failed(let msg):
@@ -413,7 +465,7 @@ final class MenubarController: NSObject {
     // MARK: - Pollers
 
     /// Bind endpoint the stats poller should hit. Sourced from the live
-    /// `ServerProcess` (which `reconfigure(host:port:)` keeps current) so a
+    /// `ServerProcess` (which `reconfigure(bindAddress:port:)` keeps current) so a
     /// runtime port/host change re-points the poller, falling back to the
     /// config snapshot only when there is no server. Mirrors the
     /// `displayPort`/`displayHost` resolution used for the visible items.
@@ -492,6 +544,10 @@ final class MenubarController: NSObject {
         rebuildStatsSubmenu()
     }
 
+    @objc private func updateStateChanged(_ note: Notification) {
+        refreshUpdateMenuItem()
+    }
+
     // MARK: - Actions
 
     @objc private func startServer() {
@@ -562,6 +618,7 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openWebAdmin() {
+        guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
         guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
@@ -569,10 +626,15 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openChat() {
+        guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
         guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func installUpdate() {
+        updates?.installAndRestart()
     }
 
     @objc private func showAbout() {
@@ -594,6 +656,11 @@ final class MenubarController: NSObject {
         let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         it.isEnabled = false
         return it
+    }
+
+    private var serverIsRunning: Bool {
+        if case .running = server?.state { return true }
+        return false
     }
 
     private func appendStat(_ label: String, _ value: String) {
