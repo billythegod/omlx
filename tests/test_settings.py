@@ -344,6 +344,11 @@ class TestCacheSettings:
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
 
+    def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
+        """Legacy hot_cache_max_size=auto should load as disabled."""
+        settings = CacheSettings.from_dict({"hot_cache_max_size": "auto"})
+        assert settings.hot_cache_max_size == "0"
+
     def test_initial_cache_blocks_custom(self):
         """Test custom initial_cache_blocks value."""
         settings = CacheSettings(initial_cache_blocks=8192)
@@ -1044,6 +1049,24 @@ class TestGlobalSettings:
         settings.cache.ssd_cache_max_size = "not-a-size"
         errors = settings.validate()
         assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+    def test_validate_hot_cache_size(self):
+        """Hot cache accepts explicit sizes only; auto is SSD-cache-only."""
+        settings = GlobalSettings()
+        settings.cache.hot_cache_max_size = "0"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "8GB"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "auto"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
+        assert any("auto" in e for e in errors)
+
+        settings.cache.hot_cache_max_size = "not-a-size"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""

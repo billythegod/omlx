@@ -275,12 +275,16 @@ class CacheSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CacheSettings:
         """Create from dictionary."""
+        hot_cache_max_size = data.get("hot_cache_max_size", "0")
+        if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
+            hot_cache_max_size = "0"
+
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
-            hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -1164,6 +1168,19 @@ class GlobalSettings:
                     errors.append("ssd_cache_max_size must be positive")
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
+
+        try:
+            hot_cache_size = parse_size(self.cache.hot_cache_max_size)
+            if hot_cache_size < 0:
+                errors.append("hot_cache_max_size must be non-negative")
+        except ValueError as e:
+            if self.cache.hot_cache_max_size.strip().lower() == "auto":
+                errors.append(
+                    "Invalid hot_cache_max_size: 'auto' is not supported; "
+                    "use '0' to disable or a size like '8GB'"
+                )
+            else:
+                errors.append(f"Invalid hot_cache_max_size: {e}")
 
         if self.cache.initial_cache_blocks <= 0:
             errors.append(
