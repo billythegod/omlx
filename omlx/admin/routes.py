@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..settings import SubKeyEntry
-from ..utils.release_check import select_latest_stable_release
+from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -5356,9 +5356,20 @@ async def get_device_info(
 # Update Check
 # =============================================================================
 
-_update_cache: dict[str, Any] | None = None
-_update_cache_time: float = 0.0
+_update_cache: dict[str, dict[str, Any]] = {}
+_update_cache_time: dict[str, float] = {}
 _UPDATE_CACHE_TTL = 3600  # 1 hour
+_UPDATE_PREFS_PATH = (
+    Path.home() / "Library" / "Application Support" / "oMLX" / "update-prefs.json"
+)
+
+
+def _read_update_channel() -> str:
+    try:
+        data = json.loads(_UPDATE_PREFS_PATH.read_text())
+    except Exception:
+        return "stable"
+    return normalize_update_channel(data.get("channel"))
 
 
 @router.get("/api/update-check")
@@ -5369,20 +5380,29 @@ async def check_update(
     global _update_cache, _update_cache_time
 
     now = time.time()
-    if _update_cache is not None and now - _update_cache_time < _UPDATE_CACHE_TTL:
-        return _update_cache
+    channel = _read_update_channel()
+
+    if not isinstance(_update_cache, dict) or _update_cache is None:
+        _update_cache = {}
+    if not isinstance(_update_cache_time, dict) or _update_cache_time is None:
+        _update_cache_time = {}
+
+    cached = _update_cache.get(channel)
+    cached_time = _update_cache_time.get(channel, 0.0)
+    if cached is not None and now - cached_time < _UPDATE_CACHE_TTL:
+        return cached
 
     no_update = {
         "update_available": False,
         "latest_version": None,
         "release_url": None,
+        "update_channel": channel,
     }
 
     try:
-        # Use the releases list (not /releases/latest) and pick the highest
-        # stable PEP 440 tag. Dev/rc tags here have historically been
-        # published with the GitHub prerelease flag unset, which makes
-        # /releases/latest return them as if they were stable.
+        # Use the releases list (not /releases/latest) and filter by the
+        # user's update channel. GitHub's prerelease flag has historically
+        # been unreliable for rc/dev tags, so release_check validates tags too.
         resp = await asyncio.to_thread(
             requests.get,
             "https://api.github.com/repos/jundot/omlx/releases",
@@ -5390,15 +5410,15 @@ async def check_update(
             timeout=5,
         )
         if resp.status_code != 200:
-            _update_cache = no_update
-            _update_cache_time = now
-            return _update_cache
+            _update_cache[channel] = no_update
+            _update_cache_time[channel] = now
+            return _update_cache[channel]
 
-        data = select_latest_stable_release(resp.json())
+        data = select_latest_release(resp.json(), channel=channel)
         if data is None:
-            _update_cache = no_update
-            _update_cache_time = now
-            return _update_cache
+            _update_cache[channel] = no_update
+            _update_cache_time[channel] = now
+            return _update_cache[channel]
 
         latest = data["tag_name"].lstrip("v")
 
@@ -5410,20 +5430,21 @@ async def check_update(
             update_available = False
 
         if update_available:
-            _update_cache = {
+            _update_cache[channel] = {
                 "update_available": True,
                 "latest_version": latest,
                 "release_url": data.get("html_url"),
+                "update_channel": channel,
             }
         else:
-            _update_cache = no_update
+            _update_cache[channel] = no_update
 
-        _update_cache_time = now
+        _update_cache_time[channel] = now
     except Exception:
-        _update_cache = no_update
-        _update_cache_time = now
+        _update_cache[channel] = no_update
+        _update_cache_time[channel] = now
 
-    return _update_cache
+    return _update_cache[channel]
 
 
 # =============================================================================
