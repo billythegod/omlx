@@ -74,7 +74,7 @@ final class ServerProcess: @unchecked Sendable {
     /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
     /// `0.0.0.0` is a bind wildcard, not a connectable address.
     var host: String {
-        bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
+        AppConfig.connectableHost(for: bindAddress)
     }
     private(set) var port: Int
     private(set) var basePath: URL
@@ -131,8 +131,10 @@ final class ServerProcess: @unchecked Sendable {
         self.port     = port
         self.basePath = basePath
         self.logURL   = ServerProcess.defaultLogURL()
-        let connectableHost = bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
-        self.resolver = PortConflictResolver(host: connectableHost, port: port)
+        self.resolver = PortConflictResolver(
+            host: AppConfig.connectableHost(for: bindAddress),
+            port: port
+        )
     }
 
     // MARK: - Public surface
@@ -387,7 +389,7 @@ final class ServerProcess: @unchecked Sendable {
     private func makeArguments() -> [String] {
         let env = ProcessInfo.processInfo.environment
         if let dev = env["OMLX_DEV_SERVER_SCRIPT"], !dev.isEmpty {
-            return [dev, "--host", host, "--port", String(port)]
+            return [dev, "--host", bindAddress, "--port", String(port)]
         }
         return [
             "-m", "omlx.cli", "serve",

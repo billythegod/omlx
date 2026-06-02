@@ -676,6 +676,7 @@ final class ServerScreenVM: ObservableObject {
     /// from `host`/`portText` so the URLs don't flicker mid-edit.
     @Published var effectiveHost: String = "127.0.0.1"
     @Published var effectivePort: Int = 8000
+    var appliedBindAddress: String = "127.0.0.1"
 
     /// Apply-button baselines: snapshots of each Apply-managed draft taken
     /// after a successful `load()` or `applyServerSettings()`. The button's
@@ -703,8 +704,8 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
-            // effectiveHost is used for endpoint URLs — normalise 0.0.0.0 → 127.0.0.1
-            self.effectiveHost = dto.server.host == "0.0.0.0" ? "127.0.0.1" : dto.server.host
+            self.appliedBindAddress = dto.server.host
+            self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
@@ -928,8 +929,9 @@ final class ServerScreenVM: ObservableObject {
 
     func applyConfig(_ config: AppConfig) {
         if !hasLoaded {
-            self.host = config.host
+            self.host = config.bindAddress
             self.portText = String(config.port)
+            self.appliedBindAddress = config.bindAddress
             self.effectiveHost = config.host
             self.effectivePort = config.port
         }
@@ -948,7 +950,8 @@ final class ServerScreenVM: ObservableObject {
             await commit(GlobalSettingsPatch(host: next))
             do {
                 try await services.applyServerEndpoint(host: next)
-                self.effectiveHost = next == "0.0.0.0" ? "127.0.0.1" : next
+                self.appliedBindAddress = next
+                self.effectiveHost = AppConfig.connectableHost(for: next)
             } catch {
                 self.lastError = error.omlxDescription
             }
@@ -1002,7 +1005,7 @@ final class ServerScreenVM: ObservableObject {
         let trimmedPort = portText.trimmingCharacters(in: .whitespaces)
         let parsedPort = Int(trimmedPort)
         let portChanged = parsedPort.map { $0 != effectivePort } ?? false
-        let hostChanged = host != effectiveHost
+        let hostChanged = host != appliedBindAddress
 
         if portChanged, let p = parsedPort, !(1...65535).contains(p) {
             self.lastError = String(localized: "server.error.port_invalid",
@@ -1031,7 +1034,10 @@ final class ServerScreenVM: ObservableObject {
                         port: portChanged ? parsedPort : nil
                     )
                     if let p = parsedPort, portChanged { self.effectivePort = p }
-                    if hostChanged { self.effectiveHost = host == "0.0.0.0" ? "127.0.0.1" : host }
+                    if hostChanged {
+                        self.appliedBindAddress = host
+                        self.effectiveHost = AppConfig.connectableHost(for: host)
+                    }
                 } else {
                     try await services.restartServer()
                 }

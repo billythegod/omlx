@@ -30,7 +30,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
     /// `0.0.0.0` is a bind wildcard, not a connectable address.
     var host: String {
-        bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
+        Self.connectableHost(for: bindAddress)
     }
     var port: Int
     var apiKey: String?
@@ -63,6 +63,10 @@ struct AppConfig: Sendable, Equatable, Codable {
         URL(fileURLWithPath: base, isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
             .path
+    }
+
+    static func connectableHost(for bindAddress: String) -> String {
+        bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
     }
 
     var baseURL: URL? {
@@ -224,7 +228,8 @@ struct AppConfig: Sendable, Equatable, Codable {
         }
 
         var server = (json["server"] as? [String: Any]) ?? [:]
-        server["bind_address"] = bindAddress
+        server["host"] = bindAddress
+        server.removeValue(forKey: "bind_address")
         server["port"] = port
         json["server"] = server
 
@@ -263,6 +268,10 @@ struct AppConfig: Sendable, Equatable, Codable {
         var hfEndpoint: String?
     }
 
+    static func readSettingsForTests(basePath: String) throws -> ServerSettingsSlice {
+        try readSettings(basePath: basePath)
+    }
+
     private static func readSettings(basePath: String) throws -> ServerSettingsSlice {
         let url = settingsURL(basePath: basePath)
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -274,9 +283,10 @@ struct AppConfig: Sendable, Equatable, Codable {
         let auth   = json["auth"]   as? [String: Any]
         let model  = json["model"]  as? [String: Any]
         let hf     = json["huggingface"] as? [String: Any]
-        // Migrate: read bind_address first, fall back to legacy "host" key.
-        let bindAddr = server?["bind_address"] as? String
-            ?? server?["host"] as? String
+        // `host` remains the Python/admin settings key. `bind_address` is a
+        // read-only compatibility fallback for builds that briefly wrote it.
+        let bindAddr = server?["host"] as? String
+            ?? server?["bind_address"] as? String
         return ServerSettingsSlice(
             bindAddress: bindAddr,
             port: server?["port"] as? Int,
