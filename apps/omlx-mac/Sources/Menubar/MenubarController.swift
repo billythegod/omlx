@@ -634,7 +634,7 @@ final class MenubarController: NSObject {
     }
 
     @objc private func installUpdate() {
-        updates?.installAndRestart()
+        updates?.requestUpdateConfirmation()
     }
 
     @objc private func showAbout() {
