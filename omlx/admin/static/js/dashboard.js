@@ -3365,8 +3365,8 @@
             // Memory guard tier → live hard ceiling (GB) for the selected tier.
             // Mirrors ProcessMemoryEnforcer._get_hard_limit_bytes:
             //   static_ceiling  = total - tier.static_reserve
-            //   dynamic_ceiling = omlx_phys_footprint + system_available - tier.other_app_reserve
-            //   final = min(static, dynamic)
+            //   dynamic_ceiling = omlx_phys + free + inactive + active * ratio
+            //   final = min(static, dynamic, metal_cap)
             // The static / dynamic inputs come from the global-settings
             // response and reflect the moment that response was fetched.
             // Warning shown below the breakdown when the kernel
@@ -3465,9 +3465,11 @@
                 // Static / metal cap for the final clamp shown to the user.
                 const totalGB = (sys.total_memory_bytes || 0) / GB;
                 const staticReserveGB =
-                    totalGB < 16
-                        ? 4
-                        : { safe: 12, balanced: 8, aggressive: 6, custom: 8 }[tier] ?? 8;
+                    tier === 'custom'
+                        ? 2
+                        : totalGB < 16
+                            ? 4
+                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
