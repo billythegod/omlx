@@ -39,6 +39,11 @@ final class MenubarControllerPortTests: XCTestCase {
         )
     }
 
+    func testSpawnEnvironmentAdvertisesMenubarSupervisor() {
+        let env = makeRuntime().makeEnvironment()
+        XCTAssertEqual(env["OMLX_SUPERVISED"], "menubar")
+    }
+
     // MARK: - displayPort
 
     func testDisplayPortFallsBackToConfigWhenNoServer() {
