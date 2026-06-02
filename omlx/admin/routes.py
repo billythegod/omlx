@@ -544,6 +544,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     """
     from pathlib import Path
 
+    from ..model_discovery import model_directory_access_error
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
@@ -552,10 +553,9 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     # Validate all model directories
     for model_dir in model_dirs:
         model_path = Path(model_dir).expanduser().resolve()
-        if not model_path.exists():
-            return False, f"Model directory does not exist: {model_dir}"
-        if not model_path.is_dir():
-            return False, f"Path is not a directory: {model_dir}"
+        access_error = model_directory_access_error(model_path)
+        if access_error is not None:
+            return False, access_error
 
     pool = _server_state.engine_pool
 

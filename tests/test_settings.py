@@ -915,6 +915,29 @@ class TestGlobalSettings:
             assert len(resolved_dirs) == 1
             assert resolved_dirs[0] == valid_models.resolve()
 
+    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Test that existing but unreadable model dirs are skipped."""
+        base = tmp_path / "omlx"
+        valid_models = tmp_path / "valid_models"
+        unreadable = tmp_path / "unreadable_models"
+        unreadable.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        settings = GlobalSettings(base_path=base)
+        settings.model.model_dirs = [str(valid_models), str(unreadable)]
+        settings.ensure_directories()
+
+        resolved_dirs = settings.model.get_model_dirs(base)
+        assert resolved_dirs == [valid_models.resolve()]
+
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
         settings = GlobalSettings()
