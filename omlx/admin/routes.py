@@ -3554,7 +3554,7 @@ def _parse_commits_from_pyproject(
     # Match: "mlx-lm @ git+https://github.com/.../mlx-lm@<sha>"
     pattern = r'"(\S+)\s*@\s*git\+https://[^@"]+@([0-9a-f]{7,40})"'
     for match in re.finditer(pattern, content):
-        pkg_name = match.group(1).strip().lower()
+        pkg_name = match.group(1).strip().lower().split("[", 1)[0]
         sha = match.group(2)
         if pkg_name in packages:
             repo_url = packages[pkg_name]
