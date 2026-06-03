@@ -2340,3 +2340,118 @@ class TestPreloadBlocks:
             assert ssd_manager2._hot_cache_get(bh) is not None
 
         ssd_manager2.close()
+
+
+class TestComputeMaxPendingWrites:
+    """Pin the block-size-aware cap formula.
+
+    The pending-writes queue holds raw KV bytes that the background
+    SSD writer hasn't drained yet — so the cap must scale by bytes per
+    slot, not just host RAM. Cap should shrink when each block is
+    expensive (large block_size or fat KV) and grow when each block is
+    cheap, keeping the worst-case pinned bytes at a small fraction of
+    host RAM regardless of system size.
+    """
+
+    def test_floor_clamps_low_end(self):
+        """An unreasonably large per-slot cost still produces at least
+        the minimum cap so saves never serialize against the disk."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # 100 MB per slot × 16 slots = 1.6 GB; on any modern Mac the
+        # math says fewer slots, the floor pulls it back to 16.
+        cap = _compute_max_pending_writes(
+            block_size_tokens=10_000_000,
+            kv_bytes_per_token=1_000_000,
+        )
+        assert cap == 16
+
+    def test_ceiling_clamps_high_end(self):
+        """A 512 GB host with tiny blocks still tops out at 256
+        rather than pinning thousands of in-flight writes."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # Tiny per-slot cost → math would produce a huge number;
+        # the ceiling must hold at 256.
+        cap = _compute_max_pending_writes(
+            block_size_tokens=1,
+            kv_bytes_per_token=1,
+        )
+        assert cap == 256
+
+    def test_larger_block_shrinks_cap(self):
+        """Doubling block_size_tokens halves the cap target (until
+        floor/ceiling clamp)."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap_256 = _compute_max_pending_writes(block_size_tokens=256)
+        cap_1024 = _compute_max_pending_writes(block_size_tokens=1024)
+
+        # 4× block size → ¼ the target. Both should be in the
+        # in-band range (above floor, below ceiling) for typical
+        # Macs; if the smaller one is at the ceiling the test
+        # degenerates but the ordering still holds.
+        assert cap_1024 <= cap_256, (
+            "Larger blocks must yield smaller cap so worst-case "
+            "pinned bytes stay bounded"
+        )
+
+    def test_larger_kv_bytes_shrinks_cap(self):
+        """Heavier per-token KV (bigger model) shrinks the cap so
+        the byte budget is preserved across model sizes."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap_small = _compute_max_pending_writes(kv_bytes_per_token=50_000)
+        cap_large = _compute_max_pending_writes(kv_bytes_per_token=400_000)
+
+        assert cap_large <= cap_small
+
+    def test_default_args_produce_sensible_cap(self):
+        """The default-args path used by static callers must produce
+        a cap inside the in-band range [16, 256]."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap = _compute_max_pending_writes()
+        assert 16 <= cap <= 256
+
+    def test_manager_picks_up_per_instance_cap(self, tmp_path):
+        """The PagedSSDCacheManager must recompute the cap from its
+        constructor args, not just inherit the module-level constant.
+        Otherwise a non-default block size silently uses a cap sized
+        for the default block size."""
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDCacheManager,
+            _compute_max_pending_writes,
+        )
+
+        mgr_small = PagedSSDCacheManager(
+            cache_dir=tmp_path / "small",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=256,
+            expected_kv_bytes_per_token=200_000,
+        )
+        mgr_large = PagedSSDCacheManager(
+            cache_dir=tmp_path / "large",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=2048,
+            expected_kv_bytes_per_token=200_000,
+        )
+
+        # Large blocks must produce a cap no larger than small blocks.
+        # Both should equal what the standalone function computes for
+        # the same inputs (no surprise rescaling inside __init__).
+        assert mgr_small._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=256, kv_bytes_per_token=200_000
+        )
+        assert mgr_large._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=2048, kv_bytes_per_token=200_000
+        )
+        assert mgr_large._max_pending_writes <= mgr_small._max_pending_writes
+
+        # The write queue must use the instance cap, not the module
+        # default — otherwise the formula change is ineffective.
+        assert mgr_small._write_queue.maxsize == mgr_small._max_pending_writes
+        assert mgr_large._write_queue.maxsize == mgr_large._max_pending_writes
+
+        mgr_small.close()
+        mgr_large.close()

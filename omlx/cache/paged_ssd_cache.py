@@ -52,29 +52,73 @@ except ImportError:
 
 
 # --- Async I/O constants ---
-def _compute_max_pending_writes() -> int:
-    """Compute max pending writes queue depth based on system memory.
+# Fraction of host RAM the pending-write queue is allowed to pin at
+# worst case. The queue holds raw-byte copies of KV blocks that the
+# background writer hasn't drained yet (see ``_extract_tensor_bytes``
+# in ``save_block``). 5% on a 32 GB Mac = 1.6 GB pinned at saturation,
+# well clear of the OOM threshold for typical inference workloads.
+_PENDING_WRITES_TARGET_RAM_FRACTION = 0.05
 
-    The background writer now handles full safetensors file writes (not just
-    renames), so the queue needs to be deeper to absorb burst saves from
-    large requests (e.g., 64 blocks per 4096-token request).
+# Conservative defaults for the per-block cost estimator. The actual
+# bytes-per-block depends on the model (num_layers × num_kv_heads ×
+# head_dim × dtype_size × block_size_tokens × 2). At construction time
+# the PagedSSDCacheManager doesn't always know these — see __init__'s
+# ``expected_kv_bytes_per_token`` parameter — so the module-level
+# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB
+# spread across all layers. Smaller models will be over-conservative
+# (fine), larger models or larger blocks should pass an explicit value.
+_DEFAULT_BLOCK_SIZE_TOKENS = 256
+_DEFAULT_KV_BYTES_PER_TOKEN = 200_000
 
-    Floor raised from 32 to 64 because long-context coding workloads
-    snapshot ~73 blocks per turn at 150k tokens (block_size=2048), which
-    saturated the prior cap=32 cap on 32-64 GB systems: each saturated
-    burst dropped boundary blocks, breaking partial-cache reconstruction
-    on the next turn and forcing a 10+ minute re-prefill.
 
-    Scales proportionally: 512GB = 256, ≤128GB = 64, minimum 64.
+def _compute_max_pending_writes(
+    block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
+    kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
+    target_fraction: float = _PENDING_WRITES_TARGET_RAM_FRACTION,
+) -> int:
+    """Compute max pending writes queue depth.
+
+    Scales by *block bytes* so the worst-case pending pool stays near
+    ``target_fraction`` of host RAM regardless of how big each block is:
+
+        worst_case_bytes = cap × block_size_tokens × kv_bytes_per_token
+        cap = (total_ram × target_fraction) / (block_size × kv_bytes_per_token)
+
+    Bounded [16, 256]:
+      - Floor at 16 so even tiny systems with large blocks retain
+        burst headroom for a few in-flight writes — dropping to zero
+        means every save serializes against the disk and the writer
+        thread becomes a hard bottleneck on the inference loop.
+      - Ceiling at 256 so 512 GB+ systems don't pin gigabytes against
+        a writer that's already keeping up at lower caps.
+
+    Workload sizing: long-context coding workloads snapshot ~73 blocks
+    per turn at 150 K tokens (block_size=2048), and at the default
+    block size of 256 tokens that's ~586 blocks per snapshot. The
+    queue is a *burst ceiling*, not steady state — a healthy writer
+    drains it continuously and the cap only matters when the writer
+    is fighting memory pressure or slow disk. Saturated drops are
+    strictly more expensive in peak memory than slot retention (a
+    dropped block forces re-prefill, which re-allocates the GPU-side
+    KV that the slot would have held in host bytes only).
+
+    Defaults target a 35B-class bf16 model at the default
+    ``paged_cache_block_size=256``; pass an explicit
+    ``kv_bytes_per_token`` for larger models or quantized configs.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        total_gb = total_bytes / (1024**3)
-        return max(64, min(256, int(total_gb / 2)))
+        block_bytes = max(1, block_size_tokens * kv_bytes_per_token)
+        target = int(total_bytes * target_fraction / block_bytes)
+        return max(16, min(256, target))
     except (ValueError, OSError):
-        return 64  # Safe default
+        return 32  # Safe default
 
 
+# Module-level constant for static callers that don't have model
+# config. The PagedSSDCacheManager recomputes per-instance from its
+# ``__init__`` parameters so a non-default block size or model
+# generation can plumb through.
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
 
 
@@ -712,6 +756,8 @@ class PagedSSDCacheManager(CacheManager):
         hot_cache_budget: SharedHotCacheBudget | None = None,
         expected_model_name: str = "",
         expected_num_layers: int = 0,
+        expected_block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
+        expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
     ):
         """
         Initialize the SSD cache manager.
@@ -734,6 +780,20 @@ class PagedSSDCacheManager(CacheManager):
                 this check (backwards compatible). Catches stale blocks left
                 over after a model upgrade changes its effective layer count
                 (e.g., #1404 attaching MTPModule changed 30 → 40 layers).
+            expected_block_size_tokens: Paged-cache block size in tokens.
+                Used to size the pending-writes queue so the worst-case
+                pinned-byte pool stays near a small fraction of host RAM
+                regardless of how big each block actually is. Defaults to
+                the scheduler's default (256). Passing a larger value
+                shrinks the cap so small Macs with large blocks don't pin
+                gigabytes at saturation; passing a smaller value lets the
+                cap grow to give workloads with many tiny blocks enough
+                burst headroom.
+            expected_kv_bytes_per_token: Per-token KV byte estimate (all
+                layers, K + V, dtype). Together with ``expected_block_size_tokens``
+                this drives the bytes-aware queue cap. Defaults to a
+                35B-class bf16 estimate; pass an explicit value for
+                quantized models or unusually wide/narrow architectures.
         """
         self._cache_dir = cache_dir
         self._max_size = max_size_bytes
@@ -784,7 +844,15 @@ class PagedSSDCacheManager(CacheManager):
             self._scan_existing_files()
 
         # --- Background writer for non-blocking saves ---
-        self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
+        # Recompute the pending-writes cap from THIS cache's block/model
+        # parameters so a non-default block size shrinks (or grows) the
+        # cap appropriately. Falls back to the module-level constant
+        # when no override is supplied.
+        self._max_pending_writes = _compute_max_pending_writes(
+            block_size_tokens=expected_block_size_tokens,
+            kv_bytes_per_token=expected_kv_bytes_per_token,
+        )
+        self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
