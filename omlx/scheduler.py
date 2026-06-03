@@ -5313,7 +5313,8 @@ class Scheduler:
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
                 f"but ceiling is {format_bytes(hard_limit)} "
                 f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length or lower memory_guard_tier."
+                f"Reduce context length, free system memory, or loosen "
+                f"memory_guard_tier (safe → balanced → aggressive)."
             )
             return _PreflightRejection(
                 message=message,
@@ -5372,7 +5373,8 @@ class Scheduler:
             f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
             f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
             f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-            f"Reduce context length or lower memory_guard_tier."
+            f"Reduce context length, free system memory, or loosen "
+            f"memory_guard_tier (safe → balanced → aggressive)."
         )
 
         if not request_id:
