@@ -33,6 +33,9 @@ struct AppConfig: Sendable, Equatable, Codable {
         Self.connectableHost(for: bindAddress)
     }
     var port: Int
+    /// Whether the macOS app should start the managed server automatically
+    /// when the app launches.
+    var autoStartOnLaunch: Bool
     var apiKey: String?
     /// Always `OMLX_BASE_PATH` if set, else `~/.omlx`. Set at load() time
     /// from the current process env so the running app sees a consistent
@@ -52,6 +55,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     init(
         bindAddress: String,
         port: Int,
+        autoStartOnLaunch: Bool = true,
         apiKey: String?,
         basePath: String,
         modelDir: String,
@@ -60,6 +64,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     ) {
         self.bindAddress = bindAddress
         self.port = port
+        self.autoStartOnLaunch = autoStartOnLaunch
         self.apiKey = apiKey
         self.basePath = basePath
         self.modelDir = modelDir
@@ -79,6 +84,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         return AppConfig(
             bindAddress: "127.0.0.1",
             port: 8000,
+            autoStartOnLaunch: true,
             apiKey: nil,
             basePath: base,
             modelDir: modelDir,
@@ -233,6 +239,9 @@ struct AppConfig: Sendable, Equatable, Codable {
         if let slice = try? readSettings(basePath: c.basePath) {
             if let h = slice.bindAddress { c.bindAddress = h }
             if let p = slice.port { c.port = p }
+            if let autoStart = slice.autoStartOnLaunch {
+                c.autoStartOnLaunch = autoStart
+            }
             if let k = slice.apiKey, !k.isEmpty { c.apiKey = k }
             // settings.json may not have model_dirs on a brand-new install;
             // in that case `c.modelDirs` keeps the `<basePath>/models`
@@ -281,6 +290,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         server["host"] = bindAddress
         server.removeValue(forKey: "bind_address")
         server["port"] = port
+        server["auto_start_on_launch"] = autoStartOnLaunch
         json["server"] = server
 
         var auth = (json["auth"] as? [String: Any]) ?? [:]
@@ -314,6 +324,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     struct ServerSettingsSlice {
         var bindAddress: String?
         var port: Int?
+        var autoStartOnLaunch: Bool?
         var apiKey: String?
         var modelDirs: [String]?
         var modelDir: String?
@@ -342,6 +353,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         return ServerSettingsSlice(
             bindAddress: bindAddr,
             port: server?["port"] as? Int,
+            autoStartOnLaunch: server?["auto_start_on_launch"] as? Bool,
             apiKey: auth?["api_key"] as? String,
             modelDirs: model?["model_dirs"] as? [String],
             modelDir: model?["model_dir"] as? String,

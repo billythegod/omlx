@@ -96,6 +96,15 @@ final class AppServices: NSObject, ObservableObject {
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
     }
 
+    func setAutoStartOnLaunch(_ enabled: Bool, persist: Bool = true) throws {
+        var updated = config
+        updated.autoStartOnLaunch = enabled
+        if persist {
+            try updated.save()
+        }
+        self.config = updated
+    }
+
     // MARK: - Server lifecycle (proxied to ServerProcess)
 
     var hasServer: Bool { server != nil }
