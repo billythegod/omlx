@@ -123,8 +123,21 @@ struct ServerScreen: View {
                 ) {
                     TextInput(text: $vm.basePathText, mono: true, width: 280)
                 }
-                FreeRow(isLast: true) {
+                FreeRow {
                     ModelDirectoriesEditor(vm: vm)
+                }
+                Row(
+                    label: String(localized: "server.row.hf_cache",
+                                  defaultValue: "Use Hugging Face local cache",
+                                  comment: "Row label for enabling standard Hugging Face Hub cache model discovery"),
+                    sublabel: String(localized: "server.row.hf_cache.sub",
+                                     defaultValue: "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
+                                     comment: "Sublabel for enabling Hugging Face local cache discovery"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: $vm.hfCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
             }
             ServerAdvancedSection(vm: vm)
@@ -730,6 +743,7 @@ final class ServerScreenVM: ObservableObject {
     @Published var serverAliasesText: String = ""
     @Published var basePathText: String = AppConfig.defaultBasePath()
     @Published var modelDirTexts: [String] = [""]
+    @Published var hfCacheEnabled: Bool = true
     @Published var lastError: String?
     @Published private(set) var isMovingBasePath: Bool = false
 
@@ -764,6 +778,7 @@ final class ServerScreenVM: ObservableObject {
     private var baselineSamplingRepetitionPenaltyText: String = "1.0"
     private var baselineServerAliasesText: String = ""
     private var baselineModelDirs: [String] = []
+    private var baselineHfCacheEnabled: Bool = true
 
     private weak var client: OMLXClient?
     private var hasLoaded = false
@@ -786,6 +801,7 @@ final class ServerScreenVM: ObservableObject {
             if !modelDirs.isEmpty {
                 self.modelDirTexts = modelDirs
             }
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -817,6 +833,7 @@ final class ServerScreenVM: ObservableObject {
         baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
         baselineServerAliasesText = serverAliasesText
         baselineModelDirs = Self.normalizedModelDirs(from: modelDirTexts)
+        baselineHfCacheEnabled = hfCacheEnabled
     }
 
     /// Apply-button gate: true when any Apply-managed draft diverges from
@@ -833,6 +850,7 @@ final class ServerScreenVM: ObservableObject {
         if t(samplingTopKText) != baselineSamplingTopKText { return true }
         if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
         if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        if hfCacheEnabled != baselineHfCacheEnabled { return true }
         return hasPendingStorageChanges(services: services)
     }
 
@@ -917,6 +935,9 @@ final class ServerScreenVM: ObservableObject {
         if newAliases != parseAliases(baselineServerAliasesText) {
             patch.serverAliases = newAliases
         }
+        if hfCacheEnabled != baselineHfCacheEnabled {
+            patch.hfCacheEnabled = hfCacheEnabled
+        }
 
         let diff = storageDiff(services: services)
         if diff.baseChanged && diff.normalizedBase.isEmpty {
@@ -943,6 +964,7 @@ final class ServerScreenVM: ObservableObject {
             || patch.samplingTopK != nil
             || patch.samplingRepetitionPenalty != nil
             || patch.serverAliases != nil
+            || patch.hfCacheEnabled != nil
             || patch.modelDirs != nil
 
         if !patchHasFields && !diff.hasChanges {

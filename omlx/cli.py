@@ -16,9 +16,20 @@ Usage:
 
 import argparse
 import faulthandler
+import math
 import sys
 
 from ._version import __version__
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 0")
+    return parsed
 
 
 def _has_cli_overrides(args) -> bool:
@@ -37,9 +48,15 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
         return True
+    if hasattr(args, "memory_guard") and args.memory_guard is not None:
+        return True
+    if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
+        return True
     if hasattr(args, "mcp_config") and args.mcp_config is not None:
         return True
     if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
+        return True
+    if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
         return True
     if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
         return True
@@ -187,7 +204,7 @@ def serve_command(args):
         from .server import init_server
         from .config import parse_size
 
-        model_dirs = settings.model.get_model_dirs(settings.base_path)
+        model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
         print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
         print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
@@ -613,6 +630,21 @@ Example directory structure:
         help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
 
+    # Memory guard options
+    serve_parser.add_argument(
+        "--memory-guard",
+        type=str,
+        choices=["safe", "balanced", "aggressive"],
+        default=None,
+        help="Memory guard tier. safe reserves more system memory; aggressive allows more oMLX memory use. (default: balanced)",
+    )
+    serve_parser.add_argument(
+        "--memory-guard-gb",
+        type=_positive_float,
+        default=None,
+        help="Custom memory guard ceiling in GB. Sets memory guard tier to custom.",
+    )
+
     # paged SSD cache options
     serve_parser.add_argument(
         "--paged-ssd-cache-dir",
@@ -659,6 +691,13 @@ Example directory structure:
         type=str,
         default=None,
         help="Custom HuggingFace Hub endpoint URL (e.g., https://hf-mirror.com)",
+    )
+    serve_parser.add_argument(
+        "--hf-cache",
+        dest="hf_cache_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Discover models from the standard HuggingFace Hub local cache (default: enabled)",
     )
 
     # ModelScope options

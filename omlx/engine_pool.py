@@ -61,6 +61,8 @@ class EngineEntry:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"
+    source_repo_id: str | None = None
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -191,6 +193,8 @@ class EnginePool:
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
                     model_context_length=getattr(info, "model_context_length", None),
+                    source_type=getattr(info, "source_type", "local"),
+                    source_repo_id=getattr(info, "source_repo_id", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -998,6 +1002,8 @@ class EnginePool:
                     "config_model_type": e.config_model_type,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
+                    "source_type": e.source_type,
+                    "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())
