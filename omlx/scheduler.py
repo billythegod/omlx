@@ -5101,6 +5101,74 @@ class Scheduler:
             )
         return None
 
+    def preflight_or_raise(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int = 0,
+        request_id: str | None = None,
+    ) -> None:
+        """Pre-StreamingResponse prefill memory check.
+
+        Called from the engine's ``preflight_chat`` / ``preflight_completion``
+        before the FastAPI route wraps the body in a ``StreamingResponse``,
+        so the typed exception can be mapped to HTTP 413 by the registered
+        handler. A no-op when the guard is disabled or the request fits.
+
+        Mirrors the ``_preflight_memory_check`` math but takes token counts
+        directly (no Request object) and raises instead of returning a
+        message — the in-stream re-check inside ``_schedule_waiting``
+        remains as defense-in-depth.
+        """
+        if not self._prefill_memory_guard:
+            return
+        if self._memory_hard_limit_bytes <= 0:
+            return
+        if self.memory_monitor is None:
+            return
+
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        if new_tokens == 0:
+            return
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
+        )
+        if peak == 0:
+            return
+
+        current = max(mx.get_active_memory(), get_phys_footprint())
+        if current + peak <= self._memory_hard_limit_bytes:
+            return
+
+        from .exceptions import PrefillMemoryExceededError
+        from .utils.hardware import format_bytes
+
+        usage_gb = current / (1024**3)
+        ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
+        message = (
+            f"Prefill would require ~{format_bytes(current + peak)} peak "
+            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+            f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+            f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+            f"Reduce context length or lower memory_guard_tier."
+        )
+
+        if not request_id:
+            import uuid as _uuid
+
+            request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+        logger.warning(
+            "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+            num_prompt_tokens, cached_tokens, request_id, message,
+        )
+        raise PrefillMemoryExceededError(
+            message=message,
+            request_id=request_id,
+            estimated_bytes=int(current + peak),
+            limit_bytes=int(self._memory_hard_limit_bytes),
+        )
+
     def _schedule_waiting(
         self,
     ) -> tuple[list["Request"], list[RequestOutput]]:
