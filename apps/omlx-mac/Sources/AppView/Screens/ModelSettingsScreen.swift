@@ -77,11 +77,16 @@ private struct Header: View {
         HStack(spacing: 12) {
             Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
             VStack(alignment: .leading, spacing: 2) {
-                Text(model?.settings?.displayName ?? model?.id ?? "—")
-                    .font(.omlxText(17, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Text(model?.settings?.displayName ?? model?.id ?? "—")
+                        .font(.omlxText(17, weight: .semibold))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let id = model?.id {
+                        CopyIconButton(value: id)
+                    }
+                }
                 if let m = model {
                     Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                         .font(.omlxMono(11))
@@ -90,6 +95,7 @@ private struct Header: View {
                         .truncationMode(.middle)
                 }
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             Button {
                 onBack()

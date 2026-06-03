@@ -1602,6 +1602,18 @@
         }
       }
     },
+    "common.copy_model_id" : {
+      "comment" : "Tooltip and accessibility label for a button that copies a model identifier",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy model ID"
+          }
+        }
+      }
+    },
     "common.create" : {
       "extractionState" : "manual",
       "localizations" : {
