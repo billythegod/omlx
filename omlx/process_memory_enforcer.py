@@ -57,9 +57,9 @@ _SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
 # `balanced` reserve so the static cap stays sane regardless of what
 # the user types into the custom ceiling field.
 _STATIC_RESERVE_LARGE: dict[str, int] = {
-    "safe": 12 * 1024**3,  # aligned with Apple iogpu.wired_limit 75%
-    "balanced": 8 * 1024**3,
-    "aggressive": 6 * 1024**3,
+    "safe": 8 * 1024**3,
+    "balanced": 6 * 1024**3,
+    "aggressive": 4 * 1024**3,
     "custom": 2 * 1024**3,
 }
 
