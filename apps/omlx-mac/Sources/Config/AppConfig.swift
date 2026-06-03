@@ -181,9 +181,8 @@ struct AppConfig: Sendable, Equatable, Codable {
     /// `currentBasePath()` resolution on the next launch:
     ///   • process env via `setenv`/`unsetenv` (so the spawned child
     ///     server inherits the choice immediately)
-    ///   • bootstrap file (so Finder relaunches see it; launchd does not
-    ///     inherit shell rc)
-    ///   • shell rc (so terminal-launched `omlx` invocations agree)
+    ///   • bootstrap file (so Finder relaunches and the app-managed CLI shim
+    ///     see it without editing shell rc files)
     /// Pass `nil` (or an empty string) to clear every override — the
     /// "reset to ~/.omlx default" flow. Callers should compare against
     /// `defaultBasePath()` first and pass `nil` when the user chose the
@@ -196,7 +195,6 @@ struct AppConfig: Sendable, Equatable, Codable {
             unsetenv(ShellEnvWriter.variableName)
         }
         try? writeBootstrapBasePath(value)
-        ShellEnvWriter.apply(value: value)
     }
 
     static func defaultBasePath() -> String {
