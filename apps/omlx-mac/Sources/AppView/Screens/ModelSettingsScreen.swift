@@ -976,9 +976,7 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.turboquant.label",
                               defaultValue: "TurboQuant KV Cache",
                               comment: "Row label for the TurboQuant KV cache toggle"),
-                sublabel: String(localized: "settings.experimental.turboquant.sub",
-                                 defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                                 comment: "Sublabel describing TurboQuant KV cache")) {
+                sublabel: turboquantSublabel) {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
@@ -989,6 +987,8 @@ private struct ExperimentalSection: View {
                     }
                     Toggle("", isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .labelsHidden().toggleStyle(.switch)
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
 
@@ -1016,11 +1016,11 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.specprefill.label",
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
-                sublabel: String(localized: "settings.experimental.specprefill.sub",
-                                 defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
-                                 comment: "Sublabel describing SpecPrefill")) {
+                sublabel: specprefillSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
                     .labelsHidden().toggleStyle(.switch)
+                    .disabled(vm.vlmMtpEnabled)
+                    .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
             if vm.specprefillEnabled {
                 Row(label: String(localized: "settings.experimental.specprefill.draft.label",
@@ -1062,8 +1062,8 @@ private struct ExperimentalSection: View {
                 sublabel: dflashSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
                     .labelsHidden().toggleStyle(.switch)
-                    .disabled(!(vm.model?.dflashCompatible ?? true))
-                    .help(vm.model?.dflashCompatibilityReason ?? "")
+                    .disabled(dflashToggleDisabled)
+                    .help(dflashHelp)
             }
             if vm.dflashEnabled {
                 Row(label: String(localized: "settings.experimental.dflash.draft.label",
@@ -1252,11 +1252,44 @@ private struct ExperimentalSection: View {
         }
     }
 
+    private var vlmMtpOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.vlm_mtp",
+               defaultValue: "Disable VLM MTP before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
+    }
+
+    private var turboquantSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.turboquant.sub",
+                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing TurboQuant KV cache")
+    }
+
+    private var specprefillSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.specprefill.sub",
+                      defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
+                      comment: "Sublabel describing SpecPrefill")
+    }
+
+    private var dflashToggleDisabled: Bool {
+        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+    }
+
+    private var dflashHelp: String {
+        if let reason = vm.model?.dflashCompatibilityReason,
+           !(vm.model?.dflashCompatible ?? true) {
+            return reason
+        }
+        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
+    }
+
     private var dflashSublabel: String {
         if let reason = vm.model?.dflashCompatibilityReason,
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")

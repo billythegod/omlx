@@ -85,6 +85,18 @@
         }
       }
     },
+    "settings.speculative.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling this feature."
+          }
+        }
+      }
+    },
     "settings.mtp.conflict.vlm_mtp" : {
       "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
       "extractionState" : "manual",
