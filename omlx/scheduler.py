@@ -45,6 +45,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.generation_config import load_generation_config_token_ids
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -52,6 +53,39 @@ from .utils.tokenizer import create_streaming_detokenizer
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
 # stream when no per-engine stream is provided.
 _default_generation_stream = generation_stream
+
+
+def _apply_suppress_token_ids(logits: Any, suppress_token_ids: tuple[int, ...]) -> Any:
+    if suppress_token_ids:
+        logits[..., list(suppress_token_ids)] = mx.array(float("-inf"))
+    return logits
+
+
+def _make_suppress_logits_processor(
+    suppress_token_ids: set[int],
+) -> Callable[[Any, Any], Any] | None:
+    suppress_tuple = tuple(sorted(int(t) for t in suppress_token_ids))
+    if not suppress_tuple:
+        return None
+
+    def _suppress_logits(tokens: Any, logits: Any) -> Any:
+        return _apply_suppress_token_ids(logits, suppress_tuple)
+
+    return _suppress_logits
+
+
+def _make_suppressing_sampler(
+    sampler: Callable[[Any], Any],
+    suppress_token_ids: set[int],
+) -> Callable[[Any], Any]:
+    suppress_tuple = tuple(sorted(int(t) for t in suppress_token_ids))
+    if not suppress_tuple:
+        return sampler
+
+    def _sample(logits: Any) -> Any:
+        return sampler(_apply_suppress_token_ids(logits, suppress_tuple))
+
+    return _sample
 
 
 @dataclass
@@ -779,9 +813,8 @@ class Scheduler:
             self._load_generation_config_eos()
         )
 
-        # Load suppress_tokens from generation_config.json for Gemma 4 unified models.
-        # Prevents generation of multimodal placeholder tokens (<image|>, <audio|>)
-        # on text-only inputs.
+        # Load generation_config.suppress_tokens once and apply them on every
+        # sampling path. Gemma 4 uses this to suppress multimodal close markers.
         self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
@@ -1488,37 +1521,16 @@ class Scheduler:
     def _load_generation_config_eos(self) -> set[int] | None:
         """Load EOS token IDs from generation_config.json if available."""
         try:
-            model_path = getattr(self.tokenizer, "name_or_path", None)
-            if not model_path:
+            model_ref = getattr(self.tokenizer, "name_or_path", None) or getattr(
+                self.config, "model_name", None
+            )
+            if not model_ref:
                 return None
-            import json
-            import os
 
-            gc_path = os.path.join(model_path, "generation_config.json")
-            if not os.path.exists(gc_path):
-                # name_or_path may be a HuggingFace repo ID (e.g. for VLM
-                # tokenizers loaded via AutoProcessor).  Try the HF cache.
-                try:
-                    from huggingface_hub import try_to_load_from_cache
-
-                    cached = try_to_load_from_cache(
-                        model_path, "generation_config.json"
-                    )
-                    if cached and isinstance(cached, str):
-                        gc_path = cached
-                    else:
-                        return None
-                except (ImportError, Exception):
-                    return None
-            with open(gc_path) as f:
-                gc = json.load(f)
-            eos = gc.get("eos_token_id")
-            if eos is None:
+            result = load_generation_config_token_ids(model_ref, "eos_token_id")
+            if result is None:
                 return None
-            if isinstance(eos, list):
-                result = set(eos)
-            else:
-                result = {eos}
+
             # Only return if there are tokens beyond what tokenizer already provides
             tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
             if tokenizer_eos is not None:
@@ -1542,39 +1554,20 @@ class Scheduler:
     def _load_model_suppress_tokens(self) -> set[int]:
         """Load suppress_tokens from generation_config.json if available.
 
-        These tokens are set to -inf during generation to prevent multimodal
-        placeholder token emission (e.g. <image|>, <audio|>) on text-only inputs.
+        These tokens are set to -inf during generation. For Gemma 4 unified,
+        generation_config marks the multimodal close markers (<image|>,
+        <audio|>) this way.
         """
         try:
-            model_path = getattr(self.tokenizer, "name_or_path", None)
-            if not model_path:
+            model_ref = getattr(self.tokenizer, "name_or_path", None) or getattr(
+                self.config, "model_name", None
+            )
+            if not model_ref:
                 return set()
-            import json
-            import os
 
-            gc_path = os.path.join(model_path, "generation_config.json")
-            if not os.path.exists(gc_path):
-                try:
-                    from huggingface_hub import try_to_load_from_cache
-
-                    cached = try_to_load_from_cache(
-                        model_path, "generation_config.json"
-                    )
-                    if cached and isinstance(cached, str):
-                        gc_path = cached
-                    else:
-                        return set()
-                except (ImportError, Exception):
-                    return set()
-            with open(gc_path) as f:
-                gc = json.load(f)
-            suppress = gc.get("suppress_tokens")
-            if suppress is None:
+            result = load_generation_config_token_ids(model_ref, "suppress_tokens")
+            if not result:
                 return set()
-            if isinstance(suppress, list):
-                result = set(suppress)
-            else:
-                result = {suppress}
             logger.info(
                 f"Loaded {len(result)} suppress token(s) from "
                 f"generation_config.json: {result}"
@@ -1736,15 +1729,11 @@ class Scheduler:
             ),
         )
 
-        # Suppress model-specific tokens (e.g. Gemma 4 <image|>/<audio|>)
-        if self._model_suppress_tokens:
-            _suppress_list = list(self._model_suppress_tokens)
-
-            def _suppress_logits(tokens, logits):
-                logits[..., _suppress_list] = mx.array(float("-inf"))
-                return logits
-
-            logits_processors.append(_suppress_logits)
+        suppress_processor = _make_suppress_logits_processor(
+            self._model_suppress_tokens
+        )
+        if suppress_processor is not None:
+            logits_processors.append(suppress_processor)
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
@@ -3199,15 +3188,11 @@ class Scheduler:
             ),
         )
 
-        # Suppress model-specific tokens (e.g. Gemma 4 <image|>/<audio|>)
-        if self._model_suppress_tokens:
-            _suppress_list = list(self._model_suppress_tokens)
-
-            def _suppress_logits(tokens, logits):
-                logits[..., _suppress_list] = mx.array(float("-inf"))
-                return logits
-
-            logits_processors.append(_suppress_logits)
+        suppress_processor = _make_suppress_logits_processor(
+            self._model_suppress_tokens
+        )
+        if suppress_processor is not None:
+            logits_processors.append(suppress_processor)
 
         # Add thinking budget processor for reasoning models
         if (
@@ -4625,6 +4610,7 @@ class Scheduler:
             )
             return None
 
+        mtp_sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
         try:
             with mx.stream(self._stream):
@@ -4645,7 +4631,7 @@ class Scheduler:
             return None
 
         logits = out.logits[:, -1, :]
-        first_bonus_arr = sampler(logits)  # mx.array shape [1]
+        first_bonus_arr = mtp_sampler(logits)  # mx.array shape [1]
         mx.eval(first_bonus_arr)
 
         hidden_states = out.hidden_states
@@ -4673,7 +4659,7 @@ class Scheduler:
                 shared_kv_states=out.shared_kv_states,
                 first_bonus=int(first_bonus_arr.item()),
                 max_tokens=request.sampling_params.max_tokens,
-                sampler=sampler,
+                sampler=mtp_sampler,
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
@@ -4692,7 +4678,7 @@ class Scheduler:
             generator=generator,
             request=request,
             prompt_cache=prefilled_cache,
-            sampler=sampler,
+            sampler=mtp_sampler,
             state_machine=state_machine,
             max_tokens=request.sampling_params.max_tokens,
             stop_token_ids=set(eos_ids),
