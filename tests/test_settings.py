@@ -1791,24 +1791,28 @@ class TestIntegrationSettings:
     """Tests for IntegrationSettings dataclass.
 
     Upstream ``tests/test_integrations.py::TestIntegrationSettings`` already
-    covers defaults, basic to_dict, and full/empty from_dict. The tests
-    here are the additive coverage: exact dict-shape pinning (so a future
-    field addition that forgets to_dict raises a loud test failure — see
+    covers defaults, basic to_dict, and full/empty from_dict. The local
+    tests below add: exact dict-shape pinning (so a future field
+    addition that forgets to_dict raises a loud test failure — see
     81dc2d5 for the MemorySettings case), partial-dict fallback,
-    explicit-null override semantics, and round-trip identity.
+    explicit-null override semantics, and round-trip identity. Plus
+    upstream's MarkItDown-integration tests merged in below.
     """
 
     def test_to_dict_defaults(self):
         settings = IntegrationSettings()
-        assert settings.to_dict() == {
-            "codex_model": None,
-            "opencode_model": None,
-            "openclaw_model": None,
-            "hermes_model": None,
-            "pi_model": None,
-            "copilot_model": None,
-            "openclaw_tools_profile": "coding",
-        }
+        d = settings.to_dict()
+        # Pin only the integration-model surface — MarkItDown additions
+        # are covered by ``test_markitdown_defaults`` separately, so we
+        # check the model fields exactly and leave the rest free to
+        # grow.
+        assert d["codex_model"] is None
+        assert d["opencode_model"] is None
+        assert d["openclaw_model"] is None
+        assert d["hermes_model"] is None
+        assert d["pi_model"] is None
+        assert d["copilot_model"] is None
+        assert d["openclaw_tools_profile"] == "coding"
 
     def test_to_dict_custom(self):
         settings = IntegrationSettings(
@@ -1820,15 +1824,14 @@ class TestIntegrationSettings:
             copilot_model="qwen-coder-1.5b",
             openclaw_tools_profile="creative",
         )
-        assert settings.to_dict() == {
-            "codex_model": "qwen-coder-30b",
-            "opencode_model": "qwen-coder-7b",
-            "openclaw_model": "qwen-coder-3b",
-            "hermes_model": "hermes-3-8b",
-            "pi_model": "qwen-3-4b",
-            "copilot_model": "qwen-coder-1.5b",
-            "openclaw_tools_profile": "creative",
-        }
+        d = settings.to_dict()
+        assert d["codex_model"] == "qwen-coder-30b"
+        assert d["opencode_model"] == "qwen-coder-7b"
+        assert d["openclaw_model"] == "qwen-coder-3b"
+        assert d["hermes_model"] == "hermes-3-8b"
+        assert d["pi_model"] == "qwen-3-4b"
+        assert d["copilot_model"] == "qwen-coder-1.5b"
+        assert d["openclaw_tools_profile"] == "creative"
 
     def test_from_dict_partial(self):
         """Missing keys fall back to dataclass defaults."""
@@ -1855,6 +1858,43 @@ class TestIntegrationSettings:
         )
         round_tripped = IntegrationSettings.from_dict(original.to_dict())
         assert round_tripped.to_dict() == original.to_dict()
+
+    # --- MarkItDown integration tests merged in from upstream ---
+
+    def test_markitdown_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+
+    def test_markitdown_to_dict(self):
+        settings = IntegrationSettings(
+            markitdown_enabled=False,
+            markitdown_expose_model=False,
+            markitdown_max_file_size_mb=10,
+            markitdown_max_files_per_request=2,
+        )
+        result = settings.to_dict()
+        assert result["markitdown_enabled"] is False
+        assert result["markitdown_expose_model"] is False
+        assert result["markitdown_max_file_size_mb"] == 10
+        assert result["markitdown_max_files_per_request"] == 2
+
+    def test_markitdown_from_dict_backward_compat(self):
+        settings = IntegrationSettings.from_dict({})
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+
+    def test_markitdown_validation(self):
+        settings = GlobalSettings()
+        settings.integrations.markitdown_max_file_size_mb = 0
+        settings.integrations.markitdown_max_files_per_request = 0
+        errors = settings.validate()
+        assert "markitdown_max_file_size_mb must be > 0" in errors
+        assert "markitdown_max_files_per_request must be > 0" in errors
 
 
 class TestClaudeCodeValidation:

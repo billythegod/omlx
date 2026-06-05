@@ -15,6 +15,7 @@ Tests cover:
 Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
+import json
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -932,6 +933,135 @@ class TestSchedulerStopTokens:
 
         # MockTokenizer has eos_token_id = 2
         assert mock_tokenizer.eos_token_id in stop_tokens
+
+    def test_includes_eot_token_id(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() includes end-of-turn token when available."""
+        # eot_token_id as a single int
+        mock_tokenizer.eot_token_id = 106
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert mock_tokenizer.eos_token_id in stop_tokens  # EOS still there too
+
+    def test_includes_eot_token_id_list(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() handles eot_token_id as a list."""
+        mock_tokenizer.eot_token_id = [106, 107]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert 107 in stop_tokens
+
+    def test_falls_back_to_eot_token_encoding(self, mock_model, mock_tokenizer):
+        """When eot_token_id is absent but eot_token string is present, encode it."""
+        mock_tokenizer.eot_token = "<turn|>"
+        # Ensure eot_token_id is NOT present
+        assert not hasattr(mock_tokenizer, "eot_token_id") or mock_tokenizer.eot_token_id is None
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        # The MockTokenizer.encode() returns hash-based IDs, so we get something
+        assert len([t for t in stop_tokens if t != mock_tokenizer.eos_token_id]) > 0
+
+    def test_no_eot_token_when_absent(self, mock_model, mock_tokenizer):
+        """When neither eot_token_id nor eot_token string is present, no crash."""
+        # MockTokenizer has no eot_token_id or eot_token by default
+        assert not hasattr(mock_tokenizer, "eot_token_id")
+        assert not hasattr(mock_tokenizer, "eot_token")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert mock_tokenizer.eos_token_id in stop_tokens
+
+
+class TestSchedulerSuppressTokens:
+    """Tests for generation_config.suppress_tokens handling."""
+
+    def test_loads_generation_config_suppress_tokens(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"suppress_tokens": [258883, 258882]}),
+            encoding="utf-8",
+        )
+        mock_tokenizer.name_or_path = str(tmp_path)
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        assert scheduler._model_suppress_tokens == {258883, 258882}
+
+    def test_suppress_logits_processor_masks_configured_ids(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._model_suppress_tokens = {2}
+
+        _, processors = scheduler._build_sampler_and_processors(SamplingParams())
+
+        assert processors
+        logits = mx.array([[0.0, 4.0, 100.0, 2.0]])
+        masked = processors[-1](mx.array([1]), logits)
+        mx.eval(masked)
+
+        assert float(masked[0, 2].item()) == float("-inf")
+        assert float(masked[0, 1].item()) == 4.0
+
+    def test_vlm_mtp_first_bonus_uses_suppressing_sampler(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._model_suppress_tokens = {3}
+        scheduler._vlm_mtp_drafter = MagicMock()
+
+        class FakeLanguageModel:
+            def rollback_speculative_cache(self):
+                pass
+
+            def __call__(self, *args, **kwargs):
+                return SimpleNamespace(
+                    logits=mx.array([[[0.0, 0.0, 5.0, 99.0, 0.0]]]),
+                    hidden_states=mx.zeros((1, 1, 4)),
+                    shared_kv_states={},
+                )
+
+        mock_model._language_model = FakeLanguageModel()
+        request = Request(
+            request_id="req-mtp",
+            prompt=[1],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        cache = [SimpleNamespace(state=mx.array([0]))]
+
+        def sampler(logits):
+            return mx.argmax(logits, axis=-1)
+
+        captured = {}
+
+        def fake_run_vlm_mtp_decode(**kwargs):
+            captured.update(kwargs)
+
+            def _gen():
+                yield kwargs["first_bonus"]
+
+            return _gen()
+
+        with patch.object(
+            scheduler_module,
+            "run_vlm_mtp_decode",
+            side_effect=fake_run_vlm_mtp_decode,
+        ):
+            uid = scheduler._route_to_vlm_mtp(
+                request,
+                cache,
+                [1],
+                sampler,
+                state_machine=object(),
+            )
+
+        assert uid is not None
+        assert captured["first_bonus"] == 2
+
+        round_logits = mx.array([[0.0, 0.0, 1.0, 99.0, 0.0]])
+        round_token = captured["sampler"](round_logits)
+        mx.eval(round_token)
+        assert int(round_token.item()) == 2
 
 
 class TestSchedulerXtcSpecialTokens:
