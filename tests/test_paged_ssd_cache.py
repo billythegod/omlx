@@ -2455,3 +2455,160 @@ class TestComputeMaxPendingWrites:
 
         mgr_small.close()
         mgr_large.close()
+
+
+class TestSchedulerPlumbsBlockSizeToSSDCache:
+    """The Scheduler construction path must plumb its final
+    ``paged_cache_block_size`` and a model-derived KV bytes-per-token
+    estimate into ``PagedSSDCacheManager.__init__`` — otherwise the
+    block-size-aware queue cap silently falls back to defaults sized
+    for the wrong workload.
+
+    Regression guard for jundot's review on PR #1627:
+
+      > PagedSSDCacheManager now accepts ``expected_block_size_tokens``
+      > / ``expected_kv_bytes_per_token``, but the real scheduler
+      > construction path still does not pass them.
+    """
+
+    def _make_scheduler(self, tmp_path, block_size_tokens, model_layers):
+        """Build a Scheduler with paged SSD cache enabled at the given
+        block size and a model whose config exposes ``model_layers``
+        layers (so the memory monitor produces a real per-token KV
+        estimate rather than its default)."""
+        from unittest.mock import MagicMock
+
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        # Real numbers so MemoryMonitor.set_model_info accepts them.
+        class _Config:
+            num_hidden_layers = model_layers
+            num_key_value_heads = 8
+            num_attention_heads = 32
+            head_dim = 192
+            hidden_size = 6144
+
+        model = MagicMock()
+        model.layers = []
+        model.config = _Config()
+
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+
+        config = SchedulerConfig(
+            max_num_seqs=4,
+            prefill_step_size=2048,
+            paged_cache_block_size=block_size_tokens,
+            paged_ssd_cache_dir=str(tmp_path),
+            paged_ssd_cache_max_size=1 << 30,
+            hot_cache_max_size=0,
+            model_name="test-model",
+        )
+        return Scheduler(model=model, tokenizer=tokenizer, config=config)
+
+    def test_block_size_plumbed_to_ssd_manager(self, tmp_path):
+        """Final scheduler block size must reach the SSD cache manager
+        — not the 256-token default."""
+        sched = self._make_scheduler(
+            tmp_path / "blk1024",
+            block_size_tokens=1024,
+            model_layers=32,
+        )
+
+        # If the plumbing works the manager's pending-writes cap should
+        # be sized for *1024*-token blocks, not the 256 default — which
+        # for the same RAM means a smaller cap.
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # The model-derived per-token cost is what reaches the manager
+        # via ``memory_monitor.estimate_block_memory(1)`` — when the
+        # monitor exists. On branches without the monitor auto-init in
+        # ``Scheduler.__init__`` the manager falls back to its 200 KB
+        # documented default; either way the *block size* must reach
+        # the manager. Recompute the cap the same way the scheduler
+        # does so we know what to expect.
+        if sched.memory_monitor is not None:
+            per_token = sched.memory_monitor.estimate_block_memory(1)
+        else:
+            per_token = 200_000
+        expected_cap = _compute_max_pending_writes(
+            block_size_tokens=1024,
+            kv_bytes_per_token=per_token,
+        )
+        assert (
+            sched.paged_ssd_cache_manager._max_pending_writes == expected_cap
+        ), (
+            "Scheduler must plumb its final paged_cache_block_size "
+            "(and per-token KV estimate when memory_monitor is "
+            "available) into PagedSSDCacheManager"
+        )
+        # Cap differs from the all-defaults cap — proves block_size
+        # actually reached the manager rather than the formula being
+        # called with defaults coincidentally yielding the same number.
+        default_cap = _compute_max_pending_writes(
+            block_size_tokens=256,
+            kv_bytes_per_token=per_token,
+        )
+        assert expected_cap != default_cap, (
+            "Test setup must produce caps where the 1024-block sizing "
+            "differs from the 256-default sizing; otherwise the assertion "
+            "passes trivially. Try a different host RAM tier."
+        )
+        # Write queue capacity must match too — the cap is only useful
+        # if the queue actually enforces it.
+        assert (
+            sched.paged_ssd_cache_manager._write_queue.maxsize
+            == sched.paged_ssd_cache_manager._max_pending_writes
+        )
+        sched.paged_ssd_cache_manager.close()
+
+    def test_larger_block_size_shrinks_scheduler_cap(self, tmp_path):
+        """The same model on the same Mac with a bigger block size
+        must produce a smaller pending-writes cap — proves the wiring
+        is not stuck at the default for every scheduler instance."""
+        sched_small = self._make_scheduler(
+            tmp_path / "blk256",
+            block_size_tokens=256,
+            model_layers=32,
+        )
+        sched_large = self._make_scheduler(
+            tmp_path / "blk2048",
+            block_size_tokens=2048,
+            model_layers=32,
+        )
+
+        cap_small = sched_small.paged_ssd_cache_manager._max_pending_writes
+        cap_large = sched_large.paged_ssd_cache_manager._max_pending_writes
+        assert cap_large <= cap_small, (
+            f"Larger blocks must shrink the cap; got "
+            f"cap(2048)={cap_large} > cap(256)={cap_small}"
+        )
+
+        sched_small.paged_ssd_cache_manager.close()
+        sched_large.paged_ssd_cache_manager.close()
+
+    def test_factory_path_also_plumbs_block_size(self, tmp_path):
+        """The cache factory path (used by direct/test callers) must
+        also pass ``config.block_size`` through — otherwise direct
+        callers silently get the 256-token default regardless of what
+        they configured."""
+        from omlx.cache.factory import CacheConfig, CacheFactory
+
+        cfg = CacheConfig(
+            block_size=1024,
+            paged_ssd_cache_dir=tmp_path,
+            max_paged_ssd_cache_size=1 << 30,
+        )
+        mgr = CacheFactory.create_paged_ssd_cache(cfg, model_name="m")
+        assert mgr is not None
+
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # Factory has no memory monitor, so it leaves
+        # ``kv_bytes_per_token`` at the 200 KB default — that's the
+        # documented contract for non-Scheduler callers.
+        expected = _compute_max_pending_writes(
+            block_size_tokens=1024, kv_bytes_per_token=200_000
+        )
+        assert mgr._max_pending_writes == expected
+        mgr.close()

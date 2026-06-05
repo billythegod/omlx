@@ -7423,6 +7423,24 @@ class Scheduler:
                 else 0
             )
 
+            # Pending-writes queue sizing depends on per-block bytes
+            # (block_size × per-token KV). Pass the *final* scheduler
+            # block size — possibly adjusted from the config default by
+            # RotatingKVCache / ArraysCache logic earlier in
+            # ``__init__`` — and a model-derived per-token KV estimate
+            # from the memory monitor when available. Otherwise the
+            # manager falls back to its 256-token / 200 KB defaults.
+            if self.memory_monitor is not None:
+                # ``estimate_block_memory(1)`` returns all-layers K+V
+                # bytes for a single token at the dtype the monitor was
+                # configured with — exactly the per-token cost the
+                # queue cap needs to weigh.
+                expected_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
+                )
+            else:
+                expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
@@ -7432,6 +7450,8 @@ class Scheduler:
                 hot_cache_budget=self.config.hot_cache_budget,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
+                expected_block_size_tokens=self.config.paged_cache_block_size,
+                expected_kv_bytes_per_token=expected_kv_bytes_per_token,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
