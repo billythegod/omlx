@@ -848,6 +848,13 @@ class PagedSSDCacheManager(CacheManager):
         # parameters so a non-default block size shrinks (or grows) the
         # cap appropriately. Falls back to the module-level constant
         # when no override is supplied.
+        #
+        # Stash the inputs the constructor was called with so callers
+        # (and the plumbing-regression test) can verify what reached
+        # the manager without depending on the cap math landing in a
+        # particular floor/ceiling band on the test host.
+        self._expected_block_size_tokens = expected_block_size_tokens
+        self._expected_kv_bytes_per_token = expected_kv_bytes_per_token
         self._max_pending_writes = _compute_max_pending_writes(
             block_size_tokens=expected_block_size_tokens,
             kv_bytes_per_token=expected_kv_bytes_per_token,

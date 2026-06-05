@@ -2515,52 +2515,46 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
             model_layers=32,
         )
 
-        # If the plumbing works the manager's pending-writes cap should
-        # be sized for *1024*-token blocks, not the 256 default — which
-        # for the same RAM means a smaller cap.
+        mgr = sched.paged_ssd_cache_manager
+
+        # The manager stashes the constructor inputs as
+        # ``_expected_block_size_tokens`` / ``_expected_kv_bytes_per_token``
+        # so the plumbing-regression check is bulletproof regardless
+        # of the test host's RAM tier (where the cap math might clamp
+        # both default and plumbed inputs to the same floor/ceiling).
+        assert mgr._expected_block_size_tokens == 1024, (
+            "Scheduler must plumb its final paged_cache_block_size "
+            "into PagedSSDCacheManager"
+        )
+        # The per-token KV estimate is plumbed from ``memory_monitor.
+        # estimate_block_memory(1)`` when the monitor is available;
+        # otherwise the manager's 200 KB default applies. On branches
+        # without the monitor auto-init in ``Scheduler.__init__``,
+        # accept either value.
+        if sched.memory_monitor is not None:
+            assert mgr._expected_kv_bytes_per_token == (
+                sched.memory_monitor.estimate_block_memory(1)
+            ), (
+                "Scheduler must plumb memory_monitor.estimate_block_memory"
+                "(1) as expected_kv_bytes_per_token when the monitor is "
+                "available"
+            )
+        else:
+            assert mgr._expected_kv_bytes_per_token == 200_000
+
+        # And the cap computed from those plumbed inputs must drive the
+        # write queue's maxsize — the cap is only useful if the queue
+        # actually enforces it.
         from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
 
-        # The model-derived per-token cost is what reaches the manager
-        # via ``memory_monitor.estimate_block_memory(1)`` — when the
-        # monitor exists. On branches without the monitor auto-init in
-        # ``Scheduler.__init__`` the manager falls back to its 200 KB
-        # documented default; either way the *block size* must reach
-        # the manager. Recompute the cap the same way the scheduler
-        # does so we know what to expect.
-        if sched.memory_monitor is not None:
-            per_token = sched.memory_monitor.estimate_block_memory(1)
-        else:
-            per_token = 200_000
         expected_cap = _compute_max_pending_writes(
-            block_size_tokens=1024,
-            kv_bytes_per_token=per_token,
+            block_size_tokens=mgr._expected_block_size_tokens,
+            kv_bytes_per_token=mgr._expected_kv_bytes_per_token,
         )
-        assert (
-            sched.paged_ssd_cache_manager._max_pending_writes == expected_cap
-        ), (
-            "Scheduler must plumb its final paged_cache_block_size "
-            "(and per-token KV estimate when memory_monitor is "
-            "available) into PagedSSDCacheManager"
-        )
-        # Cap differs from the all-defaults cap — proves block_size
-        # actually reached the manager rather than the formula being
-        # called with defaults coincidentally yielding the same number.
-        default_cap = _compute_max_pending_writes(
-            block_size_tokens=256,
-            kv_bytes_per_token=per_token,
-        )
-        assert expected_cap != default_cap, (
-            "Test setup must produce caps where the 1024-block sizing "
-            "differs from the 256-default sizing; otherwise the assertion "
-            "passes trivially. Try a different host RAM tier."
-        )
-        # Write queue capacity must match too — the cap is only useful
-        # if the queue actually enforces it.
-        assert (
-            sched.paged_ssd_cache_manager._write_queue.maxsize
-            == sched.paged_ssd_cache_manager._max_pending_writes
-        )
-        sched.paged_ssd_cache_manager.close()
+        assert mgr._max_pending_writes == expected_cap
+        assert mgr._write_queue.maxsize == mgr._max_pending_writes
+
+        mgr.close()
 
     def test_larger_block_size_shrinks_scheduler_cap(self, tmp_path):
         """The same model on the same Mac with a bigger block size
