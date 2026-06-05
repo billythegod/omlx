@@ -790,15 +790,9 @@ class TestPrefillRejectionReleasesPagedCache:
         sched.add_request(req)
         sched.block_aware_cache.reset_mock()
 
-        from omlx.scheduler import _PreflightRejection
-
         with patch.object(
             sched, "_preflight_memory_check",
-            return_value=_PreflightRejection(
-                message="Memory limit exceeded by preflight estimate",
-                estimated_bytes=1,
-                limit_bytes=1,
-            ),
+            return_value="Memory limit exceeded by preflight estimate",
         ):
             scheduled, rejected = sched._schedule_waiting()
 
