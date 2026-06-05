@@ -3473,7 +3473,7 @@
                         ? 2
                         : totalGB < 16
                             ? 4
-                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
+                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
