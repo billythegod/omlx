@@ -857,7 +857,7 @@ class Scheduler:
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
         self._prefill_safe_zone_ratio: float = 0.80
-        self._prefill_min_chunk_tokens: int = 32
+        self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         # EWMA estimator of per-token chunk transient bytes, used by
@@ -2269,7 +2269,7 @@ class Scheduler:
     # halves SDPA-fallback transient (∝ query_len × kv_len), so crossing
     # one tier under memory pressure roughly doubles the available
     # headroom for the next chunk's intermediates.
-    _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512, 256, 128)
+    _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512)
 
     # Safety margin applied to the headroom (hard_cap - current) when sizing
     # a chunk predictively. The remaining 10% absorbs estimator error and the
@@ -2580,14 +2580,10 @@ class Scheduler:
         if current >= soft_watermark and hard_cap > soft_watermark:
             band = hard_cap - soft_watermark
             band_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
-            if band_ratio < 0.25:
+            if band_ratio < 0.50:
                 bucket = self._PREFILL_STEP_TIERS[0]  # 1024
-            elif band_ratio < 0.50:
-                bucket = self._PREFILL_STEP_TIERS[1]  # 512
-            elif band_ratio < 0.75:
-                bucket = self._PREFILL_STEP_TIERS[2]  # 256
             else:
-                bucket = self._PREFILL_STEP_TIERS[3]  # 128
+                bucket = self._PREFILL_STEP_TIERS[1]  # 512
             n = max(min_chunk, min(n, bucket))
 
         if n < requested:

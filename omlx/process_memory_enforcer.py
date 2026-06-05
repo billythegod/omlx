@@ -302,7 +302,7 @@ class ProcessMemoryEnforcer:
         soft_threshold: float = 0.90,
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
-        prefill_min_chunk_tokens: int = 32,
+        prefill_min_chunk_tokens: int = 256,
     ):
         """
         Initialize the process memory enforcer.
