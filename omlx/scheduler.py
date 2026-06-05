@@ -55,6 +55,24 @@ _default_generation_stream = generation_stream
 
 
 @dataclass
+class _PreflightRejection:
+    """Typed return for ``_preflight_memory_check`` / its token-count
+    helper. Carries the human-readable diagnostic plus the numeric
+    estimated / limit bytes so callers can populate
+    ``PrefillMemoryExceededError`` without parsing the string.
+
+    Same shim as ``preflight_or_raise`` (restored on main after the
+    upstream merge dropped it); the typed shape is what
+    ``tests/test_scheduler_prefill_memory_guard.py`` asserts against,
+    and what PR #1452 carries upstream.
+    """
+
+    message: str
+    estimated_bytes: int
+    limit_bytes: int
+
+
+@dataclass
 class _VLMMTPDecodeState:
     """Per-request state for vlm_mtp decode that bypasses BatchGenerator.
 
@@ -911,7 +929,28 @@ class Scheduler:
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
-        self.memory_monitor: MemoryMonitor | None = None
+        # Prefill-peak estimator used by ``_preflight_memory_check`` /
+        # ``preflight_or_raise``. Only the estimator path is exercised
+        # here (it reads head_dim / num_layers / num_kv_heads via
+        # ``set_model_info`` below); ``eviction_enabled=False`` so the
+        # monitor does not gate on ``max_kv_cache_memory`` — paged SSD
+        # mode never wants this monitor making eviction decisions, and
+        # we have no real value to pass for that field at this point.
+        #
+        # This auto-init was wired up in b6a69c4 then silently dropped
+        # by an upstream merge (same pattern as ``preflight_or_raise``
+        # in d40ab80). Without it the guard short-circuits at the
+        # ``memory_monitor is None`` gate for every request — Pi prompts
+        # that should be rejected by the configured hard limit instead
+        # sail straight into chunked prefill and OOM at the Metal cap.
+        if MemoryMonitor is not None:
+            self.memory_monitor: MemoryMonitor | None = MemoryMonitor(
+                max_kv_cache_memory=None,
+                eviction_enabled=False,
+            )
+            self._set_model_info_for_monitor()
+        else:
+            self.memory_monitor: MemoryMonitor | None = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -4401,6 +4440,22 @@ class Scheduler:
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
 
+        # Front-door preflight: reject obviously-too-large requests at
+        # ``add_request`` rather than letting them sit in the waiting
+        # queue and trip the in-stream re-check later. The cache lookup
+        # above may have already attached a ``block_table`` whose ref
+        # counts must be released before re-raising — otherwise a
+        # sustained rejection stream leaks one block table per call.
+        try:
+            self.preflight_or_raise(
+                num_prompt_tokens=request.num_prompt_tokens,
+                cached_tokens=request.cached_tokens or 0,
+                request_id=request.request_id,
+            )
+        except Exception:
+            self._release_paged_cache_for_request(request.request_id)
+            raise
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
@@ -5272,7 +5327,9 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _preflight_memory_check(self, request: "Request") -> str | None:
+    def _preflight_memory_check(
+        self, request: "Request"
+    ) -> "_PreflightRejection | None":
         """
         Estimate whether prefill would exceed memory limits.
 
@@ -5285,7 +5342,11 @@ class Scheduler:
         For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
 
         Returns:
-            Error message string if request should be rejected, None if OK.
+            ``_PreflightRejection`` carrying the message + numeric
+            estimated / limit bytes if the request should be rejected,
+            otherwise ``None``. The structured return lets the server
+            layer populate ``PrefillMemoryExceededError.estimated_bytes``
+            / ``limit_bytes`` without parsing the human string.
         """
         if not self._prefill_memory_guard:
             return None
@@ -5308,19 +5369,40 @@ class Scheduler:
             return None  # can't estimate, skip
 
         current = max(mx.get_active_memory(), get_phys_footprint())
+        estimated = current + peak
+        hard_limit = self._memory_hard_limit_bytes
 
-        if current + peak > self._memory_hard_limit_bytes:
+        if estimated > hard_limit:
+            # Try LRU eviction first (upstream's predictive-throttle
+            # path): if eviction can free enough headroom this raises
+            # ``_PrefillEvictionNeeded`` and the request is paused for
+            # retry. If eviction can't help (already retried, no idle
+            # models), the call is a no-op and we fall through to the
+            # typed rejection.
+            self._raise_prefill_eviction_if_available(
+                request_id=request.request_id,
+                current=current,
+                target_cap=hard_limit,
+                predicted_transient=peak,
+                requested_tokens=min(new_tokens, self.config.prefill_step_size),
+                reason="prefill_preflight",
+            )
             from .utils.hardware import format_bytes
 
             usage_gb = current / (1024**3)
-            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
-            return (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
+            ceiling_gb = hard_limit / (1024**3)
+            message = (
+                f"Prefill would require ~{format_bytes(estimated)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+                f"but ceiling is {format_bytes(hard_limit)} "
                 f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
                 f"Reduce context length, free system memory, or loosen "
                 f"memory_guard_tier (safe → balanced → aggressive)."
+            )
+            return _PreflightRejection(
+                message=message,
+                estimated_bytes=int(estimated),
+                limit_bytes=int(hard_limit),
             )
         return None
 
@@ -5571,12 +5653,21 @@ class Scheduler:
                 request.sampling_params, request
             )
 
-            # and reject if it would exceed the hard limit.
-            preflight_error = self._preflight_memory_check(request)
-            if preflight_error:
+            # Pre-flight memory guard: estimate peak memory for this request
+            # and reject if it would exceed the hard limit. The check
+            # may raise ``_PrefillEvictionNeeded`` (upstream's
+            # predictive-throttle path) to pause and retry under
+            # eviction headroom; only if eviction can't help does the
+            # typed rejection propagate.
+            try:
+                preflight_rejection = self._preflight_memory_check(request)
+            except _PrefillEvictionNeeded as e:
+                self._pause_for_prefill_eviction(request, e.request)
+                break
+            if preflight_rejection is not None:
                 logger.warning(
                     f"Request {request.request_id} rejected by prefill "
-                    f"memory guard: {preflight_error}"
+                    f"memory guard: {preflight_rejection.message}"
                 )
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
@@ -5585,7 +5676,7 @@ class Scheduler:
                         request_id=request.request_id,
                         finished=True,
                         finish_reason="error",
-                        error=preflight_error,
+                        error=preflight_rejection.message,
                     )
                 )
                 continue
@@ -6314,6 +6405,23 @@ class Scheduler:
             self.block_aware_cache.release_cache(request_id)
         elif self.paged_cache_manager is not None:
             self.paged_cache_manager.delete_block_table(request_id)
+
+        # SpecPrefill primes an independent ``_draft_prefix_cache`` in
+        # ``_try_specprefill_scoring`` whose block refs are tracked
+        # separately from the target ``block_aware_cache``. Without
+        # releasing it on the rejection path a rejected SpecPrefill
+        # request leaks every draft-block ref symmetric to the
+        # target-cache leak the main branch above guards against.
+        draft_cache = getattr(self, "_draft_prefix_cache", None)
+        if draft_cache is not None:
+            try:
+                draft_cache.release_cache(request_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Draft prefix cache release_cache(%s) raised; ignoring",
+                    request_id,
+                    exc_info=True,
+                )
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
@@ -7322,7 +7430,15 @@ class Scheduler:
                 except Exception:
                     pass
 
-            if num_layers and num_kv_heads and head_dim:
+            # Truthiness alone isn't enough — MagicMock proxies leaking
+            # through the descent (test scaffolds that don't fully spec
+            # ``model.config``) are truthy but fail any later numeric
+            # comparison (``> 128`` etc.) deep inside MemoryMonitor.
+            # Insist on real positive integers before calling.
+            def _pos_int(v: Any) -> bool:
+                return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+            if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
