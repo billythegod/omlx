@@ -1503,6 +1503,12 @@ class VLMBatchedEngine(BaseEngine):
         # the processor's __call__ expects numpy arrays or (array, sample_rate)
         # tuples. load_audio handles all three source types.
         if audio:
+            if any(not isinstance(a, tuple) for a in audio):
+                from ..patches.mlx_audio_compat import (
+                    ensure_mlx_audio_resample_export,
+                )
+
+                ensure_mlx_audio_resample_export()
             audio = [
                 _load_audio(a, 16000)
                 if not isinstance(a, tuple)

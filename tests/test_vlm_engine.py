@@ -10,7 +10,7 @@ Tests cover:
 - Engine stop safety (close() exception guard)
 """
 
-import copy
+import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -716,11 +716,48 @@ class TestPrepareVisionInputs:
 
         # prepare_inputs should have been called with audio
         mock_prepare.assert_called_once()
-        call_args = mock_prepare.call_args[0]
         # First positional arg is images, second is processor, third is audio or config
         # For gemma4, audio=audio kwarg should be present
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") == audio
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_bytesio_audio_survives_missing_resample_export(
+        self, mock_vlm_act, mock_prepare, monkeypatch
+    ):
+        """BytesIO input_audio uses the compatibility export before load_audio."""
+        np = pytest.importorskip("numpy")
+        audio_utils = pytest.importorskip("mlx_audio.utils")
+        audio_io = pytest.importorskip("mlx_audio.audio_io")
+
+        monkeypatch.delattr(audio_utils, "resample_audio", raising=False)
+
+        read_calls = []
+
+        def fake_read(file, dtype="float32"):
+            read_calls.append((file, dtype))
+            return np.zeros((32,), dtype=np.float32), 16000
+
+        monkeypatch.setattr(audio_io, "read", fake_read)
+
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        audio_stream = io.BytesIO(b"not-a-real-wav")
+        messages = [{"role": "user", "content": "Transcribe this recording"}]
+
+        engine._prepare_vision_inputs(messages, [], audio=[audio_stream])
+
+        assert read_calls == [(audio_stream, "float32")]
+        call_audio = mock_prepare.call_args[1].get("audio")
+        assert len(call_audio) == 1
+        assert isinstance(call_audio[0], np.ndarray)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
