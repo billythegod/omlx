@@ -634,7 +634,7 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot)."""
+    """Other integrations settings."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
@@ -643,6 +643,10 @@ class IntegrationSettings:
     pi_model: str | None = None
     copilot_model: str | None = None
     openclaw_tools_profile: str = "coding"
+    markitdown_enabled: bool = True
+    markitdown_expose_model: bool = True
+    markitdown_max_file_size_mb: int = 25
+    markitdown_max_files_per_request: int = 5
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -654,6 +658,10 @@ class IntegrationSettings:
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
+            "markitdown_enabled": self.markitdown_enabled,
+            "markitdown_expose_model": self.markitdown_expose_model,
+            "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
+            "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
         }
 
     @classmethod
@@ -667,6 +675,12 @@ class IntegrationSettings:
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
+            markitdown_enabled=data.get("markitdown_enabled", True),
+            markitdown_expose_model=data.get("markitdown_expose_model", True),
+            markitdown_max_file_size_mb=data.get("markitdown_max_file_size_mb", 25),
+            markitdown_max_files_per_request=data.get(
+                "markitdown_max_files_per_request", 5
+            ),
         )
 
 
@@ -897,6 +911,17 @@ class GlobalSettings:
                 self.logging.retention_days = int(retention_days)
             except ValueError:
                 logger.warning(f"Invalid OMLX_LOG_RETENTION_DAYS: {retention_days}")
+
+        # Integration settings
+        if markitdown_enabled := os.getenv("OMLX_MARKITDOWN_ENABLED"):
+            self.integrations.markitdown_enabled = (
+                markitdown_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_expose_model := os.getenv("OMLX_MARKITDOWN_EXPOSE_MODEL"):
+            self.integrations.markitdown_expose_model = (
+                markitdown_expose_model.strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
 
     def _apply_cli_overrides(self, args: Any) -> None:
         """
@@ -1222,6 +1247,12 @@ class GlobalSettings:
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
             )
+
+        # Integration validation
+        if self.integrations.markitdown_max_file_size_mb <= 0:
+            errors.append("markitdown_max_file_size_mb must be > 0")
+        if self.integrations.markitdown_max_files_per_request <= 0:
+            errors.append("markitdown_max_files_per_request must be > 0")
 
         # HuggingFace validation
         if self.huggingface.endpoint:

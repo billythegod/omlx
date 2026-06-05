@@ -12,6 +12,7 @@ This module provides shared components used by the server:
 from .openai_models import (
     # Content types
     ContentPart,
+    FileContent,
     Message,
     # Tool calling
     FunctionCall,
@@ -137,6 +138,7 @@ from .mcp_routes import router as mcp_router, set_mcp_manager_getter
 __all__ = [
     # Models
     "ContentPart",
+    "FileContent",
     "Message",
     "FunctionCall",
     "ToolCall",
