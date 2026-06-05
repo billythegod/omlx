@@ -59,20 +59,14 @@ def _compute_max_pending_writes() -> int:
     renames), so the queue needs to be deeper to absorb burst saves from
     large requests (e.g., 64 blocks per 4096-token request).
 
-    Floor raised from 32 to 64 because long-context coding workloads
-    snapshot ~73 blocks per turn at 150k tokens (block_size=2048), which
-    saturated the prior cap=32 cap on 32-64 GB systems: each saturated
-    burst dropped boundary blocks, breaking partial-cache reconstruction
-    on the next turn and forcing a 10+ minute re-prefill.
-
-    Scales proportionally: 512GB = 256, ≤128GB = 64, minimum 64.
+    Scales proportionally: 512GB = 256, 32GB = 32, minimum 32.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         total_gb = total_bytes / (1024**3)
-        return max(64, min(256, int(total_gb / 2)))
+        return max(32, min(256, int(total_gb / 2)))
     except (ValueError, OSError):
-        return 64  # Safe default
+        return 32  # Safe default
 
 
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
