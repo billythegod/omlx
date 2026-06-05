@@ -226,8 +226,8 @@ class EngineCore:
 
     def _wake_engine_loop(self) -> None:
         """Wake the idle engine loop after scheduler-visible state changes."""
-        event = self._wake_event
-        loop = self._loop
+        event = getattr(self, "_wake_event", None)
+        loop = getattr(self, "_loop", None)
         if event is None or loop is None or loop.is_closed():
             return
         try:
