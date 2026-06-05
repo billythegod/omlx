@@ -734,6 +734,9 @@ class ToolCallStreamFilter:
                 # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
                 # end marker): suppress everything after the start marker.
                 self._suppress_after_markers.append(marker)
+        # Scoped to the configured pair only (not the hardcoded fallback) to
+        # avoid clobbering literal </tool_call> in prose output.
+        self._stray_close_markers: List[str] = [marker_end] if marker and marker_end else []
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
@@ -842,6 +845,10 @@ class ToolCallStreamFilter:
         # Same for suppress-after markers (e.g. "[TOOL" for "[TOOL_CALLS]").
         for sa_marker in self._suppress_after_markers:
             keep = max(keep, self._partial_prefix_len(text, sa_marker))
+        # Hold partial prefix of a stray-close marker so it reassembles before
+        # the strip check — prevents the "hello<tool_call|" + ">" split leak.
+        for close_marker in self._stray_close_markers:
+            keep = max(keep, self._partial_prefix_len(text, close_marker))
 
         bracket_idx = -1
         for bp in self._bracket_prefixes:
@@ -984,7 +991,11 @@ class ToolCallStreamFilter:
                 self._buffer = self._buffer[-keep:]
             break
 
-        return "".join(out)
+        result = "".join(out)
+        for close in self._stray_close_markers:
+            if close in result:
+                result = result.replace(close, "")
+        return result
 
     def finish(self) -> str:
         """Flush remaining safe buffer content.
@@ -1010,6 +1021,9 @@ class ToolCallStreamFilter:
         else:
             buf = self._buffer
         self._buffer = ""
+        for close in self._stray_close_markers:
+            if close in buf:
+                buf = buf.replace(close, "")
         return buf
 
 
