@@ -107,11 +107,27 @@ class EnginePool:
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
+        self.configure_hot_cache_budget()
 
     @property
     def current_model_memory(self) -> int:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
+
+    def configure_hot_cache_budget(self) -> None:
+        """Ensure loaded schedulers share one process-wide hot cache budget."""
+        hot_max = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
+        if hot_max <= 0:
+            self._scheduler_config.hot_cache_budget = None
+            return
+
+        current = getattr(self._scheduler_config, "hot_cache_budget", None)
+        if current is not None and getattr(current, "max_bytes", None) == hot_max:
+            return
+
+        from .cache.paged_ssd_cache import SharedHotCacheBudget
+
+        self._scheduler_config.hot_cache_budget = SharedHotCacheBudget(hot_max)
 
     def _current_ceiling(self) -> int:
         """Resolve the current memory ceiling via the enforcer callback.
