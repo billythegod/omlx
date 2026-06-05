@@ -2075,6 +2075,27 @@ class TestToolCallStreamFilterGemma4StrayClose:
         result += f.finish()
         assert result == "The closing tag is </tool_call> here."
 
+    def test_configured_xml_close_in_prose_passes_through(self):
+        """Configured XML close markers are not treated like Gemma 4 stray closes."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("<tool_call>", "</tool_call>")
+        )
+        result = f.feed("The closing tag is </tool_call> here.")
+        result += f.finish()
+        assert result == "The closing tag is </tool_call> here."
+
+    def test_configured_namespaced_close_in_prose_passes_through(self):
+        """Configured namespaced close markers are preserved in prose."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(
+                "<minimax:tool_call>",
+                "</minimax:tool_call>",
+            )
+        )
+        result = f.feed("The marker </minimax:tool_call> is a close marker.")
+        result += f.finish()
+        assert result == "The marker </minimax:tool_call> is a close marker."
+
     def test_stray_close_split_after_pipe_dropped(self):
         """Stray close split at the | boundary (<tool_call| + >) is reassembled and dropped."""
         f = self._make_filter()

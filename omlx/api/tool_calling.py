@@ -734,9 +734,15 @@ class ToolCallStreamFilter:
                 # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
                 # end marker): suppress everything after the start marker.
                 self._suppress_after_markers.append(marker)
-        # Scoped to the configured pair only (not the hardcoded fallback) to
-        # avoid clobbering literal </tool_call> in prose output.
-        self._stray_close_markers: List[str] = [marker_end] if marker and marker_end else []
+        # Gemma 4 can emit a bare close token outside a matched tool-call
+        # envelope. Do not apply this to XML-style closers like </tool_call>,
+        # which may appear as literal prose.
+        is_gemma4_tool_marker = (
+            marker == "<|tool_call>" and marker_end == "<tool_call|>"
+        )
+        self._stray_close_markers: List[str] = (
+            [marker_end] if is_gemma4_tool_marker else []
+        )
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
