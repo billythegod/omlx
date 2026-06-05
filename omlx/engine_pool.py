@@ -127,6 +127,12 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
+        enforcer = self._process_memory_enforcer
+        wake = getattr(enforcer, "wake", None) if enforcer is not None else None
+        if callable(wake):
+            wake(active=active)
+
     @property
     def model_count(self) -> int:
         """Total number of discovered models."""
@@ -680,6 +686,8 @@ class EnginePool:
                     f"active_memory={format_size(active_after)}"
                 )
 
+        self._wake_process_memory_enforcer()
+
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
         Load an engine for the specified model.
@@ -697,6 +705,7 @@ class EnginePool:
 
         entry.is_loading = True
         entry.loading_started_at = time.monotonic()
+        self._wake_process_memory_enforcer(active=True)
         load_started_at = entry.loading_started_at
         load_completed = False
         entry.abort_loading = False
@@ -1071,6 +1080,7 @@ class EnginePool:
             entry.is_loading = False
             entry.loading_started_at = None
             entry.abort_loading = False
+            self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
         """
