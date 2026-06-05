@@ -172,11 +172,12 @@ from .exceptions import (
 from .api.markitdown import (
     MARKITDOWN_MODEL_ID,
     MarkItDownRequestError,
-    convert_messages_to_markdown,
+    convert_messages_to_markdown_async,
     is_markitdown_model,
     markitdown_model_visible,
-    preprocess_markitdown_file_parts,
+    preprocess_markitdown_file_parts_async,
     request_has_file_parts,
+    stream_messages_to_markdown_async,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -1843,10 +1844,12 @@ async def _preprocess_markitdown_files_for_llm(
         return request
 
     try:
-        messages = await asyncio.to_thread(
-            preprocess_markitdown_file_parts,
+        messages = await preprocess_markitdown_file_parts_async(
             request.messages,
             global_settings=_server_state.global_settings,
+            engine_pool=_server_state.engine_pool,
+            settings_manager=_server_state.settings_manager,
+            get_sampling_params=get_sampling_params,
             fail_when_disabled=True,
         )
     except MarkItDownRequestError as exc:
@@ -1874,7 +1877,7 @@ def _build_markitdown_chat_response(
 
 async def _stream_markitdown_chat_response(
     request: ChatCompletionRequest,
-    markdown: str,
+    markdown_chunks: AsyncIterator[str],
     response_id: str | None = None,
 ) -> AsyncIterator[str]:
     response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -1889,7 +1892,11 @@ async def _stream_markitdown_chat_response(
     )
     yield f"data: {role_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    if markdown:
+    emitted = False
+    async for markdown in markdown_chunks:
+        if not markdown:
+            continue
+        emitted = True
         content_chunk = ChatCompletionChunk(
             id=response_id,
             model=request.model,
@@ -1900,6 +1907,12 @@ async def _stream_markitdown_chat_response(
             ],
         )
         yield f"data: {content_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    if not emitted:
+        raise MarkItDownRequestError(
+            "No text or supported file content found for MarkItDown.",
+            status_code=400,
+        )
 
     final_chunk = ChatCompletionChunk(
         id=response_id,
@@ -1935,36 +1948,24 @@ async def _create_markitdown_chat_completion(
             detail=f"Model not found: {MARKITDOWN_MODEL_ID}",
         )
 
-    try:
-        markdown = await asyncio.to_thread(
-            convert_messages_to_markdown,
-            request.messages,
-            global_settings=_server_state.global_settings,
-            latest_user_only=True,
-        )
-    except MarkItDownRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    if not markdown:
-        raise HTTPException(
-            status_code=400,
-            detail="No text or supported file content found for MarkItDown.",
-        )
-
-    logger.info("MarkItDown completion converted request to markdown")
-
     if request.stream:
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
             keepalive = _chat_keepalive_chunk(response_id)
+        markdown_chunks = stream_messages_to_markdown_async(
+            request.messages,
+            global_settings=_server_state.global_settings,
+            engine_pool=_server_state.engine_pool,
+            settings_manager=_server_state.settings_manager,
+            get_sampling_params=get_sampling_params,
+            latest_user_only=True,
+        )
         return StreamingResponse(
             _with_sse_keepalive(
                 _stream_markitdown_chat_response(
                     request,
-                    markdown,
+                    markdown_chunks,
                     response_id=response_id,
                 ),
                 http_request=http_request,
@@ -1974,7 +1975,37 @@ async def _create_markitdown_chat_completion(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    return _build_markitdown_chat_response(request, markdown)
+    async def _build_markitdown_completion():
+        try:
+            markdown = await convert_messages_to_markdown_async(
+                request.messages,
+                global_settings=_server_state.global_settings,
+                engine_pool=_server_state.engine_pool,
+                settings_manager=_server_state.settings_manager,
+                get_sampling_params=get_sampling_params,
+                latest_user_only=True,
+            )
+        except MarkItDownRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if not markdown:
+            raise HTTPException(
+                status_code=400,
+                detail="No text or supported file content found for MarkItDown.",
+            )
+
+        logger.info("MarkItDown completion converted request to markdown")
+        return _build_markitdown_chat_response(
+            request,
+            markdown,
+        ).model_dump_json(exclude_none=True)
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_markitdown_completion()),
+        media_type="application/json",
+    )
 
 
 @app.get("/v1/models")

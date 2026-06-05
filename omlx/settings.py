@@ -647,6 +647,7 @@ class IntegrationSettings:
     markitdown_expose_model: bool = True
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
+    markitdown_pdf_processing_engine: str = "markitdown"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -662,6 +663,7 @@ class IntegrationSettings:
             "markitdown_expose_model": self.markitdown_expose_model,
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
         }
 
     @classmethod
@@ -680,6 +682,9 @@ class IntegrationSettings:
             markitdown_max_file_size_mb=data.get("markitdown_max_file_size_mb", 25),
             markitdown_max_files_per_request=data.get(
                 "markitdown_max_files_per_request", 5
+            ),
+            markitdown_pdf_processing_engine=data.get(
+                "markitdown_pdf_processing_engine", "markitdown"
             ),
         )
 
@@ -919,8 +924,13 @@ class GlobalSettings:
             )
         if markitdown_expose_model := os.getenv("OMLX_MARKITDOWN_EXPOSE_MODEL"):
             self.integrations.markitdown_expose_model = (
-                markitdown_expose_model.strip().lower()
-                in {"1", "true", "yes", "on"}
+                markitdown_expose_model.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_pdf_processing_engine := os.getenv(
+            "OMLX_MARKITDOWN_PDF_PROCESSING_ENGINE"
+        ):
+            self.integrations.markitdown_pdf_processing_engine = (
+                markitdown_pdf_processing_engine.strip() or "markitdown"
             )
 
     def _apply_cli_overrides(self, args: Any) -> None:
@@ -1253,6 +1263,8 @@ class GlobalSettings:
             errors.append("markitdown_max_file_size_mb must be > 0")
         if self.integrations.markitdown_max_files_per_request <= 0:
             errors.append("markitdown_max_files_per_request must be > 0")
+        if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
+            errors.append("markitdown_pdf_processing_engine must not be empty")
 
         # HuggingFace validation
         if self.huggingface.endpoint:

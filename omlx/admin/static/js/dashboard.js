@@ -53,6 +53,7 @@
                     markitdown_expose_model: true,
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
+                    markitdown_pdf_processing_engine: 'markitdown',
                 },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
@@ -2143,6 +2144,13 @@
                 return this._launchCmd('pi');
             },
 
+            get markitdownOcrModels() {
+                return (this.models || []).filter((model) => {
+                    const configType = String(model.config_model_type || '').toLowerCase();
+                    return configType.includes('ocr');
+                });
+            },
+
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -2160,6 +2168,7 @@
                             markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,
                             markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
                             markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
+                            markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
                         }),
                     });
                     if (!response.ok) {
