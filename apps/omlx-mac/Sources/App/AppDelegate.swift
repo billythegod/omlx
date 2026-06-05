@@ -139,7 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !isRunningUnitTests {
             do {
-                try ShellEnvWriter.ensureCLIShim()
+                let cliResult = try ShellEnvWriter.ensureCLIShim()
+                handleCLISetupResult(cliResult)
             } catch {
                 NSLog("oMLX: CLI shim setup failed — \(error)")
             }
@@ -161,6 +162,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // persist settings until the user clicks Start Server.
             NSApp.activate(ignoringOtherApps: true)
             presentWelcome()
+        }
+    }
+
+    private func handleCLISetupResult(_ result: ShellEnvWriter.CLISetupResult) {
+        guard case .needsShellPathPrompt(let reason) = result else { return }
+        guard !ShellEnvWriter.shouldSuppressCLIPathPrompt() else { return }
+        promptForShellPathExport(reason: reason)
+    }
+
+    private func promptForShellPathExport(reason: String) {
+        let alert = NSAlert()
+        alert.messageText = "Enable `omlx` in Terminal?"
+        alert.informativeText = """
+        oMLX could not create a public `omlx` command in /opt/homebrew/bin or /usr/local/bin.
+
+        To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
+
+        \(reason)
+        """
+        alert.addButton(withTitle: "Update Shell File")
+        alert.addButton(withTitle: "Dismiss Now")
+        alert.addButton(withTitle: "Don't Ask Again")
+        alert.window.level = .floating
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            do {
+                try ShellEnvWriter.ensureShellPathExport()
+            } catch {
+                NSLog("oMLX: CLI shell path setup failed — \(error)")
+            }
+        case .alertThirdButtonReturn:
+            ShellEnvWriter.suppressCLIPathPromptForever()
+        default:
+            break
         }
     }
 
