@@ -7432,6 +7432,7 @@ class Scheduler:
                 hot_cache_budget=self.config.hot_cache_budget,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
+                expected_block_size=self.config.paged_cache_block_size,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
