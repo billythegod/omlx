@@ -1033,7 +1033,10 @@ class TestSchedulerStopTokens:
         """When eot_token_id is absent but eot_token string is present, encode it."""
         mock_tokenizer.eot_token = "<turn|>"
         # Ensure eot_token_id is NOT present
-        assert not hasattr(mock_tokenizer, "eot_token_id") or mock_tokenizer.eot_token_id is None
+        assert (
+            not hasattr(mock_tokenizer, "eot_token_id")
+            or mock_tokenizer.eot_token_id is None
+        )
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         stop_tokens = scheduler._get_stop_tokens()
         # The MockTokenizer.encode() returns hash-based IDs, so we get something
@@ -2856,6 +2859,34 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+    def test_cached_text_only_prefill_seeds_zero_mrope_delta(self, mock_tokenizer):
+        """Cached text-only mRoPE suffixes must start at the restored offset."""
+        model = self._make_vlm_model()
+        model._language_model = MagicMock()
+        model._language_model._rope_deltas = mx.array([[123]])
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="text-cached-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.cached_tokens = 2048
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=[1, 2, 3, 4],
+            existing_cache=[],
+            vlm_embeds=None,
+        )
+
+        model.clear_vlm_position_state.assert_called_once()
+        seeded = model._language_model._rope_deltas
+        assert seeded.shape == (1, 1)
+        assert seeded.item() == 0
 
 
 class TestBuildStateMachineStopStrings:
