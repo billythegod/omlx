@@ -81,8 +81,9 @@ dependencies = [
     # arrays on model load.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@526c210b8ef841a2906beb2805e9c41b8b77f4e7",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.8 (39b2520) — bstnxbt repo. Apple G17 NAX verify path plus v0.1.7 Qwen/Gemma4 DFlash fixes
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@39b2520e805f1d1be3852c62944b389cff73fa35",
+    # dflash-mlx v0.1.9 (b7f192b) - bstnxbt repo. Apple G17 NAX verify
+    # plus PR #37 prefix snapshot performance and hit-kind metrics.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@b7f192b62bc5a59cad41fda888c1118c60fc58b1",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
