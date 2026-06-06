@@ -2640,8 +2640,14 @@ async def create_chat_completion(
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
     )
-    # Fall back to prompt injection when grammar is not compiled
-    if compiled_grammar is None and response_format:
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
+    response_format_warning = None
+    if compiled_grammar is None and _response_format_requests_grammar(response_format):
+        response_format_warning = _response_format_warning_header(response_format)
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
@@ -2782,6 +2788,9 @@ async def create_chat_completion(
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
             keepalive = _chat_keepalive_chunk(response_id)
+        sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+        if response_format_warning:
+            sse_headers["Warning"] = response_format_warning
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
@@ -2789,7 +2798,7 @@ async def create_chat_completion(
                 keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers=sse_headers,
         )
 
     # Non-streaming response with keepalive during prefill
@@ -2888,9 +2897,13 @@ async def create_chat_completion(
             ),
         ).model_dump_json(exclude_none=True)
 
+    json_headers = (
+        {"Warning": response_format_warning} if response_format_warning else None
+    )
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
         media_type="application/json",
+        headers=json_headers,
     )
 
 
@@ -3092,6 +3105,46 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _response_format_requests_strict(response_format) -> bool:
+    """True when an OpenAI ``response_format`` demands strict json_schema output.
+
+    A ``json_schema`` response_format with ``strict: true`` signals that the
+    caller expects schema-conformant output, not best-effort.  When
+    grammar-constrained decoding is unavailable the request still falls back to
+    prompt injection, but the downgrade is logged at a level that names the
+    unhonored ``strict`` intent so it is not silent (issue #1241).
+    """
+    if response_format is None:
+        return False
+    rf = response_format
+    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
+    if rf_type != "json_schema":
+        return False
+    js = rf.get("json_schema") if isinstance(rf, dict) else getattr(rf, "json_schema", None)
+    if js is None:
+        return False
+    strict = js.get("strict") if isinstance(js, dict) else getattr(js, "strict", None)
+    return bool(strict)
+
+
+def _response_format_requests_grammar(response_format) -> bool:
+    """True when an OpenAI ``response_format`` maps to grammar-constrained JSON.
+
+    Delegates to :func:`_build_format_element` so the unenforced-degrade signal
+    stays in sync with what actually gets compiled: a format earns the
+    Warning header / prompt-injection fallback only when a grammar element would
+    have been built for it.  That is non-``None`` exactly for ``json_object``
+    and a ``json_schema`` carrying a schema; a plain ``{"type": "text"}`` (or a
+    json_schema with no schema) maps to nothing and must not warn.  Sharing the
+    one source of truth keeps the header consistent with the server-side warn
+    log and avoids claiming "grammar-constrained decoding unavailable" for a
+    request that never described an enforceable grammar (#1241 review).
+    """
+    if response_format is None:
+        return False
+    return _build_format_element(response_format=response_format) is not None
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
@@ -3106,9 +3159,12 @@ def _compile_grammar_for_request(
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
 
-    Returns a compiled grammar object or ``None``.  Raises
-    :class:`HTTPException` on compilation errors or when xgrammar is
-    required but not installed.
+    Returns a compiled grammar object or ``None``.  ``structured_outputs``
+    raises :class:`HTTPException` when grammar is unavailable or fails to
+    compile.  A ``response_format`` degrades to ``None`` so the caller can fall
+    back to prompt injection; the downgrade is logged (and named as an
+    unhonored strict request when ``strict: true`` was set) rather than being
+    silent (#1241).
     """
     compiler = getattr(engine, 'grammar_compiler', None)
 
@@ -3138,6 +3194,8 @@ def _compile_grammar_for_request(
                     "Install with: pip install 'omlx[grammar]'"
                 )
             raise HTTPException(status_code=400, detail=detail)
+        if response_format is not None:
+            _warn_response_format_not_enforced(response_format)
         return None
 
     try:
@@ -3152,9 +3210,57 @@ def _compile_grammar_for_request(
                 status_code=400,
                 detail=f"Grammar compilation error: {e}",
             )
-        logger.warning("Grammar compilation from response_format failed, "
-                       "falling back to prompt injection: %s", e)
+        _warn_response_format_not_enforced(response_format, error=e)
     return None
+
+
+def _warn_response_format_not_enforced(response_format, error=None):
+    """Log that a ``response_format`` request fell back to prompt injection.
+
+    Previously a ``response_format`` that could not be grammar-constrained
+    (no compiler available, or a compilation error) degraded to best-effort
+    prompt injection silently, giving the client no signal that the schema was
+    not enforced (#1241).  A ``strict: true`` request gets a message that names
+    the unhonored strict intent.
+    """
+    reason = f" ({error})" if error is not None else ""
+    if _response_format_requests_strict(response_format):
+        logger.warning(
+            "response_format requested strict json_schema output but "
+            "grammar-constrained decoding is unavailable; strict enforcement "
+            "cannot be honored, falling back to best-effort prompt injection "
+            "(output is NOT schema-enforced)%s.", reason,
+        )
+    else:
+        logger.warning(
+            "response_format requested but grammar-constrained decoding is "
+            "unavailable; output will not be schema-enforced (falling back to "
+            "prompt injection)%s.", reason,
+        )
+
+
+def _response_format_warning_header(response_format) -> str:
+    """Build an RFC 7234 ``Warning`` header for an unenforced response_format.
+
+    The server already logs the downgrade (see
+    :func:`_warn_response_format_not_enforced`), but that signal is only
+    visible to the operator.  This header surfaces the same fact to the API
+    caller so a client can tell that ``response_format`` fell back to
+    best-effort prompt injection rather than schema-enforced output (#1241).
+    Header values must be single-line ASCII, so the text is terse.
+    """
+    if _response_format_requests_strict(response_format):
+        text = (
+            "response_format strict json_schema not enforced; "
+            "grammar-constrained decoding unavailable, output is "
+            "best-effort and NOT schema-enforced"
+        )
+    else:
+        text = (
+            "response_format not enforced; grammar-constrained decoding "
+            "unavailable, output is best-effort"
+        )
+    return f'199 omlx "{text}"'
 
 
 # =============================================================================
