@@ -852,6 +852,10 @@ class ToolCallStreamFilter:
         self._stray_close_markers: List[str] = (
             [marker_end] if is_gemma4_tool_marker else []
         )
+        self._orphan_close_markers: List[str] = ["<|tool_call_end|>"]
+        if marker_end and not self._is_xml_close_marker(marker_end):
+            self._orphan_close_markers.append(marker_end)
+        self._orphan_close_markers = list(dict.fromkeys(self._orphan_close_markers))
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
@@ -861,6 +865,10 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
+
+    @staticmethod
+    def _is_xml_close_marker(marker: str) -> bool:
+        return marker.startswith("</") and marker.endswith(">")
 
     @property
     def active(self) -> bool:
@@ -883,10 +891,11 @@ class ToolCallStreamFilter:
             idx = text.find(marker)
             if idx >= 0:
                 starts.append((idx, len(marker), close))
-            if close:
-                close_idx = text.find(close)
-                if close_idx >= 0:
-                    starts.append((close_idx, len(close), None))
+
+        for close in self._orphan_close_markers:
+            close_idx = text.find(close)
+            if close_idx >= 0:
+                starts.append((close_idx, len(close), None))
 
         ns_match = self._namespaced_open_re.search(text)
         if ns_match:
@@ -950,8 +959,6 @@ class ToolCallStreamFilter:
         keep = 0
         for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
-            if _close:
-                keep = max(keep, self._partial_prefix_len(text, _close))
 
         last_lt = text.rfind("<")
         if last_lt >= 0:
@@ -968,7 +975,7 @@ class ToolCallStreamFilter:
             keep = max(keep, self._partial_prefix_len(text, sa_marker))
         # Hold partial prefix of a stray-close marker so it reassembles before
         # the strip check — prevents the "hello<tool_call|" + ">" split leak.
-        for close_marker in self._stray_close_markers:
+        for close_marker in self._orphan_close_markers:
             keep = max(keep, self._partial_prefix_len(text, close_marker))
 
         bracket_idx = -1
@@ -997,7 +1004,9 @@ class ToolCallStreamFilter:
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
                 return True
-            if _close and _close.startswith(tail):
+
+        for close_marker in self._orphan_close_markers:
+            if close_marker.startswith(tail):
                 return True
 
         # Drop unresolved bracket tool-call prefixes
