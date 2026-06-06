@@ -32,8 +32,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
+from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..settings import SubKeyEntry
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
@@ -284,6 +284,7 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_expose_model: bool | None = None
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
+    markitdown_pdf_processing_engine: str | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -2933,6 +2934,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -3422,6 +3424,15 @@ async def update_global_settings(
             request.markitdown_max_files_per_request
         )
         integrations_changed = True
+    if "markitdown_pdf_processing_engine" in request.model_fields_set:
+        engine = (request.markitdown_pdf_processing_engine or "").strip()
+        if not engine:
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_pdf_processing_engine must not be empty",
+            )
+        global_settings.integrations.markitdown_pdf_processing_engine = engine
+        integrations_changed = True
 
     if integrations_changed:
         runtime_applied.append("integrations")
@@ -3434,7 +3445,8 @@ async def update_global_settings(
             f"hermes={global_settings.integrations.hermes_model}, "
             f"pi={global_settings.integrations.pi_model}, "
             f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
-            f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}"
+            f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
+            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
         )
 
     # Apply UI settings

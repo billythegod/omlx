@@ -15,6 +15,17 @@ from typing import Any
 from .openai_models import ContentPart, Message
 
 logger = logging.getLogger(__name__)
+NOISY_PDF_LOGGERS = (
+    "pdfminer",
+    "pdfminer.cmapdb",
+    "pdfminer.converter",
+    "pdfminer.layout",
+    "pdfminer.pdfdocument",
+    "pdfminer.pdfinterp",
+    "pdfminer.pdfpage",
+    "pdfminer.pdfparser",
+    "pdfminer.psparser",
+)
 
 MARKITDOWN_MODEL_ID = "MarkItDown"
 MARKITDOWN_MODEL_ALIASES = {"markitdown"}
@@ -44,10 +55,12 @@ MARKITDOWN_SPREADSHEET_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 MARKITDOWN_EMPTY_PDF_MESSAGE = (
-    "No extractable text found. This PDF appears to be scanned or image-only; "
-    "OCR is not enabled."
+    "No extractable text found. This PDF appears to be scanned or image-only. "
+    "Select an OCR PDF processing engine for scanned or image-only PDFs."
 )
 MARKITDOWN_EMPTY_MESSAGE = "No extractable text found in the attached document."
+PDF_PROCESSING_MARKITDOWN = "markitdown"
+DEFAULT_PDF_PROCESSING_ENGINE = PDF_PROCESSING_MARKITDOWN
 
 _converter_lock = threading.Lock()
 _converter: Any | None = None
@@ -103,6 +116,31 @@ def markitdown_limits(global_settings: Any | None) -> tuple[int, int]:
     return int(max_mb or 25), int(max_files or 5)
 
 
+def quiet_pdf_parser_loggers() -> None:
+    for logger_name in NOISY_PDF_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def markitdown_pdf_processing_engine(global_settings: Any | None) -> str:
+    integrations = getattr(global_settings, "integrations", None)
+    value = getattr(
+        integrations,
+        "markitdown_pdf_processing_engine",
+        DEFAULT_PDF_PROCESSING_ENGINE,
+    )
+    return normalize_pdf_processing_engine(value)
+
+
+def normalize_pdf_processing_engine(value: Any) -> str:
+    engine = str(value or DEFAULT_PDF_PROCESSING_ENGINE).strip()
+    if not engine:
+        return DEFAULT_PDF_PROCESSING_ENGINE
+
+    if engine.lower() == PDF_PROCESSING_MARKITDOWN:
+        return PDF_PROCESSING_MARKITDOWN
+    return engine
+
+
 def request_has_file_parts(messages: list[Message]) -> bool:
     return any(_iter_file_part_dicts(msg.content) for msg in messages)
 
@@ -128,6 +166,119 @@ def convert_messages_to_markdown(
         if text:
             sections.append(text)
     return "\n\n".join(sections).strip()
+
+
+async def convert_messages_to_markdown_async(
+    messages: list[Message],
+    *,
+    global_settings: Any | None = None,
+    engine_pool: Any | None = None,
+    settings_manager: Any | None = None,
+    get_sampling_params: Any | None = None,
+    latest_user_only: bool = False,
+) -> str:
+    """Render request messages into Markdown, converting file parts asynchronously."""
+    if latest_user_only:
+        messages = _latest_user_turn(messages)
+
+    converted_messages = await preprocess_markitdown_file_parts_async(
+        messages,
+        global_settings=global_settings,
+        engine_pool=engine_pool,
+        settings_manager=settings_manager,
+        get_sampling_params=get_sampling_params,
+        fail_when_disabled=True,
+    )
+    sections: list[str] = []
+    for msg in converted_messages:
+        text = _content_text(msg.content).strip()
+        if text:
+            sections.append(text)
+    return "\n\n".join(sections).strip()
+
+
+async def stream_messages_to_markdown_async(
+    messages: list[Message],
+    *,
+    global_settings: Any | None = None,
+    engine_pool: Any | None = None,
+    settings_manager: Any | None = None,
+    get_sampling_params: Any | None = None,
+    latest_user_only: bool = False,
+):
+    """Stream request messages into Markdown chunks, preserving OCR PDF page order."""
+    if latest_user_only:
+        messages = _latest_user_turn(messages)
+
+    if request_has_file_parts(messages) and not markitdown_enabled(global_settings):
+        raise MarkItDownRequestError(
+            "MarkItDown integration is disabled.",
+            status_code=400,
+        )
+
+    max_file_size_mb, max_files = markitdown_limits(global_settings)
+    files_seen = 0
+    emitted = False
+
+    async def emit_chunk_stream(chunks):
+        nonlocal emitted
+        started = False
+        async for chunk in chunks:
+            if not chunk:
+                continue
+            if not started:
+                if emitted:
+                    yield "\n\n"
+                emitted = True
+                started = True
+            yield chunk
+
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, str):
+            async for chunk in emit_chunk_stream(_single_chunk(content.strip())):
+                yield chunk
+            continue
+        if not isinstance(content, list):
+            async for chunk in emit_chunk_stream(_single_chunk(str(content))):
+                yield chunk
+            continue
+
+        for part in content:
+            part_dict = _part_to_dict(part)
+            if part_dict.get("type") in {"text", "input_text"}:
+                async for chunk in emit_chunk_stream(
+                    _single_chunk(str(part_dict.get("text") or "").strip())
+                ):
+                    yield chunk
+                continue
+
+            if part_dict.get("type") != "file":
+                continue
+
+            files_seen += 1
+            if files_seen > max_files:
+                raise MarkItDownRequestError(
+                    f"Too many attached files. Maximum is {max_files} per request.",
+                    status_code=400,
+                )
+
+            parsed = parse_file_part(part_dict, max_file_size_mb=max_file_size_mb)
+            async for chunk in emit_chunk_stream(
+                stream_attachment_to_markdown_async(
+                    parsed,
+                    global_settings=global_settings,
+                    engine_pool=engine_pool,
+                    settings_manager=settings_manager,
+                    get_sampling_params=get_sampling_params,
+                )
+            ):
+                yield chunk
+
+
+async def _single_chunk(text: str):
+    if text:
+        yield text
 
 
 def _latest_user_turn(messages: list[Message]) -> list[Message]:
@@ -181,7 +332,79 @@ def preprocess_markitdown_file_parts(
                 )
 
             parsed = parse_file_part(part_dict, max_file_size_mb=max_file_size_mb)
-            markdown = convert_attachment_to_markdown(parsed)
+            markdown = convert_attachment_to_markdown(
+                parsed,
+                global_settings=global_settings,
+            )
+            new_parts.append(
+                ContentPart(
+                    type="text",
+                    text=_format_attachment_markdown(parsed.filename, markdown),
+                )
+            )
+            changed = True
+
+        processed.append(
+            msg.model_copy(update={"content": new_parts}) if changed else msg
+        )
+
+    return processed
+
+
+async def preprocess_markitdown_file_parts_async(
+    messages: list[Message],
+    *,
+    global_settings: Any | None = None,
+    engine_pool: Any | None = None,
+    settings_manager: Any | None = None,
+    get_sampling_params: Any | None = None,
+    fail_when_disabled: bool = True,
+) -> list[Message]:
+    """Replace file content parts with Markdown text parts asynchronously."""
+    if not request_has_file_parts(messages):
+        return messages
+
+    if not markitdown_enabled(global_settings):
+        if fail_when_disabled:
+            raise MarkItDownRequestError(
+                "MarkItDown integration is disabled.",
+                status_code=400,
+            )
+        return messages
+
+    max_file_size_mb, max_files = markitdown_limits(global_settings)
+    files_seen = 0
+    processed: list[Message] = []
+
+    for msg in messages:
+        content = msg.content
+        if not isinstance(content, list):
+            processed.append(msg)
+            continue
+
+        new_parts: list[ContentPart] = []
+        changed = False
+        for part in content:
+            part_dict = _part_to_dict(part)
+            if part_dict.get("type") != "file":
+                new_parts.append(ContentPart.model_validate(part_dict))
+                continue
+
+            files_seen += 1
+            if files_seen > max_files:
+                raise MarkItDownRequestError(
+                    f"Too many attached files. Maximum is {max_files} per request.",
+                    status_code=400,
+                )
+
+            parsed = parse_file_part(part_dict, max_file_size_mb=max_file_size_mb)
+            markdown = await convert_attachment_to_markdown_async(
+                parsed,
+                global_settings=global_settings,
+                engine_pool=engine_pool,
+                settings_manager=settings_manager,
+                get_sampling_params=get_sampling_params,
+            )
             new_parts.append(
                 ContentPart(
                     type="text",
@@ -216,9 +439,9 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
         )
 
     data_uri_mime_type = _mime_type_from_data_uri(data_value)
-    mime_type = str(
-        file_obj.get("mime_type") or data_uri_mime_type or ""
-    ).strip().lower()
+    mime_type = (
+        str(file_obj.get("mime_type") or data_uri_mime_type or "").strip().lower()
+    )
 
     filename = str(file_obj.get("filename") or "").strip()
     if not filename:
@@ -247,10 +470,88 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
     return MarkItDownFile(filename=filename, mime_type=mime_type, data=data)
 
 
-def convert_attachment_to_markdown(file: MarkItDownFile) -> str:
+def convert_attachment_to_markdown(
+    file: MarkItDownFile,
+    *,
+    global_settings: Any | None = None,
+) -> str:
     if _is_plain_text_attachment(file):
         return decode_plain_text_attachment(file)
-    return convert_file_to_markdown(file)
+    return convert_file_to_markdown(file, global_settings=global_settings)
+
+
+async def convert_attachment_to_markdown_async(
+    file: MarkItDownFile,
+    *,
+    global_settings: Any | None = None,
+    engine_pool: Any | None = None,
+    settings_manager: Any | None = None,
+    get_sampling_params: Any | None = None,
+) -> str:
+    if _is_plain_text_attachment(file):
+        return decode_plain_text_attachment(file)
+
+    if file.extension == ".pdf":
+        pdf_engine = markitdown_pdf_processing_engine(global_settings)
+        if pdf_engine != PDF_PROCESSING_MARKITDOWN:
+            from .markitdown_pdf_fallback import convert_pdf_with_ocr_engine
+
+            return await convert_pdf_with_ocr_engine(
+                file,
+                engine_model_id=pdf_engine,
+                engine_pool=engine_pool,
+                settings_manager=settings_manager,
+                global_settings=global_settings,
+                get_sampling_params=get_sampling_params,
+            )
+
+    import asyncio
+
+    return await asyncio.to_thread(
+        convert_file_to_markdown,
+        file,
+        global_settings=global_settings,
+    )
+
+
+async def stream_attachment_to_markdown_async(
+    file: MarkItDownFile,
+    *,
+    global_settings: Any | None = None,
+    engine_pool: Any | None = None,
+    settings_manager: Any | None = None,
+    get_sampling_params: Any | None = None,
+):
+    if _is_plain_text_attachment(file):
+        markdown = decode_plain_text_attachment(file)
+        yield _format_attachment_markdown(file.filename, markdown)
+        return
+
+    if file.extension == ".pdf":
+        pdf_engine = markitdown_pdf_processing_engine(global_settings)
+        if pdf_engine != PDF_PROCESSING_MARKITDOWN:
+            from .markitdown_pdf_fallback import stream_pdf_with_ocr_engine
+
+            yield f"## Attached file: {file.filename}\n\n"
+            async for chunk in stream_pdf_with_ocr_engine(
+                file,
+                engine_model_id=pdf_engine,
+                engine_pool=engine_pool,
+                settings_manager=settings_manager,
+                global_settings=global_settings,
+                get_sampling_params=get_sampling_params,
+            ):
+                yield chunk
+            return
+
+    markdown = await convert_attachment_to_markdown_async(
+        file,
+        global_settings=global_settings,
+        engine_pool=engine_pool,
+        settings_manager=settings_manager,
+        get_sampling_params=get_sampling_params,
+    )
+    yield _format_attachment_markdown(file.filename, markdown)
 
 
 def decode_plain_text_attachment(file: MarkItDownFile) -> str:
@@ -268,7 +569,42 @@ def decode_plain_text_attachment(file: MarkItDownFile) -> str:
     return markdown
 
 
-def convert_file_to_markdown(file: MarkItDownFile) -> str:
+def convert_file_to_markdown(
+    file: MarkItDownFile,
+    *,
+    global_settings: Any | None = None,
+) -> str:
+    if file.extension == ".pdf":
+        return convert_pdf_file_to_markdown(file)
+
+    markdown = _convert_file_with_markitdown(file)
+    if not _has_extractable_text(markdown):
+        logger.warning(
+            "MarkItDown found no extractable text: filename=%s mime_type=%s",
+            file.filename,
+            file.mime_type,
+        )
+        raise MarkItDownRequestError(MARKITDOWN_EMPTY_MESSAGE, status_code=400)
+
+    return markdown
+
+
+def convert_pdf_file_to_markdown(
+    file: MarkItDownFile,
+) -> str:
+    quiet_pdf_parser_loggers()
+    markdown = _convert_file_with_markitdown(file)
+    if not _has_extractable_text(markdown):
+        logger.warning(
+            "MarkItDown found no extractable text: filename=%s mime_type=%s",
+            file.filename,
+            file.mime_type,
+        )
+        raise MarkItDownRequestError(MARKITDOWN_EMPTY_PDF_MESSAGE, status_code=400)
+    return markdown
+
+
+def _convert_file_with_markitdown(file: MarkItDownFile) -> str:
     converter = _get_converter()
 
     try:
@@ -300,21 +636,26 @@ def convert_file_to_markdown(file: MarkItDownFile) -> str:
             status_code=400,
         ) from exc
 
-    markdown = (getattr(result, "markdown", "") or "").strip()
-    if not _has_extractable_text(markdown):
-        detail = (
-            MARKITDOWN_EMPTY_PDF_MESSAGE
-            if file.extension == ".pdf"
-            else MARKITDOWN_EMPTY_MESSAGE
-        )
-        logger.warning(
-            "MarkItDown found no extractable text: filename=%s mime_type=%s",
-            file.filename,
-            file.mime_type,
-        )
-        raise MarkItDownRequestError(detail, status_code=400)
+    return _normalize_markdown_text(getattr(result, "markdown", "") or "")
 
-    return markdown
+
+def _normalize_markdown_text(markdown: str) -> str:
+    lines = [
+        line.rstrip()
+        for line in (markdown or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .split("\n")
+    ]
+    normalized: list[str] = []
+    previous_blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and previous_blank:
+            continue
+        normalized.append(line)
+        previous_blank = is_blank
+    return "\n".join(normalized).strip()
 
 
 def _get_converter() -> Any:
