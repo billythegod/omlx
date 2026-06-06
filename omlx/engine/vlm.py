@@ -2258,7 +2258,7 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _ = extract_images_from_messages(messages)
+        text_messages, _, _ = extract_images_from_messages(messages)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
