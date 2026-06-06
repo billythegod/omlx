@@ -987,6 +987,16 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert errors == []
 
+    def test_validate_context_window_policy(self):
+        """Sampling context policy must be positive when set."""
+        settings = GlobalSettings()
+        settings.sampling.max_context_window_policy = 128000
+        assert settings.validate() == []
+
+        settings.sampling.max_context_window_policy = 0
+        errors = settings.validate()
+        assert any("max_context_window_policy" in e for e in errors)
+
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""
         settings = GlobalSettings()

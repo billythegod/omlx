@@ -546,9 +546,7 @@ class SamplingSettings:
         """Create from dictionary."""
         return cls(
             max_context_window=data.get("max_context_window", 32768),
-            max_context_window_policy=data.get(
-                "max_context_window_policy", None
-            ),
+            max_context_window_policy=data.get("max_context_window_policy"),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
@@ -1242,6 +1240,14 @@ class GlobalSettings:
             )
 
         # Sampling validation
+        if (
+            self.sampling.max_context_window_policy is not None
+            and self.sampling.max_context_window_policy <= 0
+        ):
+            errors.append(
+                "Invalid sampling max_context_window_policy: "
+                f"{self.sampling.max_context_window_policy} (must be > 0)"
+            )
         if self.sampling.max_tokens <= 0:
             errors.append(
                 f"Invalid sampling max_tokens: {self.sampling.max_tokens} (must be > 0)"
