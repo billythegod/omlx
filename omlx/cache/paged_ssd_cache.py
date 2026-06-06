@@ -495,6 +495,20 @@ class PagedSSDCacheIndex:
             self._lru[metadata.block_hash] = metadata.last_access
             self._total_size += metadata.file_size
 
+    def sort_lru_by_last_access(self) -> None:
+        """Restore LRU ordering from each entry's last access timestamp."""
+        with self._lock:
+            self._lru = OrderedDict(
+                sorted(
+                    (
+                        (block_hash, self._index[block_hash].last_access)
+                        for block_hash in self._lru
+                        if block_hash in self._index
+                    ),
+                    key=lambda item: item[1],
+                )
+            )
+
     def get(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
         """
         Get block metadata by hash.
@@ -2496,8 +2510,11 @@ class PagedSSDCacheManager(CacheManager):
                     )
             # Reinsert anything we deferred so size accounting reflects the
             # on-disk reality. Next save will retry.
-            for metadata in evicted[_MAX_INLINE_UNLINKS_PER_SAVE:]:
+            deferred = evicted[_MAX_INLINE_UNLINKS_PER_SAVE:]
+            for metadata in deferred:
                 self._index.add(metadata)
+            if deferred:
+                self._index.sort_lru_by_last_access()
             if unlinked_count < len(evicted):
                 logger.debug(
                     f"Inline eviction capped at {_MAX_INLINE_UNLINKS_PER_SAVE} "
@@ -2588,6 +2605,7 @@ class PagedSSDCacheManager(CacheManager):
                 saves=self._stats["saves"],
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
+                evict_unlink_failures=self._stats["evict_unlink_failures"],
                 total_size_bytes=self._index.total_size,
                 max_size_bytes=self._get_effective_max_size(),
                 configured_max_size_bytes=self._max_size,
@@ -2647,6 +2665,7 @@ class PagedSSDCacheManager(CacheManager):
                 saves=self._stats["saves"],
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
+                evict_unlink_failures=self._stats["evict_unlink_failures"],
                 total_size_bytes=indexed_size,
                 max_size_bytes=self._get_effective_max_size(),
                 configured_max_size_bytes=self._max_size,

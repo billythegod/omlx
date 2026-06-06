@@ -2563,6 +2563,45 @@ class TestInlineLRUUnlinks:
         finally:
             mgr.close()
 
+    def test_deferred_eviction_preserves_lru_order(self, tmp_path, monkeypatch):
+        """Deferred eviction entries remain older than survivor entries."""
+        from omlx.cache import paged_ssd_cache as ssd_cache_module
+
+        monkeypatch.setattr(ssd_cache_module, "_MAX_INLINE_UNLINKS_PER_SAVE", 2)
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deferred_lru_order",
+            max_size_bytes=1024**2 + 20,
+            hot_cache_only=True,
+        )
+        try:
+            for i in range(6):
+                block_hash = f"lru_{i}".encode()
+                mgr._index.add(
+                    PagedSSDBlockMetadata(
+                        block_hash=block_hash,
+                        file_path=tmp_path / f"{block_hash.hex()}.safetensors",
+                        file_size=10,
+                        token_count=1,
+                        created_at=float(i),
+                        last_access=float(i),
+                        num_layers=1,
+                    )
+                )
+
+            mgr._get_effective_max_size = (  # type: ignore[method-assign]
+                lambda: 1024**2 + 20
+            )
+            mgr._enforce_size_limit_for_new_block()
+
+            remaining_lru = [
+                metadata.block_hash
+                for metadata in mgr._index.get_lru_entries(mgr._index.count)
+            ]
+            assert remaining_lru == [b"lru_2", b"lru_3", b"lru_4", b"lru_5"]
+        finally:
+            mgr.close()
+
     def test_unlink_failure_increments_counter(self, tmp_path, mx):
         """When ``Path.unlink`` raises ``OSError``, the eviction loop
         records the failure in ``evict_unlink_failures`` instead of
@@ -2580,8 +2619,6 @@ class TestInlineLRUUnlinks:
 
             # Patch unlink to raise OSError on the next eviction attempt.
             from pathlib import Path as _Path
-
-            original_unlink = _Path.unlink
 
             def boom_unlink(self, *args, **kwargs):
                 raise OSError("simulated unlink failure")
