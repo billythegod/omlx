@@ -1218,6 +1218,24 @@ class TestEngineCoreCloseReleasesSSDManager:
             manager.close.assert_called_once()
             assert scheduler.paged_ssd_cache_manager is None
 
+    def test_manager_closed_when_executor_fallback_raises(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            scheduler = engine.scheduler
+            manager = MagicMock()
+            scheduler.paged_ssd_cache_manager = manager
+            scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
+            engine._mlx_executor.shutdown(wait=True)
+
+            engine.close()  # must not raise
+
+            manager.close.assert_called_once()
+            assert scheduler.paged_ssd_cache_manager is None
+
     def test_manager_closed_on_normal_close(self, mock_model, mock_tokenizer):
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True

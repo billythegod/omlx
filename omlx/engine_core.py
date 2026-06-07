@@ -821,6 +821,13 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+                except Exception:
+                    logger.warning(
+                        "Engine %s: %s raised during close() fallback",
+                        self._engine_id,
+                        getattr(fn, "__name__", fn),
+                        exc_info=True,
+                    )
             except Exception:
                 # A failing shutdown/deep_reset must not abort close(), or the
                 # SSD cache manager below stays open and its writer thread keeps
