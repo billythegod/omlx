@@ -987,6 +987,16 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert errors == []
 
+    def test_validate_context_window_policy(self):
+        """Sampling context policy must be positive when set."""
+        settings = GlobalSettings()
+        settings.sampling.max_context_window_policy = 128000
+        assert settings.validate() == []
+
+        settings.sampling.max_context_window_policy = 0
+        errors = settings.validate()
+        assert any("max_context_window_policy" in e for e in errors)
+
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""
         settings = GlobalSettings()
@@ -1654,7 +1664,12 @@ class TestSamplingSettings:
     def test_defaults(self):
         """Test default values."""
         settings = SamplingSettings()
+        # Fallback default kept at 32768 so existing settings.json
+        # files carrying the historical default keep working unchanged
+        # after upgrade. ``max_context_window_policy`` is the explicit
+        # operator policy cap (None by default).
         assert settings.max_context_window == 32768
+        assert settings.max_context_window_policy is None
         assert settings.max_tokens == 32768
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
@@ -1685,7 +1700,23 @@ class TestSamplingSettings:
         """Test from_dict uses defaults for missing fields."""
         settings = SamplingSettings.from_dict({})
         assert settings.max_context_window == 32768
+        assert settings.max_context_window_policy is None
         assert settings.repetition_penalty == 1.0
+
+    def test_policy_field_round_trip(self):
+        """``max_context_window_policy`` must serialize and
+        deserialize without losing its ``None`` semantics."""
+        unset = SamplingSettings.from_dict({})
+        assert unset.max_context_window_policy is None
+        # to_dict preserves None
+        d = unset.to_dict()
+        assert d["max_context_window_policy"] is None
+        # Setting an explicit value round-trips
+        with_policy = SamplingSettings.from_dict(
+            {"max_context_window_policy": 128_000}
+        )
+        assert with_policy.max_context_window_policy == 128_000
+        assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
 
 class TestClaudeCodeSettings:
@@ -1784,7 +1815,78 @@ class TestClaudeCodeSettings:
 
 
 class TestIntegrationSettings:
-    """Tests for IntegrationSettings dataclass."""
+    """Tests for IntegrationSettings dataclass.
+
+    Upstream ``tests/test_integrations.py::TestIntegrationSettings`` already
+    covers defaults, basic to_dict, and full/empty from_dict. The local
+    tests below add: exact dict-shape pinning (so a future field
+    addition that forgets to_dict raises a loud test failure — see
+    81dc2d5 for the MemorySettings case), partial-dict fallback,
+    explicit-null override semantics, and round-trip identity. Plus
+    upstream's MarkItDown-integration tests merged in below.
+    """
+
+    def test_to_dict_defaults(self):
+        settings = IntegrationSettings()
+        d = settings.to_dict()
+        # Pin only the integration-model surface — MarkItDown additions
+        # are covered by ``test_markitdown_defaults`` separately, so we
+        # check the model fields exactly and leave the rest free to
+        # grow.
+        assert d["codex_model"] is None
+        assert d["opencode_model"] is None
+        assert d["openclaw_model"] is None
+        assert d["hermes_model"] is None
+        assert d["pi_model"] is None
+        assert d["copilot_model"] is None
+        assert d["openclaw_tools_profile"] == "coding"
+
+    def test_to_dict_custom(self):
+        settings = IntegrationSettings(
+            codex_model="qwen-coder-30b",
+            opencode_model="qwen-coder-7b",
+            openclaw_model="qwen-coder-3b",
+            hermes_model="hermes-3-8b",
+            pi_model="qwen-3-4b",
+            copilot_model="qwen-coder-1.5b",
+            openclaw_tools_profile="creative",
+        )
+        d = settings.to_dict()
+        assert d["codex_model"] == "qwen-coder-30b"
+        assert d["opencode_model"] == "qwen-coder-7b"
+        assert d["openclaw_model"] == "qwen-coder-3b"
+        assert d["hermes_model"] == "hermes-3-8b"
+        assert d["pi_model"] == "qwen-3-4b"
+        assert d["copilot_model"] == "qwen-coder-1.5b"
+        assert d["openclaw_tools_profile"] == "creative"
+
+    def test_from_dict_partial(self):
+        """Missing keys fall back to dataclass defaults."""
+        settings = IntegrationSettings.from_dict({"pi_model": "qwen-3-4b"})
+        assert settings.pi_model == "qwen-3-4b"
+        assert settings.codex_model is None
+        assert settings.copilot_model is None
+        assert settings.openclaw_tools_profile == "coding"
+
+    def test_from_dict_explicit_null_overrides_default(self):
+        """Explicit None for a *_model field must be preserved."""
+        settings = IntegrationSettings.from_dict(
+            {"codex_model": None, "pi_model": "x"}
+        )
+        assert settings.codex_model is None
+        assert settings.pi_model == "x"
+
+    def test_round_trip(self):
+        """to_dict → from_dict → to_dict is identity."""
+        original = IntegrationSettings(
+            codex_model="m1",
+            pi_model="m2",
+            openclaw_tools_profile="custom",
+        )
+        round_tripped = IntegrationSettings.from_dict(original.to_dict())
+        assert round_tripped.to_dict() == original.to_dict()
+
+    # --- MarkItDown integration tests merged in from upstream ---
 
     def test_markitdown_defaults(self):
         settings = IntegrationSettings()

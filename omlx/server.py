@@ -167,6 +167,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
 from .api.markitdown import (
@@ -207,7 +208,19 @@ class EngineType(Enum):
 class SamplingDefaults:
     """Default sampling parameters."""
 
+    # Fallback context length used by ``get_max_context_window`` only
+    # when neither a per-model override nor a model-config-discovered
+    # native context length is available. Setting this does NOT cap
+    # models that declare their own context — use
+    # ``max_context_window_policy`` for the operator-policy cap.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, models whose native
+    # context length is discovered get ``min(native, policy)``. Per-model
+    # overrides and the fallback default above are not affected — those
+    # represent explicit choices that the policy cannot override
+    # without surprising migration semantics for existing
+    # ``settings.json`` files.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -493,6 +506,12 @@ def _status_to_error_type(status_code: int) -> str:
         return "authentication_error"
     if status_code == 404:
         return "not_found_error"
+    if status_code == 413:
+        # Prefill-memory-guard rejection. OpenAI uses
+        # invalid_request_error for context-window-exceeded as well; we
+        # use the finer-grained 413 status but the same type so existing
+        # clients that branch on type still recognise the failure mode.
+        return "invalid_request_error"
     if status_code == 429:
         return "rate_limit_error"
     if status_code >= 500:
@@ -501,7 +520,16 @@ def _status_to_error_type(status_code: int) -> str:
 
 
 def _is_api_route(request: FastAPIRequest) -> bool:
-    """Check if request targets an OpenAI-compatible API route."""
+    """Check if request targets an OpenAI-compatible API route.
+
+    Path-prefix only. This assumes the FastAPI app is mounted at root
+    (the oMLX deployment shape) and that route paths are case-sensitive
+    — both true today. If a future deployment mounts this app under a
+    prefix (``app.mount("/api", ...)``), ``request.url.path`` returns
+    the full mounted path and every ``/v1/...`` route would be
+    classified as non-API. Switch to ``request.scope.get("route")``
+    matching at that point.
+    """
     return request.url.path.startswith("/v1/")
 
 
@@ -592,6 +620,60 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(PrefillMemoryExceededError)
+async def prefill_memory_exceeded_handler(
+    request: FastAPIRequest, exc: PrefillMemoryExceededError
+):
+    """Map prefill peak overshoot to HTTP 413 with a clean JSON body.
+
+    The synchronous prefill memory guard in ``Scheduler.add_request`` raises
+    this when the estimated KV+SDPA peak for a request would push memory
+    past the user-configured ``max_process_memory``. The caller's prompt
+    fits in the model's context window but is too large for the host's
+    headroom, so 413 (Payload Too Large) is the right code.
+
+    Code vs status trade-off: 413 (Payload Too Large) is a request-shape
+    error; 507 (Insufficient Storage) more accurately describes "host
+    can't service it right now". We use 413 because it maps cleanly to
+    the OpenAI SDK retry-with-smaller-input flow that most clients
+    already implement, and the ``error.code`` field gives consumers a
+    machine-readable discriminator (``"prefill_memory_exceeded"``)
+    distinct from genuine context-window-exceeded rejections.
+    """
+    detail = str(exc)
+    logger.warning(
+        "%s %s → 413: %s",
+        request.method,
+        request.url.path,
+        detail,
+    )
+    if _is_api_route(request):
+        # code="prefill_memory_exceeded" lets OpenAI-SDK clients branch
+        # on the failure mode. Without it, "context window too small"
+        # and "host has no memory headroom" both surface as
+        # invalid_request_error with code=None and clients can only
+        # tell the user "shorten your prompt" — which is wrong when
+        # the actual fix is to raise --max-process-memory.
+        content = _openai_error_body(
+            detail, 413, code="prefill_memory_exceeded"
+        )
+        # Surface the structured fields so clients can branch on
+        # numeric values instead of regex-matching the human message.
+        # OpenAI clients ignore unknown error fields so this is a
+        # forward-compatible extension.
+        if exc.estimated_bytes is not None:
+            content["error"]["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["error"]["limit_bytes"] = exc.limit_bytes
+    else:
+        content = {"detail": detail}
+        if exc.estimated_bytes is not None:
+            content["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["limit_bytes"] = exc.limit_bytes
+    return JSONResponse(status_code=413, content=content)
 
 
 @app.exception_handler(Exception)
@@ -1148,14 +1230,25 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority (#1308):
-        1. Explicit per-model setting (admin UI / settings.json override).
-        2. Context length discovered from the model's ``config.json`` at
-           server startup (``max_position_embeddings`` etc.); without
-           this tier the server would advertise the 32 K global default
-           even for models that declare 256 K+ natively.
-        3. Global default from ``SamplingConfig`` — last-resort fallback
-           for models whose config files don't expose a context length.
+    Resolution:
+        1. **Per-model override** (admin UI / settings.json) — always
+           wins. An operator who has set a per-model number knows what
+           they want; ``max_context_window_policy`` does not clamp it.
+        2. **Model-config-discovered native context length** (#1308),
+           optionally clamped by the operator policy: if
+           ``sampling.max_context_window_policy`` is set, return
+           ``min(native, policy)``; otherwise return ``native`` as-is.
+        3. **Fallback default** from ``SamplingSettings.max_context_window``
+           — only used when neither tier 1 nor tier 2 yields a value.
+           Treated as a default, NOT capped by the policy; existing
+           ``settings.json`` files carrying the historical ``32768``
+           default keep working unchanged after upgrade.
+
+    The policy field is intentionally nullable and unset by default so
+    no existing install behavior shifts. Setting it engages
+    ``min(native, policy)`` across every model whose native context is
+    discoverable; per-model overrides remain the operator's escape
+    hatch for individual models that should exceed the policy.
 
     Returns:
         Max context window token count, or ``None`` if no tier resolves
@@ -1169,16 +1262,41 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
 
+    # Priority 2: model-native context, optionally clamped by policy
     pool = _server_state.engine_pool
     if model_id and pool is not None:
         entry = pool.get_entry(model_id)
         if entry is not None and entry.model_context_length is not None:
-            return entry.model_context_length
+            native = entry.model_context_length
+            policy = getattr(
+                _server_state.sampling, "max_context_window_policy", None
+            )
+            if policy is not None and policy > 0:
+                return min(native, policy)
+            return native
 
+    # Priority 3: fallback default (not capped — preserves legacy
+    # settings.json behavior).
     return _server_state.sampling.max_context_window
+
+
+def get_embedding_max_length(
+    model_id: str | None = None,
+    request_max_length: int | None = None,
+) -> int:
+    """Get max token length for embedding requests."""
+    if request_max_length is not None:
+        return request_max_length
+
+    max_context_window = get_max_context_window(model_id)
+    if max_context_window is not None:
+        return max_context_window
+
+    return 512
 
 
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
@@ -1312,6 +1430,9 @@ def init_server(
     if global_settings and global_settings.sampling:
         _server_state.sampling = SamplingDefaults(
             max_context_window=global_settings.sampling.max_context_window,
+            max_context_window_policy=getattr(
+                global_settings.sampling, "max_context_window_policy", None
+            ),
             max_tokens=global_settings.sampling.max_tokens,
             temperature=global_settings.sampling.temperature,
             top_p=global_settings.sampling.top_p,
@@ -2157,11 +2278,17 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
+    max_length = get_embedding_max_length(request.model, request.max_length)
+
     async def _build_embeddings():
         start_time = time.perf_counter()
         try:
             async with acquire_embedding_engine(request.model) as engine:
-                output = await engine.embed(embedding_inputs)
+                output = await engine.embed(
+                    embedding_inputs,
+                    max_length=max_length,
+                    truncation=request.truncation,
+                )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except TypeError as e:
@@ -2170,7 +2297,8 @@ async def create_embeddings(
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-            f"{output.total_tokens} tokens in {elapsed:.3f}s"
+            f"{output.total_tokens} tokens, max_length={max_length}, "
+            f"truncation={request.truncation} in {elapsed:.3f}s"
         )
         get_server_metrics().record_request_complete(
             prompt_tokens=output.total_tokens,
@@ -2355,6 +2483,17 @@ async def create_completion(
     for prompt in prompts:
         num_tokens = len(engine.tokenizer.encode(prompt))
         validate_context_window(num_tokens, request.model)
+
+    # Pre-flight prefill memory guard — see create_chat_completion for
+    # the reason this must precede any StreamingResponse return.
+    # Thread the client-provided X-Request-ID when present so the 413
+    # log line and the FastAPI handler trace correlate with whatever
+    # the client is using on its side.
+    upstream_request_id = http_request.headers.get("x-request-id")
+    for prompt in prompts:
+        await engine.preflight_completion(
+            prompt, request_id=upstream_request_id
+        )
 
     if request.stream:
         return StreamingResponse(
@@ -2582,8 +2721,14 @@ async def create_chat_completion(
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
     )
-    # Fall back to prompt injection when grammar is not compiled
-    if compiled_grammar is None and response_format:
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
+    response_format_warning = None
+    if compiled_grammar is None and _response_format_requests_grammar(response_format):
+        response_format_warning = _response_format_warning_header(response_format)
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
@@ -2717,6 +2862,19 @@ async def create_chat_completion(
     if request.stop:
         chat_kwargs["stop"] = request.stop
 
+    # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
+    # the response in a StreamingResponse — starlette emits
+    # http.response.start (status 200) before iterating the body generator,
+    # so a typed exception thrown later by add_request lands as "Caught
+    # handled exception, but response already started" and the client sees
+    # an incomplete chunked read. Running the check here lets
+    # prefill_memory_exceeded_handler return a clean HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
+
     if request.stream:
         # Pre-mint the completion id so the keepalive frame (emitted before the
         # generator starts) can share it. See _chat_keepalive_chunk.
@@ -2724,6 +2882,9 @@ async def create_chat_completion(
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
             keepalive = _chat_keepalive_chunk(response_id)
+        sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+        if response_format_warning:
+            sse_headers["Warning"] = response_format_warning
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
@@ -2731,7 +2892,7 @@ async def create_chat_completion(
                 keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers=sse_headers,
         )
 
     # Non-streaming response with keepalive during prefill
@@ -2830,9 +2991,13 @@ async def create_chat_completion(
             ),
         ).model_dump_json(exclude_none=True)
 
+    json_headers = (
+        {"Warning": response_format_warning} if response_format_warning else None
+    )
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
         media_type="application/json",
+        headers=json_headers,
     )
 
 
@@ -3034,6 +3199,46 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _response_format_requests_strict(response_format) -> bool:
+    """True when an OpenAI ``response_format`` demands strict json_schema output.
+
+    A ``json_schema`` response_format with ``strict: true`` signals that the
+    caller expects schema-conformant output, not best-effort.  When
+    grammar-constrained decoding is unavailable the request still falls back to
+    prompt injection, but the downgrade is logged at a level that names the
+    unhonored ``strict`` intent so it is not silent (issue #1241).
+    """
+    if response_format is None:
+        return False
+    rf = response_format
+    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
+    if rf_type != "json_schema":
+        return False
+    js = rf.get("json_schema") if isinstance(rf, dict) else getattr(rf, "json_schema", None)
+    if js is None:
+        return False
+    strict = js.get("strict") if isinstance(js, dict) else getattr(js, "strict", None)
+    return bool(strict)
+
+
+def _response_format_requests_grammar(response_format) -> bool:
+    """True when an OpenAI ``response_format`` maps to grammar-constrained JSON.
+
+    Delegates to :func:`_build_format_element` so the unenforced-degrade signal
+    stays in sync with what actually gets compiled: a format earns the
+    Warning header / prompt-injection fallback only when a grammar element would
+    have been built for it.  That is non-``None`` exactly for ``json_object``
+    and a ``json_schema`` carrying a schema; a plain ``{"type": "text"}`` (or a
+    json_schema with no schema) maps to nothing and must not warn.  Sharing the
+    one source of truth keeps the header consistent with the server-side warn
+    log and avoids claiming "grammar-constrained decoding unavailable" for a
+    request that never described an enforceable grammar (#1241 review).
+    """
+    if response_format is None:
+        return False
+    return _build_format_element(response_format=response_format) is not None
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
@@ -3048,9 +3253,12 @@ def _compile_grammar_for_request(
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
 
-    Returns a compiled grammar object or ``None``.  Raises
-    :class:`HTTPException` on compilation errors or when xgrammar is
-    required but not installed.
+    Returns a compiled grammar object or ``None``.  ``structured_outputs``
+    raises :class:`HTTPException` when grammar is unavailable or fails to
+    compile.  A ``response_format`` degrades to ``None`` so the caller can fall
+    back to prompt injection; the downgrade is logged (and named as an
+    unhonored strict request when ``strict: true`` was set) rather than being
+    silent (#1241).
     """
     compiler = getattr(engine, 'grammar_compiler', None)
 
@@ -3063,16 +3271,19 @@ def _compile_grammar_for_request(
             from omlx.utils.install import get_install_method
 
             method = get_install_method()
-            if method == "dmg":
-                detail = (
-                    "Structured output is not available in the DMG version. "
-                    "xgrammar requires torch which significantly increases app size. "
-                    "Use the pip or Homebrew version for structured output support."
-                )
-            elif method == "homebrew":
+            if method == "homebrew":
                 detail = (
                     "Structured output requires xgrammar. "
                     "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            elif method == "dmg":
+                # DMG bundles xgrammar with a torch stub; reaching this
+                # branch means the bundled load failed (e.g. native binding
+                # incompatibility). Surface it instead of pointing users to
+                # a different install method.
+                detail = (
+                    "Structured output is unavailable: xgrammar failed to "
+                    "load in this build. Please report this issue."
                 )
             else:
                 detail = (
@@ -3080,6 +3291,8 @@ def _compile_grammar_for_request(
                     "Install with: pip install 'omlx[grammar]'"
                 )
             raise HTTPException(status_code=400, detail=detail)
+        if response_format is not None:
+            _warn_response_format_not_enforced(response_format)
         return None
 
     try:
@@ -3094,9 +3307,57 @@ def _compile_grammar_for_request(
                 status_code=400,
                 detail=f"Grammar compilation error: {e}",
             )
-        logger.warning("Grammar compilation from response_format failed, "
-                       "falling back to prompt injection: %s", e)
+        _warn_response_format_not_enforced(response_format, error=e)
     return None
+
+
+def _warn_response_format_not_enforced(response_format, error=None):
+    """Log that a ``response_format`` request fell back to prompt injection.
+
+    Previously a ``response_format`` that could not be grammar-constrained
+    (no compiler available, or a compilation error) degraded to best-effort
+    prompt injection silently, giving the client no signal that the schema was
+    not enforced (#1241).  A ``strict: true`` request gets a message that names
+    the unhonored strict intent.
+    """
+    reason = f" ({error})" if error is not None else ""
+    if _response_format_requests_strict(response_format):
+        logger.warning(
+            "response_format requested strict json_schema output but "
+            "grammar-constrained decoding is unavailable; strict enforcement "
+            "cannot be honored, falling back to best-effort prompt injection "
+            "(output is NOT schema-enforced)%s.", reason,
+        )
+    else:
+        logger.warning(
+            "response_format requested but grammar-constrained decoding is "
+            "unavailable; output will not be schema-enforced (falling back to "
+            "prompt injection)%s.", reason,
+        )
+
+
+def _response_format_warning_header(response_format) -> str:
+    """Build an RFC 7234 ``Warning`` header for an unenforced response_format.
+
+    The server already logs the downgrade (see
+    :func:`_warn_response_format_not_enforced`), but that signal is only
+    visible to the operator.  This header surfaces the same fact to the API
+    caller so a client can tell that ``response_format`` fell back to
+    best-effort prompt injection rather than schema-enforced output (#1241).
+    Header values must be single-line ASCII, so the text is terse.
+    """
+    if _response_format_requests_strict(response_format):
+        text = (
+            "response_format strict json_schema not enforced; "
+            "grammar-constrained decoding unavailable, output is "
+            "best-effort and NOT schema-enforced"
+        )
+    else:
+        text = (
+            "response_format not enforced; grammar-constrained decoding "
+            "unavailable, output is best-effort"
+        )
+    return f'199 omlx "{text}"'
 
 
 # =============================================================================
@@ -4083,6 +4344,14 @@ async def create_anthropic_message(
     if request.stop_sequences:
         chat_kwargs["stop"] = request.stop_sequences
 
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -4489,6 +4758,14 @@ async def create_response(
         chat_kwargs["tools"] = tools_for_template
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
 
     if request.stream:
         return StreamingResponse(
@@ -5290,7 +5567,6 @@ Note: Use the omlx CLI for full feature support.
 
     # Parse pinned models
     pinned_models = args.pin.split(",") if args.pin else []
-
     # Initialize server
     init_server(
         model_dir=args.model_dir,

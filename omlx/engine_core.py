@@ -460,10 +460,23 @@ class EngineCore:
         # Add to scheduler — route through the MLX executor so that
         # prefix cache reconstruction (mx.load, mx.concatenate) never
         # races with scheduler.step() on the Metal stream.  See #95.
+        #
+        # The scheduler may raise (PrefillMemoryExceededError, or other
+        # validation errors) before the request enters self.waiting. In
+        # that case the consumer in stream_outputs / generate never sees
+        # the request_id and its finally-block cleanup never fires —
+        # without the explicit cleanup below the per-rejection leak
+        # accumulates one collector + one stream_state + one
+        # asyncio.Event per refused request. Re-raise after cleanup so
+        # the typed exception still reaches the FastAPI 413 handler.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            self._mlx_executor, self.scheduler.add_request, request
-        )
+        try:
+            await loop.run_in_executor(
+                self._mlx_executor, self.scheduler.add_request, request
+            )
+        except BaseException:
+            self._cleanup_request(request_id)
+            raise
         self._wake_engine_loop()
 
         return request_id
@@ -821,6 +834,38 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+                except Exception:
+                    logger.warning(
+                        "Engine %s: %s raised during close() fallback",
+                        self._engine_id,
+                        getattr(fn, "__name__", fn),
+                        exc_info=True,
+                    )
+            except Exception:
+                # A failing shutdown/deep_reset must not abort close(), or the
+                # SSD cache manager below stays open and its writer thread keeps
+                # the manager (and its hot cache) alive until restart.
+                logger.warning(
+                    "Engine %s: %s raised during close()",
+                    self._engine_id,
+                    getattr(fn, "__name__", fn),
+                    exc_info=True,
+                )
+
+        # Guarantee the SSD cache manager is released even if shutdown() did not
+        # reach its own close() above. The manager's writer thread holds a strong
+        # reference to it, so an unclosed manager leaks until restart.
+        manager = getattr(self.scheduler, "paged_ssd_cache_manager", None)
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception:
+                logger.warning(
+                    "Engine %s: SSD cache manager close() failed during teardown",
+                    self._engine_id,
+                    exc_info=True,
+                )
+            self.scheduler.paged_ssd_cache_manager = None
 
         if self._mlx_executor is not None:
             # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
