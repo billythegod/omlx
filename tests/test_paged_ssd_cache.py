@@ -2581,10 +2581,11 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
     def test_block_size_plumbed_to_ssd_manager(self, tmp_path):
         """Final scheduler block size must reach the SSD cache manager
         — not the 256-token default."""
+        model_layers = 32
         sched = self._make_scheduler(
             tmp_path / "blk1024",
             block_size_tokens=1024,
-            model_layers=32,
+            model_layers=model_layers,
         )
 
         mgr = sched.paged_ssd_cache_manager
@@ -2598,21 +2599,60 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
             "Scheduler must plumb its final paged_cache_block_size "
             "into PagedSSDCacheManager"
         )
-        # The per-token KV estimate is plumbed from ``memory_monitor.
-        # estimate_block_memory(1)`` when the monitor is available;
-        # otherwise the manager's 200 KB default applies. On branches
-        # without the monitor auto-init in ``Scheduler.__init__``,
-        # accept either value.
-        if sched.memory_monitor is not None:
-            assert mgr._expected_kv_bytes_per_token == (
-                sched.memory_monitor.estimate_block_memory(1)
-            ), (
-                "Scheduler must plumb memory_monitor.estimate_block_memory"
-                "(1) as expected_kv_bytes_per_token when the monitor is "
-                "available"
-            )
-        else:
-            assert mgr._expected_kv_bytes_per_token == 200_000
+
+        # The auto-init in ``Scheduler.__init__`` (paired with
+        # ``_set_model_info_for_monitor()``) must populate dims from
+        # the fixture's model.config so the writer-queue cap formula
+        # weighs a real per-token cost. If either step regresses the
+        # SSD manager would silently fall back to either the monitor's
+        # ~128 KB 7B-class fiction or the manager's own 200 KB default
+        # — both miscalibrate the cap on the real model. Assert the
+        # construction order didn't regress.
+        assert sched.memory_monitor is not None, (
+            "Scheduler.__init__ must auto-init MemoryMonitor before "
+            "_init_tiered_cache; if this regresses the SSD manager "
+            "silently uses its 200 KB default and the cap math is "
+            "miscalibrated on every workload"
+        )
+        assert sched.memory_monitor.has_model_info(), (
+            "_set_model_info_for_monitor must populate dims from "
+            "model.config BEFORE _init_tiered_cache constructs the "
+            "PagedSSDCacheManager; otherwise estimate_block_memory(1) "
+            "returns its 7B-class default fiction"
+        )
+
+        # The model-derived per-token KV is what should reach the
+        # manager. Compute it inline from the fixture's known dims so
+        # this assertion can't be satisfied by a tautological pass-
+        # through of whatever ``estimate_block_memory`` happens to
+        # return — and so it doesn't equal the 200 KB manager default,
+        # making a silent fallback to the default visible as a numeric
+        # diff in the failure message.
+        per_token_bytes = (
+            1  # block_size token
+            * 8  # num_kv_heads in _make_scheduler fixture
+            * 192  # head_dim
+            * 2  # dtype_size (float16)
+            * 2  # keys + values
+        ) * model_layers
+        assert mgr._expected_kv_bytes_per_token == per_token_bytes, (
+            f"PagedSSDCacheManager received "
+            f"expected_kv_bytes_per_token={mgr._expected_kv_bytes_per_token} "
+            f"but the model-derived value is {per_token_bytes}; "
+            f"a value of 200000 indicates a silent fallback to the "
+            f"manager default"
+        )
+        # And the value the manager received must match
+        # ``memory_monitor.estimate_block_memory(1)`` — the documented
+        # source. Keep both checks: the inline calc above catches
+        # tautological pass-throughs, this one catches drift between
+        # the monitor's calc and the scheduler's wiring.
+        assert mgr._expected_kv_bytes_per_token == (
+            sched.memory_monitor.estimate_block_memory(1)
+        ), (
+            "Scheduler must plumb memory_monitor.estimate_block_memory"
+            "(1) as expected_kv_bytes_per_token"
+        )
 
         # And the cap computed from those plumbed inputs must drive the
         # write queue's maxsize — the cap is only useful if the queue
