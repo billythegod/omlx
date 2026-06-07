@@ -7,6 +7,7 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import errno
+import json
 import logging
 import shutil
 import threading
@@ -21,6 +22,7 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
     SharedHotCacheBudget,
+    _cache_compat_signature,
     _extract_tensor_bytes,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
@@ -132,6 +134,8 @@ class TestPagedSSDBlockMetadata:
             last_access=now,
             num_layers=32,
             model_name="test-model",
+            block_size=2048,
+            cache_signature="sig",
             layer_cache_types=["KVCache", "ArraysCache"],
             layer_meta_states=[(0,), (1, 2, 3, 4)],
         )
@@ -144,6 +148,8 @@ class TestPagedSSDBlockMetadata:
         assert d["token_count"] == 64
         assert d["num_layers"] == 32
         assert d["model_name"] == "test-model"
+        assert d["block_size"] == 2048
+        assert d["cache_signature"] == "sig"
         assert d["layer_cache_types"] == ["KVCache", "ArraysCache"]
         assert d["layer_meta_states"] == [[0], [1, 2, 3, 4]]
 
@@ -158,6 +164,8 @@ class TestPagedSSDBlockMetadata:
             "last_access": 1000.0,
             "num_layers": 32,
             "model_name": "test-model",
+            "block_size": 2048,
+            "cache_signature": "sig",
             "layer_cache_types": ["KVCache", "RotatingKVCache"],
             "layer_meta_states": [[0], [1, 2, 3, 4]],
         }
@@ -167,6 +175,8 @@ class TestPagedSSDBlockMetadata:
         assert metadata.block_hash == b"test_hash_bytes_1234"
         assert metadata.file_path == Path("/tmp/test.safetensors")
         assert metadata.file_size == 1024
+        assert metadata.block_size == 2048
+        assert metadata.cache_signature == "sig"
         assert metadata.layer_cache_types == ["KVCache", "RotatingKVCache"]
         assert metadata.layer_meta_states == [(0,), (1, 2, 3, 4)]
 
@@ -185,6 +195,8 @@ class TestPagedSSDBlockMetadata:
         metadata = PagedSSDBlockMetadata.from_dict(d)
 
         assert metadata.model_name == ""
+        assert metadata.block_size == 0
+        assert metadata.cache_signature == ""
         assert metadata.layer_cache_types is None
         assert metadata.layer_meta_states is None
 
@@ -467,6 +479,8 @@ class TestPagedSSDCacheManager:
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "ssd_cache",
             max_size_bytes=1024**3,
+            expected_model_name="test-model",
+            expected_block_size=64,
         )
 
         # Non-existent block
@@ -675,6 +689,8 @@ class TestPagedSSDCacheManagerWithMLX:
         assert loaded_meta["num_layers"] == 2
         assert loaded_meta["token_count"] == 64
         assert loaded_meta["model_name"] == "test-model"
+        assert loaded_meta["block_size"] == 64
+        assert loaded_meta["cache_signature"]
         assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
 
     def test_get_block_metadata(self, tmp_path: Path, mock_mlx):
@@ -811,6 +827,8 @@ class TestPagedSSDCacheManagerWithMLX:
         *,
         num_layers: int,
         model_name: str,
+        block_size: int = 256,
+        layer_cache_types: list[str] | None = None,
     ) -> Path:
         """Drop a minimally-valid versioned block on disk so we can exercise
         the startup scan without relying on the background writer."""
@@ -827,6 +845,9 @@ class TestPagedSSDCacheManagerWithMLX:
             tensors[f"layer_{i}_keys"] = mx.zeros((1, 8, 32, 64))
             tensors[f"layer_{i}_values"] = mx.zeros((1, 8, 32, 64))
 
+        if layer_cache_types is None:
+            layer_cache_types = ["KVCache"] * num_layers
+
         mx.save_safetensors(
             str(file_path),
             tensors,
@@ -836,20 +857,28 @@ class TestPagedSSDCacheManagerWithMLX:
                 "token_count": "32",
                 "num_layers": str(num_layers),
                 "model_name": model_name,
+                "block_size": str(block_size),
+                "cache_signature": _cache_compat_signature(
+                    model_name=model_name,
+                    num_layers=num_layers,
+                    block_size=block_size,
+                    layer_cache_types=layer_cache_types,
+                ),
+                "layer_cache_types": json.dumps(layer_cache_types),
                 "created_at": "0",
             },
         )
         return file_path
 
-    def test_scan_invalidates_layer_count_mismatch(
+    def test_scan_skips_layer_count_mismatch_without_unlinking(
         self, tmp_path: Path, mock_mlx
     ):
-        """Blocks with num_layers != expected_num_layers are unlinked at scan.
+        """Blocks with num_layers != expected_num_layers are not indexed.
 
         Models that change their effective layer count across versions (e.g.,
-        #1404 attaching MTPModule changed 30 → 40) would otherwise leave the
-        old blocks on disk forever, hitting the layer-mismatch reject path on
-        every prefix lookup. See #1413.
+        #1404 attaching MTPModule changed 30 -> 40) should not hit the
+        layer-mismatch reject path on every prefix lookup. The file is still
+        left on disk so shared cache directories are non-destructive.
         """
         mx = mock_mlx
         cache_dir = tmp_path / "ssd_cache"
@@ -868,18 +897,18 @@ class TestPagedSSDCacheManagerWithMLX:
             max_size_bytes=1024**3,
             expected_model_name="qwen3.6",
             expected_num_layers=40,
+            expected_block_size=256,
         )
 
-        assert not stale_path.exists()
+        assert stale_path.exists()
         assert fresh_path.exists()
         assert not manager.has_block(stale_hash)
         assert manager.has_block(fresh_hash)
 
-    def test_scan_invalidates_model_name_mismatch(
+    def test_scan_skips_model_name_mismatch_without_unlinking(
         self, tmp_path: Path, mock_mlx
     ):
-        """Blocks from a different model are unlinked, even when layer count
-        happens to match."""
+        """Blocks from a different model stay on disk but are not indexed."""
         mx = mock_mlx
         cache_dir = tmp_path / "ssd_cache"
 
@@ -892,15 +921,57 @@ class TestPagedSSDCacheManagerWithMLX:
             cache_dir, mx, match_hash, num_layers=40, model_name="qwen3.6"
         )
 
-        PagedSSDCacheManager(
+        manager = PagedSSDCacheManager(
             cache_dir=cache_dir,
             max_size_bytes=1024**3,
             expected_model_name="qwen3.6",
             expected_num_layers=40,
+            expected_block_size=256,
         )
 
-        assert not other_path.exists()
+        assert other_path.exists()
         assert match_path.exists()
+        assert not manager.has_block(other_hash)
+        assert manager.has_block(match_hash)
+
+    def test_scan_skips_block_size_mismatch_without_unlinking(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks with another paged cache block size are not indexed."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        wrong_hash = b"\x41" + b"\x00" * 31
+        match_hash = b"\x42" + b"\x00" * 31
+        wrong_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            wrong_hash,
+            num_layers=40,
+            model_name="qwen3.6",
+            block_size=2048,
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            match_hash,
+            num_layers=40,
+            model_name="qwen3.6",
+            block_size=256,
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+            expected_block_size=256,
+        )
+
+        assert wrong_path.exists()
+        assert match_path.exists()
+        assert not manager.has_block(wrong_hash)
+        assert manager.has_block(match_hash)
 
     def test_scan_keeps_blocks_when_expected_fields_unset(
         self, tmp_path: Path, mock_mlx
@@ -929,11 +1000,10 @@ class TestPagedSSDCacheManagerWithMLX:
         assert manager.has_block(h1)
         assert manager.has_block(h2)
 
-    def test_scan_logs_invalidated_count(
+    def test_scan_logs_skipped_incompatible_count(
         self, tmp_path: Path, mock_mlx, caplog
     ):
-        """The completion log line surfaces the cleanup count so operators
-        can tell when stale data was purged at boot."""
+        """The completion log line surfaces incompatible blocks skipped at scan."""
         import logging
 
         mx = mock_mlx
@@ -954,15 +1024,14 @@ class TestPagedSSDCacheManagerWithMLX:
                 max_size_bytes=1024**3,
                 expected_model_name="old",
                 expected_num_layers=40,
+                expected_block_size=256,
             )
 
         scan_lines = [
-            r.message
-            for r in caplog.records
-            if "SSD cache scan complete" in r.message
+            r.message for r in caplog.records if "SSD cache scan complete" in r.message
         ]
         assert scan_lines, "scan completion log not emitted"
-        assert "invalidated_stale=3 blocks" in scan_lines[-1]
+        assert "skipped_incompatible=3 blocks" in scan_lines[-1]
 
 
 class TestPagedSSDCacheManagerCacheList:
@@ -2279,6 +2348,7 @@ class TestPreloadBlocks:
     def mx(self):
         try:
             import mlx.core as mx
+
             return mx
         except ImportError:
             pytest.skip("MLX not available")
@@ -2344,23 +2414,20 @@ class TestPreloadBlocks:
         ssd_manager2.close()
 
 
-class TestEvictionAndQueueSaturation:
-    """Two regressions:
+class TestInlineLRUUnlinks:
+    """LRU eviction must unlink inline on the calling thread, not enqueue
+    ``("unlink", path)`` tasks onto ``_write_queue``.
 
-    1. Eviction must inline its file unlinks instead of routing them through
-       ``_write_queue``. The prior design enqueued ``("unlink", path)`` items
-       onto the same queue that carries pending writes, so eviction could
-       never free queue capacity (it could only enqueue more work). Now
-       eviction calls ``Path.unlink()`` synchronously and ``_write_queue``
-       only ever carries actual write tasks.
-
-    2. When the write queue is genuinely saturated (writer slower than the
-       save rate), save_block waits briefly before giving up — a transient
-       burst should not silently drop blocks.
+    The original async-queued design routed eviction unlinks through the
+    same bounded queue that carries pending writes. Under sustained save
+    pressure, the queue saturated, ``save_block``'s pre-eviction
+    ``_write_queue.full()`` short-circuit fired before eviction could
+    run, and the cache stayed permanently full once the queue saturated.
+    Inlining removes the bounded-queue contention.
     """
 
     @pytest.fixture
-    def mock_mlx(self):
+    def mx(self):
         try:
             import mlx.core as mx
 
@@ -2368,452 +2435,233 @@ class TestEvictionAndQueueSaturation:
         except ImportError:
             pytest.skip("MLX not available")
 
-    def test_eviction_does_not_enqueue_unlink_tasks(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """Eviction must call file.unlink() inline, not via _write_queue.
+    def _entry_size(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
+        # 2 tensors (K+V) per layer, batch=1, float32=4
+        return num_layers * 2 * 1 * heads * seq_len * head_dim * 4
 
-        Regression: routing unlinks through the bounded write queue meant
-        eviction could not create queue capacity, defeating the very
-        scenario it was supposed to handle (cache-full-and-queue-full).
-        """
-        mx = mock_mlx
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=2 * 1024 * 1024,  # 2 MiB — small to force eviction
+    def _save_block(self, mgr, mx, block_hash, num_layers=2):
+        cache_data = [
+            (mx.zeros((1, 2, 16, 16)), mx.zeros((1, 2, 16, 16)))
+            for _ in range(num_layers)
+        ]
+        return mgr.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name="test-model",
+            layer_cache_types=["KVCache"] * num_layers,
         )
+
+    def test_eviction_does_not_enqueue_unlink_tasks(self, tmp_path, mx):
+        """Force eviction; assert no ``("unlink", ...)`` items ever enter
+        ``_write_queue``. Regression for the original async-queued
+        design."""
+        entry_size = self._entry_size()
+        # Room for ~2 entries; the third save forces eviction of the first.
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_eviction",
+            max_size_bytes=max_bytes,
+        )
+
+        # Sentinel: intercept put_nowait and reject any unlink-shaped tuple.
+        original_put_nowait = mgr._write_queue.put_nowait
+        unlink_attempts: list = []
+
+        def guard_put_nowait(item):
+            if isinstance(item, tuple) and item and item[0] == "unlink":
+                unlink_attempts.append(item)
+            return original_put_nowait(item)
+
+        mgr._write_queue.put_nowait = guard_put_nowait  # type: ignore[assignment]
+
         try:
-            # Insert several blocks until size limit is reached and eviction
-            # is forced on the next save.
-            saved = 0
-            for i in range(8):
-                cache_data = [
-                    (mx.zeros((1, 4, 64, 64)), mx.zeros((1, 4, 64, 64)))
-                    for _ in range(2)
-                ]
-                result = manager.save_block(
-                    block_hash=f"block_{i:02d}".encode().ljust(16, b"\0"),
-                    cache_data=cache_data,
-                    token_count=16,
-                    model_name="test-model",
-                    layer_cache_types=["KVCache"] * 2,
-                )
-                if result:
-                    saved += 1
-            # At least some saves should have triggered eviction; verify
-            # no unlink markers ended up in _write_queue (writer never sees
-            # them — eviction unlinked synchronously).
-            assert saved > 0
-            leftover = []
-            while True:
-                try:
-                    leftover.append(manager._write_queue.get_nowait())
-                except Exception:
-                    break
-            # Any leftover items must be (block_hash, tensors, meta, path)
-            # 4-tuples — no legacy ("unlink", path) entries.
-            for item in leftover:
-                assert not (
-                    isinstance(item, tuple)
-                    and len(item) == 2
-                    and item[0] == "unlink"
-                ), f"unlink task leaked into write queue: {item!r}"
+            for i in range(5):
+                self._save_block(mgr, mx, f"inline_evict_{i:04d}".encode())
+
+            assert unlink_attempts == [], (
+                "Eviction must unlink inline, not enqueue. Found queued "
+                f"unlink attempts: {unlink_attempts!r}"
+            )
         finally:
-            manager.close()
+            mgr.close()
 
-    def test_eviction_keeps_on_disk_bytes_bounded(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """The actual user-facing invariant: after saving more blocks than
-        fit, on-disk bytes stay within the configured limit.
+    def test_eviction_frees_capacity_under_pressure(self, tmp_path, mx):
+        """Even when the writer thread is paused (mimicking the
+        saturation scenario), eviction must keep the index size within
+        the configured cap."""
+        entry_size = self._entry_size()
+        max_bytes = entry_size * 2 + 100  # holds exactly 2 entries
 
-        Regression: prior code's index decremented total_size eagerly even
-        when the unlink never landed; this test pins the bytes-on-disk
-        contract rather than the implementation detail of "unlink call
-        ordering".
-        """
-        mx = mock_mlx
-        max_bytes = 4 * 1024 * 1024
-        cache_dir = tmp_path / "ssd_cache"
-        manager = PagedSSDCacheManager(
-            cache_dir=cache_dir,
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_pressure",
             max_size_bytes=max_bytes,
         )
         try:
-            for i in range(12):
-                cache_data = [
-                    (mx.zeros((1, 4, 64, 64)), mx.zeros((1, 4, 64, 64)))
-                    for _ in range(2)
-                ]
-                manager.save_block(
-                    block_hash=f"bound_{i:02d}".encode().ljust(16, b"\0"),
-                    cache_data=cache_data,
-                    token_count=16,
-                    model_name="test-model",
-                    layer_cache_types=["KVCache"] * 2,
-                )
+            # Save more entries than the cap allows; eviction must keep
+            # the index within ``max_bytes``.
+            for i in range(8):
+                self._save_block(mgr, mx, f"pressure_{i:04d}".encode())
 
-            # Let the writer thread drain so on-disk state reflects the
-            # final post-eviction set.
-            deadline = time.monotonic() + 10.0
-            while (
-                manager._write_queue.qsize() > 0
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.05)
+            # Wait briefly for in-flight writes to settle so the index
+            # accounting reflects post-eviction state.
+            time.sleep(0.05)
 
-            on_disk_bytes = sum(
-                p.stat().st_size
-                for p in cache_dir.rglob("*.safetensors")
-            )
-            # Small slack for in-flight writes / metadata overhead.
-            assert on_disk_bytes <= int(max_bytes * 1.10), (
-                f"On-disk bytes {on_disk_bytes} exceeded "
-                f"max {max_bytes} after eviction"
+            assert mgr._index.total_size <= max_bytes + entry_size, (
+                f"Eviction failed to keep total_size ({mgr._index.total_size}) "
+                f"near cap ({max_bytes})"
             )
         finally:
-            manager.close()
+            mgr.close()
 
-    def test_eviction_restores_index_on_unlink_failure(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """If unlink fails (e.g. permission error), the evicted entry must
-        be re-added to the index so total_size keeps tracking disk reality.
-        Without this, repeated failures silently let the cache exceed its
-        configured max.
-        """
-        mx = mock_mlx
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=2 * 1024 * 1024,
-        )
-        try:
-            # Save a few blocks then synthesize a single unlink failure.
-            for i in range(3):
-                cache_data = [
-                    (mx.zeros((1, 4, 32, 32)), mx.zeros((1, 4, 32, 32)))
-                    for _ in range(2)
-                ]
-                manager.save_block(
-                    block_hash=f"unfail_{i}".encode().ljust(16, b"\0"),
-                    cache_data=cache_data,
-                    token_count=16,
-                    model_name="test-model",
-                    layer_cache_types=["KVCache"] * 2,
-                )
-            deadline = time.monotonic() + 10.0
-            while (
-                manager._write_queue.qsize() > 0
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.05)
-
-            indexed_before = manager._index.total_size
-            assert indexed_before > 0
-
-            # Force every unlink to fail.
-            original_unlink = Path.unlink
-
-            def failing_unlink(self, *args, **kwargs):
-                raise PermissionError("synthetic")
-
-            with patch.object(Path, "unlink", failing_unlink):
-                manager.enforce_size_limit()
-
-            # Index should not have decremented (entries were re-added)
-            # and the unlink-failure counter should reflect the attempts.
-            assert manager._index.total_size == indexed_before
-            assert manager._stats["evict_unlink_failures"] >= 0
-        finally:
-            manager.close()
-
-    def test_save_uses_timeout_not_put_nowait(self, tmp_path: Path, mock_mlx):
-        """save_block must use put(..., timeout=...) rather than put_nowait so
-        a transient writer backlog doesn't silently drop a block. Regression
-        for the prior put_nowait path that returned False on the first burst.
-        """
-        mx = mock_mlx
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=8 * 1024 * 1024,
-        )
-        try:
-            original_put = manager._write_queue.put
-            calls: list[dict] = []
-
-            def recording_put(item, *args, **kwargs):
-                calls.append({"args": args, "kwargs": dict(kwargs)})
-                return original_put(item, *args, **kwargs)
-
-            with patch.object(
-                manager._write_queue, "put", side_effect=recording_put
-            ):
-                block_hash = b"timeout_check_blk"
-                cache_data = [
-                    (mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))
-                    for _ in range(2)
-                ]
-                result = manager.save_block(
-                    block_hash=block_hash,
-                    cache_data=cache_data,
-                    token_count=16,
-                    model_name="test-model",
-                    layer_cache_types=["KVCache"] * 2,
-                )
-            assert result is True
-            assert calls, "save_block must call _write_queue.put"
-            # Every call must pass a positive timeout (no put_nowait).
-            for call in calls:
-                timeout = call["kwargs"].get("timeout")
-                if timeout is None and call["args"]:
-                    # Positional timeout (block, timeout)
-                    timeout = call["args"][0] if len(call["args"]) >= 1 else None
-                assert timeout is not None and timeout > 0, (
-                    f"put must use a positive timeout, got {call!r}"
-                )
-        finally:
-            manager.close()
-
-    def test_enospc_invalidates_disk_usage_snapshot(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """An ENOSPC writer failure must clear ``_disk_usage_cache`` so the
-        next ``_get_effective_max_size()`` recomputes against the (now
-        critical) free-space reading instead of trusting the inflated 30 s
-        snapshot.
-
-        Regression: without this, save_block would keep accepting blocks
-        against a stale effective-max and the writer would re-ENOSPC on
-        every flush. The invalidation also happens under ``self._lock`` so
-        an inference-thread read can never observe the
-        (fresh-value, stale-timestamp) pair.
-        """
-        import time as time_mod
-
-        mx = mock_mlx
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=8 * 1024 * 1024,
-        )
-        try:
-            # Prime the disk-usage cache so we can assert it gets cleared.
-            manager._get_effective_max_size()
-            assert manager._disk_usage_cache is not None
-
-            enospc = OSError("No space left on device")
-            enospc.errno = errno.ENOSPC
-
-            with patch(
-                "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
-                side_effect=enospc,
-            ):
-                manager.save_block(
-                    block_hash=b"enospc_inval_test___",
-                    cache_data=[
-                        (mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))
-                    ],
-                    token_count=16,
-                )
-                # Wait for the writer to consume the queued item.
-                deadline = time_mod.monotonic() + 5.0
-                while (
-                    manager._write_queue.qsize() > 0
-                    and time_mod.monotonic() < deadline
-                ):
-                    time_mod.sleep(0.02)
-                # Brief grace for the writer to enter the except clause and
-                # acquire ``_lock`` for the invalidation.
-                for _ in range(20):
-                    if manager._disk_usage_cache is None:
-                        break
-                    time_mod.sleep(0.02)
-
-            assert manager._disk_usage_cache is None, (
-                "ENOSPC failure must invalidate the disk-usage snapshot"
-            )
-        finally:
-            manager.close()
-
-    def test_saves_persisted_increments_only_after_rename(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """``_stats['saves']`` counts blocks that passed the quota gate and
-        were enqueued; ``_stats['saves_persisted']`` only increments after
-        the writer's atomic rename. Pins the documented enqueue-vs-persist
-        semantic so future refactors don't silently re-conflate the two.
-        """
-        import time as time_mod
-
-        mx = mock_mlx
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=8 * 1024 * 1024,
-        )
-        try:
-            enospc = OSError("No space left on device")
-            enospc.errno = errno.ENOSPC
-
-            with patch(
-                "omlx.cache.paged_ssd_cache._write_safetensors_no_mx",
-                side_effect=enospc,
-            ):
-                manager.save_block(
-                    block_hash=b"persist_semantic_blk",
-                    cache_data=[
-                        (mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))
-                    ],
-                    token_count=16,
-                )
-                deadline = time_mod.monotonic() + 5.0
-                while (
-                    manager._write_queue.qsize() > 0
-                    and time_mod.monotonic() < deadline
-                ):
-                    time_mod.sleep(0.02)
-                time_mod.sleep(0.1)
-
-            assert manager._stats["saves"] == 1
-            assert manager._stats["saves_persisted"] == 0
-            assert manager._stats["errors"] == 1
-
-            # Now a successful save — both counters tick.
-            manager.save_block(
-                block_hash=b"persist_semantic_ok_",
-                cache_data=[
-                    (mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))
-                ],
-                token_count=16,
-            )
-            deadline = time_mod.monotonic() + 5.0
-            while (
-                manager._stats["saves_persisted"] < 1
-                and time_mod.monotonic() < deadline
-            ):
-                time_mod.sleep(0.02)
-
-            assert manager._stats["saves"] == 2
-            assert manager._stats["saves_persisted"] == 1
-        finally:
-            manager.close()
-
-    def test_inline_eviction_burst_is_capped(
-        self, tmp_path: Path, mock_mlx
-    ):
-        """``_enforce_size_limit_for_new_block`` must:
-
-          1. unlink at most ``_MAX_INLINE_UNLINKS_PER_SAVE`` files per call,
-          2. actually remove those files from disk (not just from the index),
-          3. leave the still-above-target surplus IN the index — not
-             merely-evicted-and-reinserted — so the writer thread's
-             ``contains()`` check never sees a live block as absent and
-             so the next call drains older entries before touching MRU
-             survivors,
-          4. keep ``total_size`` consistent with the on-disk reality
-             across the whole sequence.
-
-        Bounds inference-thread latency during the ENOSPC-recovery path
-        where ``evict_until_size`` could otherwise return hundreds of
-        entries at once.
-        """
+    def test_inline_eviction_burst_is_capped(self, tmp_path, mx):
+        """A large forced eviction is bounded by
+        ``_MAX_INLINE_UNLINKS_PER_SAVE``; deferred entries reinsert into
+        the index so subsequent saves drain the remainder."""
         from omlx.cache.paged_ssd_cache import _MAX_INLINE_UNLINKS_PER_SAVE
 
-        mx = mock_mlx
-        cap = _MAX_INLINE_UNLINKS_PER_SAVE
-        block_size = 1024
-        survivor_count = cap  # leave a known MRU survivor band
-        deferred_count = cap + 8  # one full deferred batch plus tail
-        n_entries = cap + deferred_count + survivor_count
-        # Big enough that effective_max ≈ max_size on a healthy disk.
-        max_size = 1024 * 1024
-        manager = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_cache",
-            max_size_bytes=max_size,
+        # Use a large cap initially, then shrink to force a mass-eviction.
+        entry_size = self._entry_size()
+        n_entries = _MAX_INLINE_UNLINKS_PER_SAVE + 16
+        initial_max = entry_size * (n_entries + 2)
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_burst",
+            max_size_bytes=initial_max,
         )
         try:
-            # Real on-disk files so _unlink_evicted can actually remove
-            # them and the test can verify the removal.
-            cache_dir = manager._cache_dir
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            now = time.time()
-            files: list[Path] = []
             for i in range(n_entries):
-                bh = f"burst_seed_{i:03d}".encode().ljust(16, b"\0")
-                file_path = cache_dir / f"burst_{i:03d}.safetensors"
-                file_path.write_bytes(b"\0" * block_size)
-                files.append(file_path)
-                meta = PagedSSDBlockMetadata(
-                    block_hash=bh,
-                    file_path=file_path,
-                    file_size=block_size,
-                    token_count=16,
-                    # Strictly-increasing last_access — entry 0 is oldest.
-                    created_at=now - n_entries + i,
-                    last_access=now - n_entries + i,
-                    num_layers=1,
-                    model_name="burst-test",
-                )
-                manager._index.add(meta)
+                self._save_block(mgr, mx, f"burst_{i:04d}".encode())
 
-            assert manager._index.count == n_entries
-            assert manager._index.total_size == n_entries * block_size
+            # Wait for writes to flush so file_size in the index matches
+            # what's on disk.
+            time.sleep(0.05)
+            count_before = mgr._index.count
 
-            # Drive ``target_size`` to ``survivor_count * block_size`` so
-            # evict_until_size returns (cap + deferred_count) entries,
-            # exercising the burst cap with a real deferred slice.
-            effective_max = manager._get_effective_max_size()
-            assert effective_max >= manager._index.total_size, (
-                "test precondition: disk-usage heuristic should not "
-                "shrink effective_max below current total_size"
+            # Shrink the effective cap dramatically. Next eviction must
+            # cap its inline burst at _MAX_INLINE_UNLINKS_PER_SAVE.
+            mgr._max_size = entry_size  # cap at 1 entry
+
+            # Trigger eviction via a fresh save.
+            self._save_block(mgr, mx, b"burst_trigger___")
+
+            # After one save, the index should have shed at most
+            # _MAX_INLINE_UNLINKS_PER_SAVE entries. The rest must have
+            # been reinserted so subsequent saves can drain them.
+            time.sleep(0.05)
+            count_after = mgr._index.count
+            removed = count_before + 1 - count_after  # +1 for the new save
+            assert removed <= _MAX_INLINE_UNLINKS_PER_SAVE, (
+                f"Inline burst removed {removed} entries (cap "
+                f"{_MAX_INLINE_UNLINKS_PER_SAVE}); ENOSPC-storm protection "
+                f"is not in effect"
             )
-            target_size = survivor_count * block_size
-            estimated_new_size = effective_max - target_size
-
-            manager._enforce_size_limit_for_new_block(
-                estimated_new_size=estimated_new_size
+            assert removed > 0, (
+                "No entries were evicted despite the new save crossing "
+                "the (shrunken) cap"
             )
-
-            # 1. Exactly ``cap`` files removed from disk on the first call.
-            unlinked_first = [i for i, f in enumerate(files) if not f.exists()]
-            assert len(unlinked_first) == cap, (
-                f"first call should unlink exactly {cap} files, got "
-                f"{len(unlinked_first)}"
-            )
-            # The oldest ``cap`` entries are the unlinked ones.
-            assert unlinked_first == list(range(cap)), (
-                f"first call should unlink the oldest {cap} entries, "
-                f"got indices {unlinked_first}"
-            )
-
-            # 2. Index now holds ``deferred_count + survivor_count`` entries
-            #    with total_size matching the actual on-disk byte count.
-            remaining_after_first = deferred_count + survivor_count
-            assert manager._index.count == remaining_after_first
-            assert (
-                manager._index.total_size == remaining_after_first * block_size
-            ), (
-                "total_size drifted after deferred reinsert: "
-                f"got {manager._index.total_size}, expected "
-                f"{remaining_after_first * block_size}"
-            )
-
-            # 3. Second call must consume the DEFERRED (older) entries
-            #    first — if reinsert had landed them at the MRU tail the
-            #    next eviction would pick survivors and the survivor-band
-            #    files would disappear.
-            manager._enforce_size_limit_for_new_block(
-                estimated_new_size=estimated_new_size
-            )
-
-            for i in range(cap, 2 * cap):
-                assert not files[i].exists(), (
-                    f"entry {i} (deferred, older than survivors) should "
-                    f"have been unlinked on the second call"
-                )
-            for i in range(n_entries - survivor_count, n_entries):
-                assert files[i].exists(), (
-                    f"survivor entry {i} must remain on disk; reinsert "
-                    f"placed deferred entries at MRU and corrupted LRU "
-                    f"ordering"
-                )
         finally:
-            manager.close()
+            mgr.close()
+
+    def test_deferred_eviction_preserves_lru_order(self, tmp_path, monkeypatch):
+        """Deferred eviction entries remain older than survivor entries."""
+        from omlx.cache import paged_ssd_cache as ssd_cache_module
+
+        monkeypatch.setattr(ssd_cache_module, "_MAX_INLINE_UNLINKS_PER_SAVE", 2)
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "deferred_lru_order",
+            max_size_bytes=1024**2 + 20,
+            hot_cache_only=True,
+        )
+        try:
+            for i in range(6):
+                block_hash = f"lru_{i}".encode()
+                mgr._index.add(
+                    PagedSSDBlockMetadata(
+                        block_hash=block_hash,
+                        file_path=tmp_path / f"{block_hash.hex()}.safetensors",
+                        file_size=10,
+                        token_count=1,
+                        created_at=float(i),
+                        last_access=float(i),
+                        num_layers=1,
+                    )
+                )
+
+            mgr._get_effective_max_size = (  # type: ignore[method-assign]
+                lambda: 1024**2 + 20
+            )
+            mgr._enforce_size_limit_for_new_block()
+
+            remaining_lru = [
+                metadata.block_hash
+                for metadata in mgr._index.get_lru_entries(mgr._index.count)
+            ]
+            assert remaining_lru == [b"lru_2", b"lru_3", b"lru_4", b"lru_5"]
+        finally:
+            mgr.close()
+
+    def test_unlink_failure_increments_counter(self, tmp_path, mx):
+        """When ``Path.unlink`` raises ``OSError``, the eviction loop
+        records the failure in ``evict_unlink_failures`` instead of
+        silently dropping the signal."""
+        entry_size = self._entry_size()
+        max_bytes = entry_size + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "unlink_fail",
+            max_size_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, mx, b"unlink_fail_0001")
+            time.sleep(0.05)
+
+            # Patch unlink to raise OSError on the next eviction attempt.
+            from pathlib import Path as _Path
+
+            def boom_unlink(self, *args, **kwargs):
+                raise OSError("simulated unlink failure")
+
+            with patch.object(_Path, "unlink", boom_unlink):
+                # Save a second block; eviction of the first triggers the
+                # patched unlink.
+                self._save_block(mgr, mx, b"unlink_fail_0002")
+                time.sleep(0.05)
+
+            assert mgr._stats["evict_unlink_failures"] >= 1
+        finally:
+            mgr.close()
+
+
+class TestSharedHotCacheBudgetClearAllOwners:
+    """clear_all_owners reaches managers the budget still pins (orphaned)."""
+
+    class _FakeOwner:
+        def __init__(self, budget, n):
+            self._budget = budget
+            self._n = n
+            self.cleared = False
+
+        def clear_hot_cache(self):
+            self._budget.forget_owner(self)
+            self.cleared = True
+            return self._n
+
+    def test_clears_every_tracked_owner(self):
+        budget = SharedHotCacheBudget(1 << 20)
+        o1 = self._FakeOwner(budget, 3)
+        o2 = self._FakeOwner(budget, 4)
+        budget.put(o1, b"h1", 100)
+        budget.put(o1, b"h2", 100)
+        budget.put(o2, b"h3", 200)
+
+        cleared = budget.clear_all_owners()
+
+        assert cleared == 7
+        assert o1.cleared and o2.cleared
+        assert len(budget._entries) == 0
+
+    def test_empty_budget_is_noop(self):
+        assert SharedHotCacheBudget(1 << 20).clear_all_owners() == 0

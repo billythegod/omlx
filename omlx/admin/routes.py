@@ -256,6 +256,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Sampling defaults
     sampling_max_context_window: int | None = None
+    sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
     sampling_max_tokens: int | None = None
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
@@ -842,6 +843,8 @@ async def _apply_cache_settings_runtime(
 
 def _apply_sampling_settings_runtime(
     max_context_window: int | None,
+    max_context_window_policy: int | None,
+    max_context_window_policy_set: bool,
     max_tokens: int | None,
     temperature: float | None,
     top_p: float | None,
@@ -863,6 +866,10 @@ def _apply_sampling_settings_runtime(
     if max_context_window is not None:
         _server_state.sampling.max_context_window = max_context_window
         changes.append(f"max_context_window={max_context_window}")
+
+    if max_context_window_policy_set:
+        _server_state.sampling.max_context_window_policy = max_context_window_policy
+        changes.append(f"max_context_window_policy={max_context_window_policy}")
 
     if max_tokens is not None:
         _server_state.sampling.max_tokens = max_tokens
@@ -2902,6 +2909,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
+            "max_context_window_policy": (
+                global_settings.sampling.max_context_window_policy
+            ),
             "max_tokens": global_settings.sampling.max_tokens,
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
@@ -3287,6 +3297,11 @@ async def update_global_settings(
             request.sampling_max_context_window
         )
         sampling_changed = True
+    if "sampling_max_context_window_policy" in request.model_fields_set:
+        global_settings.sampling.max_context_window_policy = (
+            request.sampling_max_context_window_policy
+        )
+        sampling_changed = True
     if request.sampling_max_tokens is not None:
         global_settings.sampling.max_tokens = request.sampling_max_tokens
         sampling_changed = True
@@ -3308,6 +3323,8 @@ async def update_global_settings(
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
             request.sampling_max_context_window,
+            request.sampling_max_context_window_policy,
+            "sampling_max_context_window_policy" in request.model_fields_set,
             request.sampling_max_tokens,
             request.sampling_temperature,
             request.sampling_top_p,
@@ -4335,12 +4352,11 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
-def _iter_loaded_schedulers():
-    """Yield (model_id, scheduler) for each loaded model.
+def _iter_loaded_scheduler_records():
+    """Yield (model_id, scheduler, core) for each loaded model.
 
     Traverses the internal engine hierarchy: pool entry → async engine →
-    core engine → scheduler.  Both ``clear_ssd_cache`` and
-    ``clear_hot_cache`` share this traversal.
+    core engine → scheduler.
     """
     engine_pool = _get_engine_pool()
     if engine_pool is None:
@@ -4356,7 +4372,16 @@ def _iter_loaded_schedulers():
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if scheduler is not None:
-            yield model_id, scheduler
+            yield model_id, scheduler, core
+
+
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Both ``clear_ssd_cache`` and ``clear_hot_cache`` share this traversal.
+    """
+    for model_id, scheduler, _core in _iter_loaded_scheduler_records():
+        yield model_id, scheduler
 
 
 @router.post("/api/ssd-cache/clear")
@@ -4407,13 +4432,23 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
 
 @router.post("/api/hot-cache/clear")
 async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
-    """Clear the in-memory (hot) cache for all loaded models.
+    """Clear the in-memory hot cache and release the buffers it held.
 
-    No filesystem fallback needed — hot cache is in-memory only and does
-    not survive process restart.
+    Dropping hot cache entries releases Python references, but MLX may keep
+    now-unused buffers in its allocator pool. Reclaim through the scheduler's
+    synchronized clear path so active engine streams and async store-cache
+    workers keep the same Metal safety barriers used by generation.
     """
+    import gc
+
+    from ..engine_core import get_mlx_executor
+    from ..scheduler import _sync_and_clear_cache
+    from ..utils.proc_memory import get_phys_footprint
+
+    footprint_before = get_phys_footprint()
     total_cleared = 0
-    for model_id, scheduler in _iter_loaded_schedulers():
+    reclaim_targets = []
+    for model_id, scheduler, core in _iter_loaded_scheduler_records():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
             try:
@@ -4427,7 +4462,51 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()
-    return {"status": "ok", "total_cleared": total_cleared}
+        executor = getattr(core, "_mlx_executor", None)
+        if executor is not None:
+            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+
+    # Also clear managers orphaned by an abnormal teardown: they hold live
+    # hot cache but are no longer attached to a loaded scheduler, so the loop
+    # above cannot reach them. The shared budget still references them.
+    pool = _get_engine_pool()
+    budget = getattr(getattr(pool, "_scheduler_config", None), "hot_cache_budget", None)
+    if budget is not None and hasattr(budget, "clear_all_owners"):
+        try:
+            total_cleared += budget.clear_all_owners()
+        except Exception as exc:
+            logger.warning("Failed to clear orphaned hot caches: %s", exc)
+
+    # Return pooled buffers to the OS using scheduler._sync_and_clear_cache(),
+    # the same lock/synchronize/clear helper used by generation. Run on each
+    # loaded engine's executor so its thread-local stream is present. If every
+    # model has been unloaded, still run one reclaim on the fallback executor so
+    # orphaned/no-loaded hot cache cleanup can release MLX's allocator pool.
+    gc.collect()
+    loop = asyncio.get_running_loop()
+    if reclaim_targets:
+        for model_id, executor, stream in reclaim_targets:
+            try:
+                await loop.run_in_executor(executor, _sync_and_clear_cache, stream)
+            except RuntimeError as exc:
+                if "cannot schedule new futures after shutdown" not in str(exc):
+                    raise
+                logger.warning(
+                    "Engine executor unavailable while reclaiming MLX buffers "
+                    "for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    else:
+        await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
+
+    return {
+        "status": "ok",
+        "total_cleared": total_cleared,
+        "bytes_reclaimed": bytes_reclaimed,
+    }
 
 
 @router.post("/api/cache/probe")

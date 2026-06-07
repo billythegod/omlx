@@ -515,12 +515,13 @@ class TestGetMaxContextWindow:
     def test_global_default_when_nothing_discovered(self):
         """No model context, no per-model override → global default.
 
-        The global default is intentionally large (1 M) so it acts as
-        "no policy" for unconfigured installs; an operator who wants a
-        real cap lowers it explicitly.
+        Fallback default kept at 32768 so existing ``settings.json``
+        files carrying the historical default keep working unchanged.
+        Operators who want a real server-wide cap set
+        ``max_context_window_policy`` instead — see TestPolicyCap below.
         """
         self._mount_pool({"llama-3": self._entry("llama-3", None)})
-        assert get_max_context_window("llama-3") == 1_000_000
+        assert get_max_context_window("llama-3") == 32768
 
     def test_discovered_context_returned_when_no_override(self):
         """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
@@ -541,9 +542,9 @@ class TestGetMaxContextWindow:
 
     def test_no_model_id_returns_global_default(self):
         """A bare /v1/messages-style call with no model id falls to the default."""
-        assert get_max_context_window(None) == 1_000_000
+        assert get_max_context_window(None) == 32768
 
     def test_unknown_model_id_returns_global_default(self):
         """An unknown model id doesn't crash — falls through to the default."""
         self._mount_pool({})
-        assert get_max_context_window("ghost-model") == 1_000_000
+        assert get_max_context_window("ghost-model") == 32768
