@@ -9,6 +9,7 @@ enabling larger effective cache sizes than GPU memory allows.
 import errno
 import json
 import logging
+import queue
 import shutil
 import threading
 import time
@@ -2421,22 +2422,46 @@ class TestComputeMaxPendingWrites:
     SSD writer hasn't drained yet — so the cap must scale by bytes per
     slot, not just host RAM. Cap should shrink when each block is
     expensive (large block_size or fat KV) and grow when each block is
-    cheap, keeping the worst-case pinned bytes at a small fraction of
-    host RAM regardless of system size.
+    cheap, while the hard byte budget bounds the soft floor.
     """
 
-    def test_floor_clamps_low_end(self):
-        """An unreasonably large per-slot cost still produces at least
-        the minimum cap so saves never serialize against the disk."""
+    def test_soft_floor_applies_when_hard_budget_allows(self):
+        """The soft floor gives large-block workloads burst headroom
+        when the byte hard cap still has room."""
         from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
 
-        # 100 MB per slot × 16 slots = 1.6 GB; on any modern Mac the
-        # math says fewer slots, the floor pulls it back to 16.
-        cap = _compute_max_pending_writes(
-            block_size_tokens=10_000_000,
-            kv_bytes_per_token=1_000_000,
-        )
-        assert cap == 16
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                return 4096
+            if name == "SC_PHYS_PAGES":
+                return (64 * 1024**3) // 4096
+            raise ValueError(name)
+
+        with patch("omlx.cache.paged_ssd_cache.os.sysconf", side_effect=fake_sysconf):
+            cap = _compute_max_pending_writes(
+                block_size_tokens=2048,
+                kv_bytes_per_token=200_000,
+            )
+        assert cap == 24
+
+    def test_hard_budget_bounds_soft_floor(self):
+        """The soft floor must not force the pending pool above 30%
+        of host RAM for very expensive blocks."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                return 4096
+            if name == "SC_PHYS_PAGES":
+                return (64 * 1024**3) // 4096
+            raise ValueError(name)
+
+        with patch("omlx.cache.paged_ssd_cache.os.sysconf", side_effect=fake_sysconf):
+            cap = _compute_max_pending_writes(
+                block_size_tokens=2048,
+                kv_bytes_per_token=500_000,
+            )
+        assert cap == 20
 
     def test_ceiling_clamps_high_end(self):
         """A 512 GB host with tiny blocks still tops out at 256
@@ -2480,11 +2505,11 @@ class TestComputeMaxPendingWrites:
 
     def test_default_args_produce_sensible_cap(self):
         """The default-args path used by static callers must produce
-        a cap inside the in-band range [16, 256]."""
+        a cap inside the bounded range."""
         from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
 
         cap = _compute_max_pending_writes()
-        assert 16 <= cap <= 256
+        assert 1 <= cap <= 256
 
     def test_manager_picks_up_per_instance_cap(self, tmp_path):
         """The PagedSSDCacheManager must recompute the cap from its
@@ -2757,6 +2782,37 @@ class TestInlineLRUUnlinks:
             model_name="test-model",
             layer_cache_types=["KVCache"] * num_layers,
         )
+
+    def test_save_waits_on_full_queue_before_drop(self, tmp_path, mx):
+        """A full queue must not short-circuit before tensor extraction.
+
+        The bounded wait gives the writer a chance to drain transient bursts;
+        only sustained saturation should drop the block.
+        """
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "full_queue_wait",
+            max_size_bytes=1 << 30,
+        )
+        original_put = mgr._write_queue.put
+        original_full = mgr._write_queue.full
+        calls: list[float | None] = []
+
+        def fake_put(item, timeout=None, *args, **kwargs):
+            calls.append(timeout)
+            raise queue.Full
+
+        try:
+            mgr._write_queue.full = lambda: True  # type: ignore[method-assign]
+            mgr._write_queue.put = fake_put  # type: ignore[method-assign]
+
+            assert self._save_block(mgr, mx, b"full_queue_wait") is False
+
+            assert calls == [1.0]
+            assert mgr.get_stats().ssd_write_drops == 1
+        finally:
+            mgr._write_queue.put = original_put  # type: ignore[method-assign]
+            mgr._write_queue.full = original_full  # type: ignore[method-assign]
+            mgr.close()
 
     def test_eviction_does_not_enqueue_unlink_tasks(self, tmp_path, mx):
         """Force eviction; assert no ``("unlink", ...)`` items ever enter

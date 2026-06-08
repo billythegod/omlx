@@ -52,12 +52,16 @@ except ImportError:
 
 
 # --- Async I/O constants ---
-# Fraction of host RAM the pending-write queue is allowed to pin at
-# worst case. The queue holds raw-byte copies of KV blocks that the
-# background writer hasn't drained yet (see ``_extract_tensor_bytes``
-# in ``save_block``). 5% on a 32 GB Mac = 1.6 GB pinned at saturation,
-# well clear of the OOM threshold for typical inference workloads.
-_PENDING_WRITES_TARGET_RAM_FRACTION = 0.05
+# Fraction of host RAM the pending-write queue targets at saturation.
+# The queue holds raw-byte copies of KV blocks that the background
+# writer hasn't drained yet (see ``_extract_tensor_bytes`` in
+# ``save_block``). The hard fraction below bounds the soft floor so
+# large-block workloads cannot silently reserve an unsafe amount of RAM.
+_PENDING_WRITES_TARGET_RAM_FRACTION = 0.10
+_PENDING_WRITES_HARD_RAM_FRACTION = 0.30
+_PENDING_WRITES_SOFT_FLOOR = 24
+_PENDING_WRITES_CEILING = 256
+_PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (num_layers × num_kv_heads ×
@@ -75,20 +79,24 @@ def _compute_max_pending_writes(
     block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
     kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
     target_fraction: float = _PENDING_WRITES_TARGET_RAM_FRACTION,
+    hard_fraction: float = _PENDING_WRITES_HARD_RAM_FRACTION,
 ) -> int:
     """Compute max pending writes queue depth.
 
-    Scales by *block bytes* so the worst-case pending pool stays near
-    ``target_fraction`` of host RAM regardless of how big each block is:
+    Scales by *block bytes* so the target pending pool stays near
+    ``target_fraction`` of host RAM regardless of how big each block is,
+    while ``hard_fraction`` bounds the soft floor:
 
         worst_case_bytes = cap × block_size_tokens × kv_bytes_per_token
         cap = (total_ram × target_fraction) / (block_size × kv_bytes_per_token)
 
-    Bounded [16, 256]:
-      - Floor at 16 so even tiny systems with large blocks retain
+    Bounded by a soft floor, a byte hard cap, and a ceiling:
+      - Soft floor at 24 so even small systems with large blocks retain
         burst headroom for a few in-flight writes — dropping to zero
         means every save serializes against the disk and the writer
         thread becomes a hard bottleneck on the inference loop.
+      - Hard cap at 30% of host RAM so the soft floor cannot turn very
+        large blocks into an unsafe memory reservation.
       - Ceiling at 256 so 512 GB+ systems don't pin gigabytes against
         a writer that's already keeping up at lower caps.
 
@@ -110,7 +118,9 @@ def _compute_max_pending_writes(
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         block_bytes = max(1, block_size_tokens * kv_bytes_per_token)
         target = int(total_bytes * target_fraction / block_bytes)
-        return max(16, min(256, target))
+        hard_cap = max(1, int(total_bytes * hard_fraction / block_bytes))
+        soft_target = max(_PENDING_WRITES_SOFT_FLOOR, target)
+        return max(1, min(_PENDING_WRITES_CEILING, soft_target, hard_cap))
     except (ValueError, OSError):
         return 64  # Safe default
 
@@ -1134,11 +1144,10 @@ class PagedSSDCacheManager(CacheManager):
         # 3. Queue third — enqueue for background writer.
         try:
             item = (block_hash, tensors_raw, metadata, file_path)
-            # Non-blocking callers (hot-cache LRU spill) also wait briefly so
-            # a transient writer backlog doesn't silently drop blocks. Same
-            # 250 ms budget as save_block. Blocking callers (shutdown flush)
-            # wait longer to maximize the chance of flushing every entry.
-            self._write_queue.put(item, timeout=0.5 if blocking else 0.25)
+            # Non-blocking callers (hot-cache LRU spill) also wait so a
+            # transient writer backlog doesn't silently drop blocks. Blocking
+            # callers (shutdown flush) use the same bounded wait.
+            self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -1147,7 +1156,7 @@ class PagedSSDCacheManager(CacheManager):
         except queue.Full:
             self._stats["ssd_write_drops"] += 1
             logger.warning(
-                f"SSD write queue saturated (cap={_MAX_PENDING_WRITES}); "
+                f"SSD write queue saturated (cap={self._max_pending_writes}); "
                 f"dropping evicted block {block_hash.hex()[:16]} — writer is "
                 f"falling behind"
             )
@@ -1563,25 +1572,6 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["hits"] += 1
                 return True
 
-        # Cold-store saturation short-circuit: when hot cache is disabled
-        # the write queue is the only buffer between save_block and the
-        # writer thread. If the writer is already saturated, dropping here
-        # avoids the GPU tensor-extraction + size-enforcement work we'd
-        # otherwise throw away at the put step a few hundred lines down.
-        # Inline-LRU-unlinks already let eviction free queue capacity;
-        # this guard handles the case where the writer (not eviction) is
-        # the bottleneck. In hot-cache mode the LRU spill path through
-        # _enqueue_ssd_write has its own timeout-put + drop accounting,
-        # so we don't short-circuit there.
-        if not self._hot_cache_enabled and self._write_queue.full():
-            self._stats["ssd_write_drops"] += 1
-            logger.warning(
-                f"SSD cache write queue saturated (cap={_MAX_PENDING_WRITES}); "
-                f"dropping save for {block_hash.hex()[:16]} before tensor "
-                f"extraction — writer is falling behind"
-            )
-            return False
-
         file_path = self._get_file_path(block_hash)
 
         try:
@@ -1832,20 +1822,18 @@ class PagedSSDCacheManager(CacheManager):
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.add(block_hash)
 
-            # Enqueue full file write for background thread. Wait briefly on
-            # Full so a transient burst (faster than the writer can drain)
-            # doesn't immediately drop the block — 250 ms is well below human
-            # perception of latency and typically covers one or two writer
-            # iterations on a healthy SSD.
+            # Enqueue full file write for background thread. Wait on Full so
+            # transient bursts (faster than the writer can drain) don't
+            # immediately punch holes in the cache chain.
             try:
                 self._write_queue.put(
                     (block_hash, tensors_raw, metadata, file_path),
-                    timeout=0.25,
+                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
                 )
             except queue.Full:
                 self._stats["ssd_write_drops"] += 1
                 logger.warning(
-                    f"SSD cache write queue saturated (cap={_MAX_PENDING_WRITES}); "
+                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
                     f"dropping write for {block_hash.hex()[:16]} — writer is "
                     f"falling behind"
                 )
