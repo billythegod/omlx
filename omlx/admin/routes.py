@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import SubKeyEntry
+from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -210,6 +210,7 @@ class GlobalSettingsRequest(BaseModel):
     server_aliases: list[str] | None = None
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
+    burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -2853,6 +2854,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "server_aliases": list(global_settings.server.server_aliases),
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
+            "burst_decode_mode": global_settings.server.burst_decode_mode,
         },
         "model": {
             "model_dirs": [
@@ -3023,6 +3025,41 @@ async def update_global_settings(
             )
         global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
         runtime_applied.append("sse_keepalive_mode")
+    if request.burst_decode_mode is not None:
+        if request.burst_decode_mode not in BURST_DECODE_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid burst_decode_mode: {request.burst_decode_mode} "
+                f"(must be one of {sorted(BURST_DECODE_MODES)})",
+            )
+        mode = request.burst_decode_mode
+        global_settings.server.burst_decode_mode = mode
+        # Seed env so models loaded later pick up the mode without a restart.
+        for _key, _value in burst_decode_env(mode).items():
+            os.environ[_key] = _value
+        # Hot-apply to every loaded engine. EngineConfig is a mutable dataclass
+        # and its burst fields are read fresh each decode burst
+        # (EngineCore._step_burst), so this takes effect on the next token.
+        max_steps, single_s = BURST_DECODE_MODES[mode]
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            for _mid, entry in pool._entries.items():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = (
+                    getattr(async_core, "engine", None)
+                    if async_core is not None
+                    else None
+                )
+                cfg = getattr(core, "config", None) if core is not None else None
+                if cfg is not None and hasattr(cfg, "decode_burst_budget_single_s"):
+                    cfg.decode_burst_max_steps = max_steps
+                    cfg.decode_burst_budget_single_s = single_s
+        runtime_applied.append("burst_decode_mode")
+        logger.info(f"Burst Decode mode set to '{mode}'")
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")

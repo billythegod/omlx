@@ -79,7 +79,7 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
-    from .settings import init_settings, get_settings
+    from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     process_title.set_process_title()
@@ -160,6 +160,11 @@ def serve_command(args):
     if settings.network.ca_bundle:
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
+
+    # Seed Burst Decode env vars so EngineConfig picks up the saved mode at
+    # engine construction (no restart needed when the mode changes later).
+    for _key, _value in burst_decode_env(settings.server.burst_decode_mode).items():
+        os.environ[_key] = _value
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
