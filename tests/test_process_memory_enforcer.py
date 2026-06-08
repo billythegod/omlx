@@ -1032,8 +1032,6 @@ class TestMemoryLimitPropagation:
         bg._memory_limit_bytes = 0
         bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -1049,14 +1047,35 @@ class TestMemoryLimitPropagation:
         assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
         assert bg._memory_hard_limit_bytes == 10 * 1024**3
 
+    def test_propagate_with_guard_disabled(self, enforcer):
+        """When the guard is disabled the field reflects it; hard limit is
+        still propagated for observability — the reader's early-return on
+        ``prefill_memory_guard=False`` makes the value moot for the
+        rejection path."""
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+        enforcer._prefill_memory_guard = False
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._prefill_memory_guard is False
+        # Hard limit is still propagated for observability — the reader's
+        # early-return on ``prefill_memory_guard=False`` makes the value
+        # moot for the rejection path. (The fixture's monkey-patched
+        # ceiling stays at 10 GB; the production ``_get_hard_limit_bytes``
+        # would return 0 when the guard is disabled, but the fixture
+        # bypasses that branch — see ``_make_enforcer``.)
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+
     def test_propagates_on_tier_change(self, enforcer):
         """Changing the tier at runtime triggers re-propagation."""
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 0
         bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -1089,7 +1108,6 @@ class TestMemoryLimitPropagation:
             bg = MagicMock(spec=[])
             bg._memory_limit_bytes = 0
             scheduler = MagicMock(spec=[])
-            scheduler._memory_limit_bytes = 0
             scheduler.batch_generator = bg
             schedulers.append(scheduler)
             engine = MagicMock(spec=[])
@@ -1102,6 +1120,110 @@ class TestMemoryLimitPropagation:
 
         for scheduler in schedulers:
             assert scheduler._memory_limit_bytes == 10 * 1024**3
+
+    async def test_check_and_enforce_propagates_every_poll(self, enforcer):
+        """Regression: a fresh engine loaded AFTER enforcer.start() must pick
+        up its limits within one poll interval — even when pressure stays
+        "ok" the whole time.
+
+        Before this guarantee the propagation only fired on pressure-level
+        changes. On a host where the first prefill stayed below soft until
+        a few seconds in, the scheduler kept _prefill_memory_guard=False /
+        _memory_hard_limit_bytes=0 (their __init__ defaults), the guard
+        short-circuited, the request entered prefill, and the underlying
+        Apple IOGPUFamily bug (FB22091885) panicked the kernel mid-chunk.
+        """
+        # Engine pool starts empty (mirrors real startup: lazy load on first
+        # request, well after enforcer.start()).
+        enforcer._engine_pool._entries = {}
+        # Engine loads at t1 — the enforcer hasn't seen it yet.
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 0
+        bg._memory_hard_limit_bytes = 0
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        # One poll iteration with pressure well below soft — pressure level
+        # does NOT change. Before the fix this returned without propagating.
+        with patch.object(
+            enforcer, "_current_usage_bytes", return_value=1 * 1024**3
+        ):
+            await enforcer._check_and_enforce()
+
+        # Within one poll, the freshly-loaded engine has the user-configured
+        # ceiling and the guard flag.
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+        assert scheduler._memory_limit_bytes == 10 * 1024**3
+        assert scheduler._prefill_memory_guard is True
+
+    def test_propagates_through_batched_engine_wrapper(self, enforcer):
+        """Regression: live engines in EnginePool don't expose ``.scheduler``
+        on the top-level wrapper — BatchedEngine and VLMBatchedEngine both
+        hold the real Scheduler at ``self._engine.engine.scheduler``. The
+        propagation must traverse that chain, otherwise the prefill memory
+        guard flag never reaches the scheduler and the guard short-circuits
+        on every request (observed end-to-end 2026-05-15: three kernel
+        panics from 110k-token Qwen3.6-VL prefills the guard "should" have
+        rejected).
+        """
+        # Build the real wrapper shape:
+        #   entry.engine                  → BatchedEngine / VLMBatchedEngine
+        #   entry.engine._engine          → AsyncEngineCore
+        #   entry.engine._engine.engine   → EngineCore
+        #   entry.engine._engine.engine.scheduler → Scheduler  ← target
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        engine_core = MagicMock(spec=["scheduler"])
+        engine_core.scheduler = scheduler
+        async_engine_core = MagicMock(spec=["engine"])
+        async_engine_core.engine = engine_core
+        # Wrapper deliberately does NOT expose top-level ``.scheduler`` — only
+        # ``._engine`` like the real BatchedEngine.
+        wrapper = MagicMock(spec=["_engine"])
+        wrapper._engine = async_engine_core
+
+        entry = _make_entry("model-a", engine=wrapper)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_limit_bytes == 10 * 1024**3
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+        assert scheduler._prefill_memory_guard is True
+
+    def test_unresolvable_scheduler_logs_warning_once(self, enforcer, caplog):
+        """If the wrapper-chain traversal fails (no ``scheduler`` anywhere
+        in the chain), ``_propagate_memory_limit`` must log a WARNING
+        naming the engine type so the silent no-op failure mode that
+        originally hid the dead memory guard is loud in CI / oncall. The
+        warning is rate-limited per engine type so a misconfigured
+        engine polled every second doesn't spam.
+        """
+        # Wrapper chain that bottoms out without a scheduler.
+        wrapper = MagicMock(spec=["_engine"])
+        wrapper._engine = MagicMock(spec=["engine"])
+        wrapper._engine.engine = MagicMock(spec=[])  # no .scheduler
+        wrapper.__class__.__name__ = "BrokenEngine"
+
+        entry = _make_entry("model-broken", engine=wrapper)
+        enforcer._engine_pool._entries = {"model-broken": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+            # Second call: no extra log line — rate limit holds.
+            enforcer._propagate_memory_limit()
+
+        matching = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.message
+        ]
+        assert len(matching) == 1, (
+            f"expected 1 warning, got {[r.message for r in matching]}"
+        )
 
 
 class TestUnresolvableSchedulerWarning:
@@ -1416,10 +1538,6 @@ class TestTwoWatermarkPressureLevels:
         # Wire a scheduler-like mock so propagate has something to set.
         engine = MagicMock()
         scheduler = MagicMock()
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
-        scheduler._prefill_memory_guard = False
-        scheduler._admission_paused = False
         engine.scheduler = scheduler
         entry = _make_entry("m", engine=engine)
         pool._entries = {"m": entry}
@@ -1436,9 +1554,6 @@ class TestTwoWatermarkPressureLevels:
     async def test_clears_admission_paused_on_recovery(self, enforcer_2wm, pool):
         engine = MagicMock()
         scheduler = MagicMock()
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
-        scheduler._prefill_memory_guard = False
         scheduler._admission_paused = True
         engine.scheduler = scheduler
         entry = _make_entry("m", engine=engine, is_pinned=True)

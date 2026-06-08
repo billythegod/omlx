@@ -1231,11 +1231,13 @@ class TestSSDWriteDrops:
             mgr.close()
 
     def test_ssd_write_drops_increments_on_hot_eviction_queue_full(self, tmp_path):
-        """Site 1: hot-cache eviction → put_nowait raises queue.Full → drop += 1.
+        """Site 1: hot-cache eviction → put raises queue.Full → drop += 1.
 
-        Patches the real queue's put_nowait to always raise queue.Full,
-        guaranteeing the drop path fires on the first eviction without any
-        dependency on the writer thread's drain rate.
+        Patches the real queue's put to raise queue.Full, guaranteeing the
+        drop path fires on the first eviction without any dependency on the
+        writer thread's drain rate. _enqueue_ssd_write uses put(item,
+        timeout=...) (not put_nowait) so a transient burst can ride over a
+        short writer-backlog window; sustained saturation still drops.
         """
         import queue as _queue
         from unittest.mock import patch
@@ -1252,12 +1254,12 @@ class TestSSDWriteDrops:
         )
         try:
             with patch.object(
-                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+                mgr._write_queue, "put", side_effect=_queue.Full
             ):
                 self._save_block(mgr, b"qf_drop_block_00")
                 self._save_block(mgr, b"qf_drop_block_01")
-                # save_02 evicts block 00 → _enqueue_ssd_write → put_nowait
-                # raises queue.Full → drop fires, cleanup runs.
+                # save_02 evicts block 00 → _enqueue_ssd_write → put raises
+                # queue.Full → drop fires, cleanup runs.
                 self._save_block(mgr, b"qf_drop_block_02")
 
             stats = mgr.get_stats()
@@ -1275,10 +1277,10 @@ class TestSSDWriteDrops:
     def test_ssd_write_drops_increments_on_cold_store_preflight(self, tmp_path):
         """Site 2: save_block preflight _write_queue.full() guard.
 
-        Hot cache disabled. Patches the queue's `full()` method to return
-        True so the preflight short-circuits on the first save. No real
-        queue manipulation, no writer-thread race, no risk of crashing the
-        writer with a malformed sentinel.
+        Hot cache disabled. Patches the queue's ``full()`` method to return
+        True so the preflight short-circuits before tensor extraction. The
+        guard's job is to avoid GPU work we'd otherwise throw away at the
+        put call when the writer is already saturated.
         """
         from unittest.mock import patch
 
@@ -1302,17 +1304,20 @@ class TestSSDWriteDrops:
             stats = mgr.get_stats()
             assert stats.ssd_write_drops == 1
             assert stats.errors == 0
-            # Site 2 is a preflight rejection — no index/buffer state was
-            # created, so nothing to assert on cleanup.
+            # Preflight rejection: no index/buffer state was created,
+            # so nothing to assert on cleanup.
         finally:
             mgr.close()
 
     def test_ssd_write_drops_increments_on_cold_store_late_exception(self, tmp_path):
-        """Site 3: save_block put_nowait raises queue.Full after preflight passes.
+        """Site 3: save_block put raises queue.Full after the preflight passes.
 
-        Hot cache disabled. put_nowait is patched to raise queue.Full even
-        though _write_queue.full() reports False — forces the late-exception
-        path inside save_block. Cleanup must remove index + pending hashes.
+        Hot cache disabled. ``put`` is patched to raise queue.Full directly
+        (simulating a sustained writer-backlog saturation that materializes
+        after the preflight check). Cleanup must remove index + pending
+        hashes. The pre-eviction ``_write_queue.full()`` short-circuit
+        handles the easy case earlier; this test covers the race where the
+        queue fills between the preflight read and the put.
         """
         import queue as _queue
         from unittest.mock import patch
@@ -1326,7 +1331,7 @@ class TestSSDWriteDrops:
             cache_data = self._make_cache_data()
             block_hash = b"cold_late_drop_00"
             with patch.object(
-                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+                mgr._write_queue, "put", side_effect=_queue.Full
             ):
                 ok = mgr.save_block(
                     block_hash=block_hash,
