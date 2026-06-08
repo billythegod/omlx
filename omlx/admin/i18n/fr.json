@@ -295,6 +295,7 @@
   "settings.server.host_public": "Ouvert à tous (0.0.0.0)",
   "settings.server.host_custom": "Personnalisé (attention)",
   "settings.server.host_placeholder": "par ex. 192.168.1.100",
+  "settings.server.host_multi_hint": "Separate multiple addresses with commas",
   "settings.server.port": "Port",
   "settings.server.log_level": "Niveau de log",
   "settings.server.log_level_error": "erreur",

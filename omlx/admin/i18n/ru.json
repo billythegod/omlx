@@ -295,6 +295,7 @@
   "settings.server.host_public": "Открыть для всех (0.0.0.0)",
   "settings.server.host_custom": "Пользовательский (осторожно)",
   "settings.server.host_placeholder": "например 192.168.1.100",
+  "settings.server.host_multi_hint": "Separate multiple addresses with commas",
   "settings.server.port": "Порт",
   "settings.server.log_level": "Уровень логирования",
   "settings.server.log_level_error": "ошибка",
