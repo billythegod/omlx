@@ -50,6 +50,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -7821,7 +7822,7 @@ class Scheduler:
         logger.info("Scheduler shutdown initiated...")
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
-        # below before the executor is joined.
+        # below before the executor is asked to shut down.
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
@@ -7833,15 +7834,21 @@ class Scheduler:
                         "Waiting for %d inflight async store_cache future(s)...",
                         len(inflight),
                     )
-                    concurrent.futures.wait(inflight, timeout=30.0)
+                    _done, not_done = concurrent.futures.wait(
+                        inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+                    )
+                    if not_done:
+                        fatal_exit(
+                            "Scheduler shutdown timed out after "
+                            f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
+                            f"{len(not_done)} async store_cache future(s)"
+                        )
                 self._drain_pending_async_removes()
-                self._store_cache_executor.shutdown(wait=True)
-                # Final drain after executor join. All workers are now done,
-                # so any entries still in _pending_async_removes (skipped by
-                # the first drain because their future hadn't completed yet)
-                # are guaranteed drainable here. Without this, slow worker
-                # finishes between the 30s wait timeout and shutdown(wait=True)
-                # would leave KV cache references pinned on Request objects.
+                self._store_cache_executor.shutdown(wait=False)
+                # Final drain after the bounded wait. If all workers finished
+                # before the timeout, skipped entries are now drainable. If not,
+                # fatal_exit() above terminates the process instead of leaving
+                # a partially torn-down engine alive.
                 self._drain_pending_async_removes()
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")
