@@ -1975,6 +1975,7 @@ async def _preprocess_markitdown_files_for_llm(
             settings_manager=_server_state.settings_manager,
             get_sampling_params=get_sampling_params,
             fail_when_disabled=True,
+            allow_missing_historical_files=True,
         )
     except MarkItDownRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
