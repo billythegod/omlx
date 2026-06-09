@@ -1200,6 +1200,24 @@ class DFlashEngine(BaseEngine):
         ):
             yield output
 
+    @property
+    def scheduler(self) -> Any | None:
+        fallback = self._fallback_engine
+        if fallback is None:
+            return None
+
+        scheduler = getattr(fallback, "scheduler", None)
+        if scheduler is not None:
+            return scheduler
+
+        inner = getattr(fallback, "_engine", None)
+        if inner is None:
+            return None
+        inner_engine = getattr(inner, "engine", None)
+        if inner_engine is None:
+            return None
+        return getattr(inner_engine, "scheduler", None)
+
     def has_active_requests(self) -> bool:
         if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
             return True

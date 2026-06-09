@@ -672,6 +672,11 @@ class ProcessMemoryEnforcer:
                     # would fire on a routine startup before any model is
                     # loaded and turn the signal into noise.
                     continue
+                if (
+                    type(engine).__name__ == "DFlashEngine"
+                    and getattr(engine, "_fallback_engine", None) is None
+                ):
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
                 # ``_resolve_scheduler()`` return None on a loaded engine

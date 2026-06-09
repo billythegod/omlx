@@ -1383,6 +1383,26 @@ class TestUnresolvableSchedulerWarning:
             f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
         )
 
+    def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
+        """DFlash normal mode has no scheduler until fallback is started."""
+
+        class DFlashEngine:
+            _fallback_engine = None
+
+        entry = _make_entry("model-dflash", engine=DFlashEngine())
+        enforcer._engine_pool._entries = {"model-dflash": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
 
 class TestStoreCacheCapWalk:
     """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""
