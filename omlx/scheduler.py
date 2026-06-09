@@ -5790,12 +5790,11 @@ class Scheduler:
         Estimate whether prefill would exceed memory limits.
 
         Computes worst-case peak memory for the last prefill chunk
-        (model weights + KV cache + SDPA attention matrix) and rejects
+        (model weights + KV cache + SDPA activation/scratch) and rejects
         if it would exceed the hard limit.
 
-        For head_dim > 128, MLX SDPA uses a fallback that materializes
-        the full attention matrix [B, n_q, chunk, kv_len] in float32.
-        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+        Current MLX avoids the old full fp32 attention matrix for
+        head_dim > 128, but still needs a bounded tiled scratch term.
 
         Returns:
             ``_PreflightRejection`` carrying the message + numeric
