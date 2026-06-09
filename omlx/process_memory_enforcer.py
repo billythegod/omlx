@@ -209,29 +209,50 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
     so the user sees the hint in logs in addition to the admin UI red
     banner.
 
-    `mx.set_wired_limit` raises when asked for more than the kernel
-    sysctl allows, so we clamp before calling.
+    When iogpu.wired_limit_mb is unset (0), leave Apple's default Metal
+    cap active instead of calling mx.set_wired_limit with the same default
+    cap. The scheduler still clamps against get_effective_metal_cap_bytes();
+    this only avoids changing MLX allocator state unless the user explicitly
+    raised the kernel cap.
     """
     if desired_bytes <= 0:
         return 0, None
-    effective_cap = get_effective_metal_cap_bytes()
+
+    sysctl_cap = get_iogpu_wired_limit_bytes()
+    if sysctl_cap <= 0:
+        effective_cap = get_effective_metal_cap_bytes()
+        if effective_cap > 0 and effective_cap < desired_bytes:
+            logger.warning(
+                "Metal cap (%s, Apple max_recommended_working_set_size) is "
+                "below the oMLX static ceiling (%s); leaving Apple's default "
+                "Metal cap active because iogpu.wired_limit_mb is unset. "
+                "Raise it with: sudo sysctl iogpu.wired_limit_mb=%d",
+                _format_gb(effective_cap),
+                _format_gb(desired_bytes),
+                desired_bytes // (1024**2),
+            )
+        else:
+            logger.debug(
+                "Skipping mx.set_wired_limit because iogpu.wired_limit_mb is "
+                "unset (target=%s, Apple cap=%s)",
+                _format_gb(desired_bytes),
+                _format_gb(effective_cap),
+            )
+        return 0, None
+
+    effective_cap = sysctl_cap
     capped = effective_cap > 0 and effective_cap < desired_bytes
     applied = effective_cap if capped else desired_bytes
     try:
         previous = mx.set_wired_limit(applied)
         if capped:
-            source = (
-                "kernel iogpu.wired_limit_mb"
-                if get_iogpu_wired_limit_bytes() > 0
-                else "Apple max_recommended_working_set_size"
-            )
             logger.warning(
                 "Metal cap (%s, %s) is below the oMLX static ceiling (%s); "
                 "Metal will clamp allocations to the cap and panic if a "
                 "request exceeds it. Raise it with: sudo sysctl "
                 "iogpu.wired_limit_mb=%d",
                 _format_gb(effective_cap),
-                source,
+                "kernel iogpu.wired_limit_mb",
                 _format_gb(desired_bytes),
                 desired_bytes // (1024**2),
             )
@@ -378,11 +399,10 @@ class ProcessMemoryEnforcer:
     def start(self) -> None:
         """Start the background enforcement loop.
 
-        Also raises this process's Metal wired-memory limit to the static
-        ceiling so allocations within ceiling don't bounce off Apple's
-        default ~75% cap. Static ceiling is used (not dynamic) because
-        dynamic shrinks with other-app pressure and would oscillate the
-        Metal limit if used here.
+        Also mirrors the static ceiling into MLX's wired-memory limit when
+        the user explicitly raised iogpu.wired_limit_mb. When the kernel
+        sysctl is unset, the scheduler still clamps against Apple's default
+        Metal cap, but oMLX leaves MLX allocator state untouched.
         """
         if self._running:
             return

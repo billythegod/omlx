@@ -836,10 +836,7 @@ class TestAbortLimitCalculation:
 
 
 class TestMetalWiredLimit:
-    """enforcer.start() raises the per-process Metal wired memory limit
-    via mx.set_wired_limit so allocations within the ceiling don't bounce
-    off Apple's default cap.
-    """
+    """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
 
     def test_start_calls_set_wired_limit_with_static_ceiling(
         self, mock_engine_pool
@@ -852,6 +849,9 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=64 * 1024**3,  # cap above static ceiling
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=64 * 1024**3,
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
@@ -890,31 +890,33 @@ class TestMetalWiredLimit:
         # Desired (60 GB) is stored, not the post-clamp 42 GB.
         assert enforcer._metal_wired_limit_request == 60 * 1024**3
 
-    def test_start_clamps_to_apple_default_when_sysctl_unset(
-        self, mock_engine_pool
+    def test_start_skips_set_wired_limit_when_sysctl_unset(
+        self, mock_engine_pool, caplog
     ):
-        """sysctl=0 path: fall back to mx.device_info()'s working set size."""
+        """sysctl=0 path: plan against Apple cap, but don't touch MLX state."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=512 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=128 * 1024**3,  # Apple default below static ceiling
-        ), patch(
-            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
-            return_value=0,  # sysctl unset; cap comes from working set
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
-        ):
-            mock_mx.set_wired_limit.return_value = 0
-            enforcer.start()
-        # balanced @ 512 GB static = 506 GB, clamped to working set 128 GB
-        mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            with patch(
+                "omlx.settings.get_system_memory", return_value=512 * 1024**3
+            ), patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=128 * 1024**3,  # Apple default below static ceiling
+            ), patch(
+                "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                return_value=0,  # sysctl unset; cap comes from working set
+            ), patch(
+                "omlx.process_memory_enforcer.mx"
+            ) as mock_mx, patch.object(
+                asyncio, "create_task", side_effect=_close_coro
+            ):
+                enforcer.start()
+        # balanced @ 512 GB static = 506 GB. The scheduler still clamps to the
+        # 128 GB effective cap, but MLX's wired limit is left untouched.
+        mock_mx.set_wired_limit.assert_not_called()
         assert enforcer._metal_wired_limit_request == 506 * 1024**3
+        assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
         """Older macOS (<15) raises on the call; enforcer keeps going."""
@@ -925,7 +927,10 @@ class TestMetalWiredLimit:
             "omlx.settings.get_system_memory", return_value=48 * 1024**3
         ), patch(
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=0,
+            return_value=64 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=64 * 1024**3,
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
