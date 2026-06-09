@@ -1831,7 +1831,12 @@ async def health():
     pool_status = None
     if _server_state.engine_pool is not None:
         enforcer = _server_state.process_memory_enforcer
-        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
+        ceiling = 0
+        if enforcer is not None:
+            try:
+                ceiling = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Health memory ceiling unavailable: %s", exc)
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
@@ -1871,9 +1876,11 @@ async def server_status(_: bool = Depends(verify_api_key)):
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
         enforcer = _server_state.process_memory_enforcer
-        model_memory_max = (
-            enforcer.get_final_ceiling() if enforcer is not None else None
-        )
+        if enforcer is not None:
+            try:
+                model_memory_max = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Status memory ceiling unavailable: %s", exc)
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1

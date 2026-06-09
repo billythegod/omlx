@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import omlx.process_memory_enforcer as pme
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
@@ -81,6 +82,48 @@ def _close_coro(coro):
     if hasattr(coro, "close"):
         coro.close()
     return MagicMock()
+
+
+class TestMacOSVMStats:
+    """Tests for the host_statistics64 telemetry adapter."""
+
+    def test_uses_max_sized_host_info64_buffer(self):
+        """Newer macOS kernels can require a larger vm_statistics64 tail."""
+
+        class FakeLibc:
+            def host_statistics64(self, host, flavor, stats, count):
+                assert host == 123
+                assert flavor == pme._HOST_VM_INFO64
+                assert count._obj.value == pme._HOST_INFO64_MAX_COUNT
+                stats[0] = 10
+                stats[1] = 20
+                stats[2] = 30
+                stats[3] = 40
+                count._obj.value = 104
+                return 0
+
+        with patch.object(pme, "_libc", FakeLibc()), patch.object(
+            pme, "_MACH_HOST", 123
+        ), patch.object(pme, "_VM_PAGE_SIZE", 4096):
+            stats = pme.get_macos_vm_stats()
+
+        assert stats == {
+            "free": 10 * 4096,
+            "active": 20 * 4096,
+            "inactive": 30 * 4096,
+            "wired": 40 * 4096,
+        }
+
+    def test_short_host_info64_response_returns_none(self):
+        class FakeLibc:
+            def host_statistics64(self, host, flavor, stats, count):
+                count._obj.value = 3
+                return 0
+
+        with patch.object(pme, "_libc", FakeLibc()), patch.object(
+            pme, "_MACH_HOST", 123
+        ):
+            assert pme.get_macos_vm_stats() is None
 
 
 @pytest.fixture
@@ -599,6 +642,26 @@ class TestDynamicCeilingActiveRatio:
             mock_psutil.virtual_memory.return_value.available = 15 * 1024**3
             result = enforcer._get_dynamic_ceiling()
         assert result == 2 * 1024**3 + 15 * 1024**3
+
+    def test_psutil_failure_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=2 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value=None,
+        ), patch(
+            "omlx.process_memory_enforcer.psutil.virtual_memory",
+            side_effect=RuntimeError(
+                "host_statistics64(HOST_VM_INFO64) syscall failed"
+            ),
+        ), patch("omlx.settings.get_system_memory", return_value=64 * 1024**3):
+            result = enforcer._get_dynamic_ceiling()
+
+        assert result == 58 * 1024**3
 
 
 class TestDynamicCeilingCustom:
