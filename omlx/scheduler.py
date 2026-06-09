@@ -882,6 +882,43 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     return advanced
 
 
+def _get_attr_or_key(obj: Any, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return None
+    if type(value).__module__.startswith("unittest.mock"):
+        return None
+    return value
+
+
+def _model_declares_llama4(model: Any) -> bool:
+    """Return True if the loaded model/config tree declares Llama 4."""
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _get_attr_or_key(obj, "model_type") == "llama4":
+            return True
+
+        for attr in ("config", "args", "text_config", "language_config", "llm_config"):
+            child = _get_attr_or_key(obj, attr)
+            if child is not None and not isinstance(
+                child, (str, bytes, int, float, bool)
+            ):
+                stack.append(child)
+    return False
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1061,6 +1098,12 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        self._serialize_llama4_requests = _model_declares_llama4(model)
+        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Llama 4 detected; serializing requests because ChunkedKVCache "
+                "does not support multi-row batching yet"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -5612,9 +5655,9 @@ class Scheduler:
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
 
     def _effective_max_num_seqs(self) -> int:
-        """Current admission cap, narrowed during generation-overflow retry."""
+        """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._generation_overflow_recovery_ids:
+        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
             return 1
         return max(1, self.config.max_num_seqs)
 
