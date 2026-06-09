@@ -82,9 +82,9 @@ dependencies = [
     # Phi 3.5 VL EOS fixes, and prior Gemma4 unified audio/MTP fixes.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@54c9a114ecf55f03facacd3684c5fa62403ef26d",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.9 (b7f192b) - bstnxbt repo. Apple G17 NAX verify
-    # plus PR #37 prefix snapshot performance and hit-kind metrics.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@b7f192b62bc5a59cad41fda888c1118c60fc58b1",
+    # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
+    # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@5d70faebe3d0af0a3dae76fcc15cc731f7ba46da",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
