@@ -77,10 +77,10 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (54c9a11, main) — includes Gemma4 shared-KV/load fixes,
-    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask alignment,
-    # Phi 3.5 VL EOS fixes, and prior Gemma4 unified audio/MTP fixes.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@54c9a114ecf55f03facacd3684c5fa62403ef26d",
+    # mlx-vlm from commit (c9a6743, main) — includes Gemma4 shared-KV/load fixes,
+    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask/deepstack
+    # chunked-prefill fixes, Phi 3.5 VL EOS fixes, and speculative prefill fixes.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@c9a6743e5f059be36362d8e4a78171bbf91f18bc",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
     # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
