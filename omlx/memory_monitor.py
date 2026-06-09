@@ -227,7 +227,7 @@ class MemoryMonitor:
 
             process = psutil.Process()
             return process.memory_info().rss
-        except ImportError:
+        except Exception:
             return 0
 
     def get_memory_info(self) -> MemoryInfo:

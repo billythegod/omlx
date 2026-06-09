@@ -506,6 +506,8 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
+            if sys.platform == "darwin":
+                return self._get_static_ceiling()
             try:
                 available = int(psutil.virtual_memory().available)
             except Exception as exc:  # noqa: BLE001
