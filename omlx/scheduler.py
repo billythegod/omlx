@@ -2218,13 +2218,15 @@ class Scheduler:
         plain KVCache objects but read fetched cache tensors directly, which
         TurboQuant's quantized states do not support (#1613).
         """
-        from mlx_lm.models.cache import CacheList, KVCache
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
             return False
 
         def _ok(c: Any) -> bool:
             if isinstance(c, KVCache):
+                return True
+            if isinstance(c, ArraysCache):
                 return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
@@ -8037,8 +8039,11 @@ class Scheduler:
 
             # Count KVCache layers for hybrid models
             cache_list_for_tq = None
+            actual_kv_cache_layers = None
             num_kv_cache_layers = num_layers
-            if hasattr(self.model, "make_cache"):
+            if not hasattr(self.model, "make_cache"):
+                actual_kv_cache_layers = num_layers
+            else:
                 try:
                     cache_list = self.model.make_cache()
                     cache_list_for_tq = cache_list
@@ -8048,12 +8053,11 @@ class Scheduler:
                         if type(c) is KVCache:
                             return 1
                         if isinstance(c, CacheList):
-                            return sum(
-                                1 for inner in c.caches if type(inner) is KVCache
-                            )
+                            return sum(_count_kv(inner) for inner in c.caches)
                         return 0
 
-                    num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                    actual_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                    num_kv_cache_layers = actual_kv_cache_layers
                     if num_kv_cache_layers == 0:
                         num_kv_cache_layers = num_layers  # fallback
                 except Exception:
@@ -8064,6 +8068,8 @@ class Scheduler:
                 and isinstance(head_dim, int)
                 and not isinstance(head_dim, bool)
                 and head_dim > 0
+                and isinstance(actual_kv_cache_layers, int)
+                and actual_kv_cache_layers > 0
                 and (
                     self._turboquant_eligible(cache_list_for_tq)
                     if cache_list_for_tq is not None
@@ -8073,22 +8079,15 @@ class Scheduler:
                 tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (
                     2.0 / head_dim
                 )
-                kv_layers = (
-                    num_kv_cache_layers
-                    if isinstance(num_kv_cache_layers, int)
-                    and not isinstance(num_kv_cache_layers, bool)
-                    and num_kv_cache_layers > 0
-                    else num_layers
-                )
                 if (
                     self._turboquant_skip_last
-                    and isinstance(kv_layers, int)
-                    and not isinstance(kv_layers, bool)
-                    and kv_layers > 1
+                    and not isinstance(actual_kv_cache_layers, bool)
+                    and actual_kv_cache_layers > 1
                 ):
                     dtype_size = (
-                        (kv_layers - 1) * tq_dtype_size + base_dtype_size
-                    ) / kv_layers
+                        (actual_kv_cache_layers - 1) * tq_dtype_size
+                        + base_dtype_size
+                    ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
 

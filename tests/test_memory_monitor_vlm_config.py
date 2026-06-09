@@ -257,6 +257,38 @@ class TestSetModelInfoTurboQuantDtype:
         expected = 4.0 / 8.0 + 2.0 / 128
         assert abs(kwargs["dtype_size"] - expected) < 1e-9
 
+    def test_turboquant_hybrid_arrays_cache_counts_only_kv_layers(self):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
+        sched.model.make_cache.return_value = [
+            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2)
+            for i in range(40)
+        ]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        expected = (9 * quantized + 2.0) / 10
+        assert kwargs["num_kv_cache_layers"] == 10
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_arrays_cache_only_uses_full_dtype(self):
+        from mlx_lm.models.cache import ArraysCache
+
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.make_cache.return_value = [ArraysCache(size=2) for _ in range(40)]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
     def test_turboquant_ineligible_cache_uses_full_dtype(self):
         sched = self._make_sched_with_config(_PlainLMConfig())
         sched.model.make_cache.return_value = [object()]
