@@ -113,7 +113,7 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: int = 2  # Default float16
+        self._dtype_size: float = 2  # Default float16/bfloat16
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
 
@@ -291,7 +291,7 @@ class MemoryMonitor:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype_size: int = 2,
+        dtype_size: float = 2,
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
     ) -> None:
@@ -302,7 +302,8 @@ class MemoryMonitor:
             num_layers: Number of transformer layers
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
-            dtype_size: Bytes per element (2 for float16, 4 for float32)
+            dtype_size: Bytes per element. This may be fractional for
+                quantized KV cache layouts.
             num_attention_heads: Number of query attention heads (for SDPA
                 peak estimation). Defaults to num_kv_heads if not set.
             num_kv_cache_layers: Number of layers that use KVCache
@@ -354,8 +355,8 @@ class MemoryMonitor:
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
-        dtype_size: Optional[int] = None,
-    ) -> int:
+        dtype_size: Optional[float] = None,
+    ) -> float:
         """
         Estimate memory usage for a KV cache block.
 
@@ -381,7 +382,7 @@ class MemoryMonitor:
 
         return total
 
-    def estimate_prompt_kv_bytes(self, num_tokens: int) -> int:
+    def estimate_prompt_kv_bytes(self, num_tokens: int) -> float:
         """
         Estimate KV cache memory for a prompt of given length.
 
@@ -408,7 +409,7 @@ class MemoryMonitor:
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
-    ) -> int:
+    ) -> float:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
 
@@ -545,7 +546,7 @@ class MemoryMonitor:
             return 0
 
         # Round up to ensure we free enough
-        num_blocks = (bytes_to_free + block_mem - 1) // block_mem
+        num_blocks = int((bytes_to_free + block_mem - 1) // block_mem)
         return max(1, num_blocks)
 
     @property

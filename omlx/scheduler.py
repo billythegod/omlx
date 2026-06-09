@@ -8019,13 +8019,14 @@ class Scheduler:
                 num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
                 head_dim = hidden_size // num_heads
 
-            # Determine dtype size
-            dtype_size = 2  # Default float16
+            # Determine base dtype size for uncompressed KV cache elements.
+            base_dtype_size: float = 2  # Default float16/bfloat16
             if hasattr(self.model, "dtype"):
                 if self.model.dtype == mx.float32:
-                    dtype_size = 4
+                    base_dtype_size = 4
                 elif self.model.dtype == mx.bfloat16:
-                    dtype_size = 2
+                    base_dtype_size = 2
+            dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
@@ -8035,19 +8036,61 @@ class Scheduler:
             )
 
             # Count KVCache layers for hybrid models
+            cache_list_for_tq = None
             num_kv_cache_layers = num_layers
             if hasattr(self.model, "make_cache"):
                 try:
                     cache_list = self.model.make_cache()
-                    from mlx_lm.models.cache import KVCache
+                    cache_list_for_tq = cache_list
+                    from mlx_lm.models.cache import CacheList, KVCache
 
-                    num_kv_cache_layers = sum(
-                        1 for c in cache_list if type(c) is KVCache
-                    )
+                    def _count_kv(c: Any) -> int:
+                        if type(c) is KVCache:
+                            return 1
+                        if isinstance(c, CacheList):
+                            return sum(
+                                1 for inner in c.caches if type(inner) is KVCache
+                            )
+                        return 0
+
+                    num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
                     if num_kv_cache_layers == 0:
                         num_kv_cache_layers = num_layers  # fallback
                 except Exception:
                     pass
+
+            if (
+                self._turboquant_kv_bits is not None
+                and isinstance(head_dim, int)
+                and not isinstance(head_dim, bool)
+                and head_dim > 0
+                and (
+                    self._turboquant_eligible(cache_list_for_tq)
+                    if cache_list_for_tq is not None
+                    else not self._model_uses_mla()
+                )
+            ):
+                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (
+                    2.0 / head_dim
+                )
+                kv_layers = (
+                    num_kv_cache_layers
+                    if isinstance(num_kv_cache_layers, int)
+                    and not isinstance(num_kv_cache_layers, bool)
+                    and num_kv_cache_layers > 0
+                    else num_layers
+                )
+                if (
+                    self._turboquant_skip_last
+                    and isinstance(kv_layers, int)
+                    and not isinstance(kv_layers, bool)
+                    and kv_layers > 1
+                ):
+                    dtype_size = (
+                        (kv_layers - 1) * tq_dtype_size + base_dtype_size
+                    ) / kv_layers
+                else:
+                    dtype_size = tq_dtype_size
 
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec

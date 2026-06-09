@@ -14,6 +14,7 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
+from omlx.memory_monitor import MemoryMonitor
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 
@@ -187,3 +188,131 @@ class TestSetModelInfoForMonitorVLMWalk:
         assert kwargs["num_layers"] == 24, (
             "GPT-style ``n_layer`` in the sub-config should be recognized"
         )
+
+
+class TestSetModelInfoTurboQuantDtype:
+    def _make_sched_with_config(self, config) -> Scheduler:
+        from mlx_lm.models.cache import KVCache
+
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = config
+        sched.model.make_cache.return_value = [KVCache() for _ in range(40)]
+        del sched.model.args
+        return sched
+
+    def test_no_turboquant_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = None
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_4bit_without_skip_last_uses_quantized_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        expected = 4.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        expected = (39 * quantized + 2.0) / 40
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_8bit_without_skip_last_uses_quantized_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 8.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        expected = 8.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_dtype_with_vlm_nested_config(self):
+        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["num_layers"] == 40
+        expected = 4.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_ineligible_cache_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.make_cache.return_value = [object()]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_mla_model_uses_full_dtype(self):
+        class _MLAConfig(_PlainLMConfig):
+            kv_lora_rank = 512
+
+        sched = self._make_sched_with_config(_MLAConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_reported_scale_fits_after_turboquant_skip_last_accounting(self):
+        tokens = 327_872
+        ceiling = 44.0 * 1024**3
+        current = 27.17 * 1024**3
+        headroom = ceiling - current
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=32,
+            num_kv_cache_layers=40,
+        )
+        full_dtype_peak = monitor.estimate_prefill_peak_bytes(
+            tokens, 2048, cached_tokens=0
+        )
+
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        skip_last_dtype = (39 * quantized + 2.0) / 40
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=skip_last_dtype,
+            num_attention_heads=32,
+            num_kv_cache_layers=40,
+        )
+        turboquant_peak = monitor.estimate_prefill_peak_bytes(
+            tokens, 2048, cached_tokens=0
+        )
+
+        assert full_dtype_peak > headroom
+        assert turboquant_peak < headroom
