@@ -108,8 +108,10 @@ def _throttle_ctx(
         _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        _last_mlx_active_memory_bytes=0,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
+    ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )
