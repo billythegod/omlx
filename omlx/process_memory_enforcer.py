@@ -344,6 +344,10 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
+        # Cached Metal cap used by the background poll loop. Reading the Apple
+        # default cap falls back to mx.device_info(), so keep it out of active
+        # decode ticks once the enforcer is running.
+        self._effective_metal_cap_bytes: int | None = None
         # Engine types we've already complained about in
         # ``_propagate_memory_limit``'s "scheduler unreachable" path.
         # Prevents the per-poll warning from spamming logs while keeping
@@ -369,6 +373,8 @@ class ProcessMemoryEnforcer:
         old = self._memory_guard_tier
         self._memory_guard_tier = new_tier
         if self._running:
+            if self._prefill_memory_guard:
+                self._refresh_effective_metal_cap_bytes()
             self._propagate_memory_limit()
         logger.info(f"Memory guard tier changed: {old} -> {new_tier}")
 
@@ -384,6 +390,8 @@ class ProcessMemoryEnforcer:
         old = self._memory_guard_custom_ceiling_bytes
         self._memory_guard_custom_ceiling_bytes = new_value
         if self._running:
+            if self._prefill_memory_guard:
+                self._refresh_effective_metal_cap_bytes()
             self._propagate_memory_limit()
         logger.info(
             "Memory guard custom ceiling changed: %s -> %s",
@@ -406,6 +414,8 @@ class ProcessMemoryEnforcer:
         """
         if self._running:
             return
+        if self._prefill_memory_guard:
+            self._refresh_effective_metal_cap_bytes()
         self._running = True
         self._propagate_memory_limit()
         ceiling = self._get_hard_limit_bytes()
@@ -550,7 +560,7 @@ class ProcessMemoryEnforcer:
             candidates.append(max(0, self._memory_guard_custom_ceiling_bytes))
         else:
             candidates.append(self._get_dynamic_ceiling())
-        metal_cap = get_effective_metal_cap_bytes()
+        metal_cap = self._get_effective_metal_cap_bytes()
         if metal_cap > 0:
             candidates.append(metal_cap)
         return min(candidates)
@@ -577,7 +587,7 @@ class ProcessMemoryEnforcer:
         if not self._prefill_memory_guard:
             return 0
         static_ceiling = self._get_static_ceiling()
-        metal_cap = get_effective_metal_cap_bytes()
+        metal_cap = self._get_effective_metal_cap_bytes()
         if metal_cap > 0:
             return min(static_ceiling, metal_cap)
         return static_ceiling
@@ -603,12 +613,63 @@ class ProcessMemoryEnforcer:
     def _current_usage_bytes(self) -> int:
         """Process memory usage as seen by macOS jetsam.
 
-        Combines MLX-reported active memory and the kernel phys_footprint
-        ledger. phys_footprint covers anonymous + IOAccelerator + dirty
-        file-backed, so it usually dominates; we take max() so MLX-internal
-        cache that hasn't been mirrored into phys yet still triggers.
+        During active requests this must not call MLX/Metal APIs from the
+        background enforcer thread. The scheduler records the last
+        mx.get_active_memory() sample on the MLX executor thread; the enforcer
+        combines that cached value with the kernel phys_footprint ledger.
+
+        When no request is active we keep the legacy direct MLX telemetry path
+        so idle/status accounting remains as precise as before.
         """
-        return max(mx.get_active_memory(), get_phys_footprint())
+        phys = get_phys_footprint()
+        if self._has_active_requests():
+            return max(self._cached_executor_active_memory_bytes(), phys)
+        return max(mx.get_active_memory(), phys)
+
+    def _refresh_effective_metal_cap_bytes(self) -> int:
+        """Refresh the cached effective Metal cap outside the poll hot path."""
+        self._effective_metal_cap_bytes = get_effective_metal_cap_bytes()
+        return self._effective_metal_cap_bytes
+
+    def _get_effective_metal_cap_bytes(self) -> int:
+        """Return the cached Metal cap, populating it on first use."""
+        if self._effective_metal_cap_bytes is None:
+            return self._refresh_effective_metal_cap_bytes()
+        return self._effective_metal_cap_bytes
+
+    def _has_active_requests(self) -> bool:
+        """Best-effort active-request detection without touching MLX."""
+        for entry in self._engine_pool._entries.values():
+            engine = getattr(entry, "engine", None)
+            if engine is None:
+                continue
+            has_active_requests = getattr(engine, "has_active_requests", None)
+            if not callable(has_active_requests):
+                continue
+            try:
+                if has_active_requests() is True:
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _cached_executor_active_memory_bytes(self) -> int:
+        """Max MLX active-memory sample recorded by scheduler executor threads."""
+        cached = 0
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            getter = getattr(scheduler, "get_cached_mlx_active_memory_bytes", None)
+            try:
+                value = getter() if callable(getter) else getattr(
+                    scheduler, "_last_mlx_active_memory_bytes", 0
+                )
+            except Exception:
+                continue
+            if isinstance(value, (int, float)):
+                cached = max(cached, int(value))
+        return cached
 
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.

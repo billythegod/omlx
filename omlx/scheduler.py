@@ -1169,6 +1169,10 @@ class Scheduler:
         # kill a near-complete request that actually fits. 0 => fall back to
         # _memory_hard_limit_bytes (pre-propagation / old enforcer).
         self._memory_abort_limit_bytes: int = 0
+        # Last mx.get_active_memory() sample taken on this scheduler's MLX
+        # executor thread. The background memory enforcer reads this cached
+        # value during active decode instead of touching MLX/Metal directly.
+        self._last_mlx_active_memory_bytes: int = 0
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -2526,7 +2530,7 @@ class Scheduler:
             # show in mx.get_active_memory() still trigger the guard.
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 _hard = self._memory_hard_limit_bytes
                 _soft = self._memory_limit_bytes
                 # Only log when crossing the soft watermark — that's the
@@ -2790,7 +2794,7 @@ class Scheduler:
         if cap <= 0:
             return n_tokens
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         if current + self._predicted_chunk_transient(n_tokens, kv_len) <= cap:
             return n_tokens
 
@@ -2904,7 +2908,7 @@ class Scheduler:
         if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
             return requested
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
         # Conservative per-token transient (measured-last / EWMA / static, ×
@@ -2988,6 +2992,23 @@ class Scheduler:
             )
         return n
 
+    def get_cached_mlx_active_memory_bytes(self) -> int:
+        """Return the last MLX active-memory sample taken on the executor."""
+        return self._last_mlx_active_memory_bytes
+
+    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+        """Current memory usage for scheduler-side guard checks.
+
+        Scheduler steps run on the MLX executor thread, so they can refresh
+        mx.get_active_memory() safely. Event-loop callers such as early
+        preflight use the cached executor sample and phys_footprint instead.
+        """
+        active = self._last_mlx_active_memory_bytes
+        if refresh_mlx_active:
+            active = max(0, int(mx.get_active_memory()))
+            self._last_mlx_active_memory_bytes = active
+        return max(active, get_phys_footprint())
+
     def _record_chunk_transient(
         self,
         n_tokens: int,
@@ -3041,7 +3062,7 @@ class Scheduler:
             ``max(active, phys_footprint)`` after reclaim.
         """
         _sync_and_clear_cache(self._stream)
-        return max(mx.get_active_memory(), get_phys_footprint())
+        return self._current_usage_bytes()
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -3205,7 +3226,7 @@ class Scheduler:
         # phys_footprint, so the active-only check could miss the page
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
-            current = max(mx.get_active_memory(), get_phys_footprint())
+            current = self._current_usage_bytes()
             _hard = self._memory_hard_limit_bytes
             _soft = self._memory_limit_bytes
             # Caution-zone-only memcheck log (see external loop counterpart).
@@ -5519,7 +5540,7 @@ class Scheduler:
         self._pending_reclaim_request = False
         if self.running or self.prefilling or self.waiting:
             return
-        before = max(mx.get_active_memory(), get_phys_footprint())
+        before = self._current_usage_bytes()
         after = self._reclaim_prefill_headroom()
         logger.info(
             "Idle reclaim: trimmed Metal transients between turns "
@@ -5801,7 +5822,7 @@ class Scheduler:
         if peak == 0:
             return None  # can't estimate, skip
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes()
         estimated = current + peak
         hard_limit = self._memory_hard_limit_bytes
 
@@ -5875,7 +5896,7 @@ class Scheduler:
         if peak == 0:
             return
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        current = self._current_usage_bytes(refresh_mlx_active=False)
         if current + peak <= self._memory_hard_limit_bytes:
             return
 
@@ -5982,7 +6003,7 @@ class Scheduler:
                 and self._memory_limit_bytes > 0
                 and admitted
             ):
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = self._current_usage_bytes()
                 if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "

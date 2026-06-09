@@ -403,6 +403,69 @@ class TestCheckAndEnforce:
         # Should not raise, just log warning
 
 
+class TestCurrentUsageTelemetry:
+    """Tests for enforcer memory telemetry threading behavior."""
+
+    def test_idle_usage_keeps_direct_mlx_telemetry(self, enforcer):
+        """Idle accounting preserves the legacy max(active, phys_footprint)."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=3 * 1024**3,
+        ):
+            mock_mx.get_active_memory.return_value = 5 * 1024**3
+            assert enforcer._current_usage_bytes() == 5 * 1024**3
+        mock_mx.get_active_memory.assert_called_once()
+
+    def test_active_usage_uses_cached_executor_sample_without_mlx(self, enforcer):
+        """Active decode ticks must not call MLX from the enforcer thread."""
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 7 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=5 * 1024**3,
+        ):
+            mock_mx.get_active_memory.side_effect = AssertionError(
+                "background enforcer touched MLX during active decode"
+            )
+            assert enforcer._current_usage_bytes() == 7 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_active_usage_keeps_phys_footprint_when_it_dominates(self, enforcer):
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 4 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=9 * 1024**3,
+        ):
+            assert enforcer._current_usage_bytes() == 9 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_hard_limit_reuses_cached_metal_cap(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=1024.0,
+        )
+        enforcer._effective_metal_cap_bytes = 48 * 1024**3
+        with patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            side_effect=AssertionError("Metal cap cache was bypassed"),
+        ):
+            assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
+
+
 class TestDisabledWhenCeilingZero:
     """Tests for enforcement disabled when the ceiling is 0 (guard off)."""
 
