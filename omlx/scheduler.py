@@ -3006,7 +3006,8 @@ class Scheduler:
 
     def _hot_cache_cpu_bytes(self) -> int:
         """Return serialized hot-cache bytes safe to exclude from phys guard."""
-        budget = getattr(self.config, "hot_cache_budget", None)
+        config = getattr(self, "config", None)
+        budget = getattr(config, "hot_cache_budget", None)
         if budget is not None:
             try:
                 return max(0, int(getattr(budget, "total_bytes", 0)))
@@ -3039,7 +3040,12 @@ class Scheduler:
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
-        phys = max(0, int(get_phys_footprint()) - self._hot_cache_cpu_bytes())
+        hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
+        if callable(hot_cache_cpu_bytes):
+            hot_cache_bytes = hot_cache_cpu_bytes()
+        else:
+            hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
+        phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
 
     def _record_chunk_transient(
