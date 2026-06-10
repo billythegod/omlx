@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import ctypes.util
+import inspect
 import logging
 import subprocess
 import sys
@@ -83,6 +84,13 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
     "aggressive": 0.95,
     "custom": 0.95,
 }
+
+# Last-resort active-request brake. Normal hard pressure starts at the
+# hard watermark (usually 95% of ceiling); pinned workloads are only aborted
+# after the process crosses the actual ceiling by a small margin, or stays
+# over the ceiling for consecutive polls.
+_EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
+_EMERGENCY_OVER_CEILING_POLLS = 2
 
 
 def _format_gb(b: int) -> str:
@@ -311,7 +319,7 @@ class ProcessMemoryEnforcer:
             soft_threshold: Fraction of ceiling that triggers soft action
                 (LRU non-pinned eviction + admission pause; in-flight allowed).
             hard_threshold: Fraction of ceiling that triggers hard action
-                (also abort in-flight when all loaded models are pinned).
+                (LRU/non-pinned aborts, loading aborts, and idle reclaim).
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
@@ -340,6 +348,7 @@ class ProcessMemoryEnforcer:
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
+        self._over_ceiling_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -626,6 +635,22 @@ class ProcessMemoryEnforcer:
             return max(self._cached_executor_active_memory_bytes(), phys)
         return max(mx.get_active_memory(), phys)
 
+    def _is_emergency_pressure(self, current: int, ceiling: int) -> bool:
+        """Return True only for pressure beyond the configured ceiling.
+
+        This deliberately does not fire at the hard watermark. A pinned model
+        means "do not unload"; active requests remain protected until the
+        process is at or above the real ceiling and needs a last-resort brake.
+        """
+        if ceiling <= 0 or current < ceiling:
+            self._over_ceiling_polls = 0
+            return False
+
+        self._over_ceiling_polls += 1
+        if current >= ceiling + _EMERGENCY_OVER_CEILING_MARGIN_BYTES:
+            return True
+        return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
+
     def _refresh_effective_metal_cap_bytes(self) -> int:
         """Refresh the cached effective Metal cap outside the poll hot path."""
         self._effective_metal_cap_bytes = get_effective_metal_cap_bytes()
@@ -789,6 +814,34 @@ class ProcessMemoryEnforcer:
             if adjust is not None:
                 adjust(self._pressure_level)
 
+    async def _abort_loaded_requests_for_memory_emergency(self) -> int:
+        """Abort active requests on loaded models without unloading them."""
+        aborted_total = 0
+        for entry in self._engine_pool._entries.values():
+            engine = getattr(entry, "engine", None)
+            if engine is None:
+                continue
+
+            abort_all = getattr(engine, "abort_all_requests", None)
+            if not callable(abort_all):
+                continue
+
+            try:
+                result = abort_all()
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Emergency memory abort failed for '%s': %s",
+                    getattr(entry, "model_id", "<unknown>"),
+                    exc,
+                )
+                continue
+
+            if isinstance(result, (int, float)):
+                aborted_total += max(0, int(result))
+        return aborted_total
+
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
         self._running = False
@@ -880,8 +933,10 @@ class ProcessMemoryEnforcer:
         - ok (current < soft): no action, ensure admission unpaused.
         - soft (soft <= current < hard): LRU non-pinned eviction + signal
           schedulers to pause new admissions (in-flight requests proceed).
-        - hard (current >= hard): full enforcement — LRU evict, abort
-          in-flight when only pinned remain, abort in-progress model loads.
+        - hard (current >= hard): LRU evict, abort a sole non-pinned
+          victim's in-flight requests, abort in-progress model loads, and
+          request idle reclaim when no victim exists. Pinned active requests
+          are only aborted under emergency pressure beyond the real ceiling.
         """
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
@@ -890,12 +945,14 @@ class ProcessMemoryEnforcer:
         ceiling = self._get_hard_limit_bytes()
         if ceiling <= 0:
             self._pressure_level = "ok"
+            self._over_ceiling_polls = 0
             return
 
         current = self._current_usage_bytes()
         soft = int(ceiling * self._soft_threshold)
         hard = int(ceiling * self._hard_threshold)
         prev_level = self._pressure_level
+        emergency = self._is_emergency_pressure(current, ceiling)
 
         if current < soft:
             new_level = "ok"
@@ -939,14 +996,17 @@ class ProcessMemoryEnforcer:
                         # so clients receive proper error responses instead
                         # of silent disconnect.
                         entry = self._engine_pool._entries.get(victim)
-                        if entry and entry.engine is not None:
-                            if hasattr(entry.engine, "abort_all_requests"):
-                                aborted = await entry.engine.abort_all_requests()
-                                if aborted > 0:
-                                    logger.warning(
-                                        f"Aborted {aborted} requests on "
-                                        f"'{victim}' before eviction"
-                                    )
+                        if (
+                            entry
+                            and entry.engine is not None
+                            and hasattr(entry.engine, "abort_all_requests")
+                        ):
+                            aborted = await entry.engine.abort_all_requests()
+                            if aborted > 0:
+                                logger.warning(
+                                    f"Aborted {aborted} requests on "
+                                    f"'{victim}' before eviction"
+                                )
                         logger.warning(
                             f"Evicting model '{victim}' (pressure={new_level})"
                         )
@@ -958,20 +1018,24 @@ class ProcessMemoryEnforcer:
                         # Abort in-flight requests, keep model loaded —
                         # frees KV blocks so short-context follow-ups work.
                         entry = self._engine_pool._entries.get(victim)
-                        if entry and entry.engine is not None:
-                            if hasattr(entry.engine, "abort_all_requests"):
-                                aborted = await entry.engine.abort_all_requests()
-                                if aborted > 0:
-                                    logger.warning(
-                                        f"Aborted {aborted} requests on "
-                                        f"'{victim}' due to hard memory "
-                                        f"pressure (model kept loaded)"
-                                    )
+                        if (
+                            entry
+                            and entry.engine is not None
+                            and hasattr(entry.engine, "abort_all_requests")
+                        ):
+                            aborted = await entry.engine.abort_all_requests()
+                            if aborted > 0:
+                                logger.warning(
+                                    f"Aborted {aborted} requests on "
+                                    f"'{victim}' due to hard memory "
+                                    f"pressure (model kept loaded)"
+                                )
                     # soft: leave in-flight alone — admission pause already
                     # signaled, eviction can't help further without aborts.
                     break
 
-                # No non-pinned victim. All loaded models are pinned.
+                # No non-pinned victim. Loaded models are pinned or no loaded
+                # engines exist at all.
                 if new_level == "hard":
                     # Hard only: abort any in-progress model loads.
                     aborted_any = False
@@ -989,6 +1053,26 @@ class ProcessMemoryEnforcer:
                             for e in self._engine_pool._entries.values()
                         )
                         if has_loaded:
+                            if emergency:
+                                emergency_current = self._current_usage_bytes()
+                            else:
+                                emergency_current = 0
+                            if emergency and emergency_current >= ceiling:
+                                aborted = await (
+                                    self._abort_loaded_requests_for_memory_emergency()
+                                )
+                                if aborted > 0:
+                                    logger.warning(
+                                        "Emergency memory pressure: aborted "
+                                        "%d in-flight request(s) "
+                                        "(current=%s, ceiling=%s); models "
+                                        "kept loaded.",
+                                        aborted,
+                                        _format_gb(emergency_current),
+                                        _format_gb(ceiling),
+                                    )
+                                    break
+
                             # Nothing to evict (all pinned) and no load to
                             # abort — but the resident footprint may still hold
                             # reclaimable Metal transients from a finished turn.
@@ -1005,8 +1089,8 @@ class ProcessMemoryEnforcer:
                                     sched.request_idle_reclaim()
                                     requested += 1
                             logger.warning(
-                                "Hard memory pressure, all loaded models "
-                                "pinned and no loads in progress: requested "
+                                "Hard memory pressure, no evictable models "
+                                "and no loads in progress: requested "
                                 "idle reclaim on %d scheduler(s).",
                                 requested,
                             )
@@ -1031,6 +1115,8 @@ class ProcessMemoryEnforcer:
             post_level = "soft"
         else:
             post_level = "hard"
+        if post_ceiling <= 0 or post_current < post_ceiling:
+            self._over_ceiling_polls = 0
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()
