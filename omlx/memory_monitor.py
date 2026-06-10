@@ -464,7 +464,7 @@ class MemoryMonitor:
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
             model info is not available. Caller compares this against
-            `(hard_threshold * max_bytes) - max(active, phys_footprint())` —
+            `(hard_threshold * max_bytes) - current_usage_bytes` —
             the margin handles cache pool / python heap / compressed memory.
         """
         hd = self._head_dim or 0
@@ -486,8 +486,8 @@ class MemoryMonitor:
         attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
-        # The cached portion is already counted via the baseline
-        # mx.get_active_memory() reading on the caller side.
+        # The cached portion is already counted in the caller's current-usage
+        # baseline.
         kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
@@ -722,6 +722,7 @@ def raise_if_prefill_exceeds(
     *,
     prefill_memory_guard: bool,
     hard_limit_bytes: int,
+    current_usage_bytes: int,
     prefill_step_size: int,
     num_prompt_tokens: int,
     cached_tokens: int = 0,
@@ -734,7 +735,10 @@ def raise_if_prefill_exceeds(
     an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
     same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
     disabled, no limit is set, the monitor is missing, or the request fits.
-    Maps to HTTP 400 via the server's ``prefill_memory_exceeded_handler``.
+    The caller supplies ``current_usage_bytes`` so HTTP/event-loop preflight
+    paths can use cached executor telemetry plus physical footprint without
+    calling MLX directly. Maps to HTTP 400 via the server's
+    ``prefill_memory_exceeded_handler``.
 
     ``cached_tokens`` means prompt KV *already resident in current memory*
     (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
@@ -747,8 +751,6 @@ def raise_if_prefill_exceeds(
         return
     if monitor is None:
         return
-    if mx is None:  # no MLX runtime → nothing to measure against; no-op
-        return
 
     new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
     if new_tokens == 0:
@@ -760,9 +762,7 @@ def raise_if_prefill_exceeds(
     if peak == 0:
         return
 
-    from omlx.utils.proc_memory import get_phys_footprint
-
-    current = max(mx.get_active_memory(), get_phys_footprint())
+    current = max(0, int(current_usage_bytes))
     if current + peak <= hard_limit_bytes:
         return
 

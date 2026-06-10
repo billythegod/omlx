@@ -58,10 +58,11 @@ def _make_guard(step: int = 2048) -> _DFlashPrefillGuard:
 
 
 def _zero_mem():
-    """Patch the live-memory probes to 0 so the estimate alone drives the check."""
-    return patch(
-        "omlx.memory_monitor.mx.get_active_memory", return_value=0
-    ), patch("omlx.utils.proc_memory.get_phys_footprint", return_value=0)
+    """Patch live-memory probes so the estimate alone drives the check."""
+    return patch("omlx.engine.dflash.get_phys_footprint", return_value=0), patch(
+        "omlx.memory_monitor.mx.get_active_memory",
+        side_effect=AssertionError("preflight must not read MLX directly"),
+    )
 
 
 # --- guard math (mirrors the scheduler guard tests) -----------------------
@@ -96,9 +97,8 @@ def test_preflight_raises_when_oversized():
     guard._prefill_memory_guard = True
     guard._memory_hard_limit_bytes = 1  # any allocation exceeds
     p1, p2 = _zero_mem()
-    with p1, p2:
-        with pytest.raises(PrefillMemoryExceededError) as exc:
-            guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r1")
+    with p1, p2, pytest.raises(PrefillMemoryExceededError) as exc:
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r1")
     err = exc.value
     assert err.estimated_bytes > 0
     assert err.limit_bytes == 1
@@ -132,10 +132,75 @@ def test_shared_helper_noop_when_fully_cached():
         monitor,
         prefill_memory_guard=True,
         hard_limit_bytes=1,
+        current_usage_bytes=0,
         prefill_step_size=2048,
         num_prompt_tokens=1000,
         cached_tokens=1000,
     )
+
+
+def test_shared_helper_uses_caller_supplied_usage_without_mlx_probe():
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    set_model_info_from_model(monitor, _make_target_model())
+
+    with patch(
+        "omlx.memory_monitor.mx.get_active_memory",
+        side_effect=AssertionError("preflight must not read MLX directly"),
+    ), pytest.raises(PrefillMemoryExceededError):
+        raise_if_prefill_exceeds(
+            monitor,
+            prefill_memory_guard=True,
+            hard_limit_bytes=1,
+            current_usage_bytes=0,
+            prefill_step_size=2048,
+            num_prompt_tokens=65536,
+        )
+
+
+def test_guard_uses_cached_active_and_physical_usage_without_mlx_probe():
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    cached = 2 * 1024**3
+    phys = 3 * 1024**3
+    guard.record_mlx_active_memory(cached)
+    peak = guard.memory_monitor.estimate_prefill_peak_bytes(65536, 2048)
+    guard._memory_hard_limit_bytes = int(phys + peak - 1)
+
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError) as exc,
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-phys")
+
+    assert exc.value.estimated_bytes >= int(phys + peak)
+    assert exc.value.request_id == "r-phys"
+
+
+def test_guard_uses_cached_active_when_larger_than_physical():
+    guard = _make_guard()
+    guard._prefill_memory_guard = True
+    cached = 3 * 1024**3
+    phys = 2 * 1024**3
+    guard.record_mlx_active_memory(cached)
+    peak = guard.memory_monitor.estimate_prefill_peak_bytes(65536, 2048)
+    guard._memory_hard_limit_bytes = int(cached + peak - 1)
+
+    with (
+        patch("omlx.engine.dflash.get_phys_footprint", return_value=phys),
+        patch(
+            "omlx.memory_monitor.mx.get_active_memory",
+            side_effect=AssertionError("preflight must not read MLX directly"),
+        ),
+        pytest.raises(PrefillMemoryExceededError) as exc,
+    ):
+        guard.preflight_or_raise(num_prompt_tokens=65536, request_id="r-cached")
+
+    assert exc.value.estimated_bytes >= int(cached + peak)
+    assert exc.value.request_id == "r-cached"
 
 
 def test_guard_rejects_cached_tokens():

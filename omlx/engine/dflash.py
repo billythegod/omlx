@@ -24,14 +24,15 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
-from ..utils.generation_config import load_generation_config_token_ids
-from ..utils.model_loading import maybe_apply_pre_load_patches
-from ..utils.tokenizer import create_streaming_detokenizer
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
     set_model_info_from_model,
 )
+from ..utils.generation_config import load_generation_config_token_ids
+from ..utils.model_loading import maybe_apply_pre_load_patches
+from ..utils.proc_memory import get_phys_footprint
+from ..utils.tokenizer import create_streaming_detokenizer
 from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
@@ -88,9 +89,16 @@ class _DFlashPrefillGuard:
     def __init__(self, memory_monitor: MemoryMonitor, prefill_step_size: int):
         self.memory_monitor = memory_monitor
         self._prefill_step_size = prefill_step_size
+        self._last_mlx_active_memory_bytes: int = 0
         # Written by ProcessMemoryEnforcer._propagate_memory_limit each tick.
         self._prefill_memory_guard: bool = False
         self._memory_hard_limit_bytes: int = 0
+
+    def record_mlx_active_memory(self, active_bytes: int) -> None:
+        self._last_mlx_active_memory_bytes = max(0, int(active_bytes))
+
+    def _current_usage_bytes(self) -> int:
+        return max(self._last_mlx_active_memory_bytes, get_phys_footprint())
 
     def preflight_or_raise(
         self,
@@ -105,6 +113,7 @@ class _DFlashPrefillGuard:
             self.memory_monitor,
             prefill_memory_guard=self._prefill_memory_guard,
             hard_limit_bytes=self._memory_hard_limit_bytes,
+            current_usage_bytes=self._current_usage_bytes(),
             prefill_step_size=self._prefill_step_size,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
@@ -164,7 +173,7 @@ class DFlashEngine(BaseEngine):
         # Primary-mode prefill memory guard. DFlash bypasses the scheduler, so
         # it can't receive the enforcer's watermarks through one; this holder
         # stands in (built in start(), resolved by the enforcer).
-        self._prefill_guard: "_DFlashPrefillGuard | None" = None
+        self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
         self._suppress_token_ids: set[int] = set()
@@ -418,6 +427,15 @@ class DFlashEngine(BaseEngine):
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
             f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
         )
+
+    def _record_prefill_guard_active_memory(self) -> None:
+        guard = self._prefill_guard
+        if guard is None:
+            return
+        try:
+            guard.record_mlx_active_memory(mx.get_active_memory())
+        except Exception as exc:
+            logger.debug(f"DFlash active-memory sample failed: {exc}")
 
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
@@ -858,10 +876,12 @@ class DFlashEngine(BaseEngine):
 
         event_iter = None
         try:
+            self._record_prefill_guard_active_memory()
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
             )
+            self._record_prefill_guard_active_memory()
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
@@ -957,6 +977,7 @@ class DFlashEngine(BaseEngine):
         finally:
             # Closing the dflash generator throws GeneratorExit on its next
             # yield, releasing kernel state and any draft cache it holds.
+            self._record_prefill_guard_active_memory()
             if event_iter is not None:
                 close = getattr(event_iter, "close", None)
                 if close is not None:
@@ -1034,10 +1055,12 @@ class DFlashEngine(BaseEngine):
                 else None
             )
             try:
+                self._record_prefill_guard_active_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
                 )
+                self._record_prefill_guard_active_memory()
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
@@ -1062,6 +1085,7 @@ class DFlashEngine(BaseEngine):
                         parsed_visible_parts.append(final.visible_text)
                 return summary, tokens, parser_session, parsed_visible_parts
             finally:
+                self._record_prefill_guard_active_memory()
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
                     if close is not None:
