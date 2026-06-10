@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
@@ -581,3 +581,215 @@ class MemoryMonitor:
             f"MemoryMonitor(max_kv_cache={format_bytes(self._max_kv_cache_memory)}, "
             f"used={format_bytes(info.used_bytes)})"
         )
+
+
+def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
+    """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
+
+    The engine-agnostic baseline used by engines that bypass the
+    ``Scheduler`` (currently ``DFlashEngine``'s primary speculative path) so
+    they can run the same prefill-peak estimate the scheduler-driven engines
+    get. Best-effort: on any extraction failure the monitor is left dim-less
+    and ``estimate_prefill_peak_bytes`` returns 0, making the guard a no-op
+    rather than raising spuriously.
+
+    Note this populates the *uncompressed* (base-dtype) KV size — it does not
+    apply the TurboQuant fractional-byte adjustment that
+    ``Scheduler._set_model_info_for_monitor`` layers on, because that depends
+    on scheduler-side TurboQuant configuration. For a memory *guard* the
+    uncompressed estimate is the conservative (never-under-count) choice.
+    """
+    try:
+        # Try to get model config
+        config = None
+        if hasattr(model, "config"):
+            config = model.config
+        elif hasattr(model, "args"):
+            config = model.args
+
+        if config is None:
+            logger.debug("Could not extract model config for memory estimation")
+            return
+
+        # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+        # language-model dimensions under a sub-config. Prefer
+        # ``text_config`` / ``language_config`` / ``llm_config`` when ANY of
+        # them exposes the LM layer count, even if the top-level config also
+        # has one — on some VLM packs the top-level field refers to the
+        # *vision encoder*, not the LM, and accepting it silently miscalibrates
+        # the SDPA-peak estimate. Probe ``num_hidden_layers`` and the legacy
+        # ``n_layer`` alias. Falls back to the top-level config only when no
+        # sub-config has either field.
+        for sub_attr in ("text_config", "language_config", "llm_config"):
+            sub = getattr(config, sub_attr, None)
+            if sub is not None and (
+                getattr(sub, "num_hidden_layers", None)
+                or getattr(sub, "n_layer", None)
+            ):
+                config = sub
+                break
+
+        # Extract KV cache dimensions
+        num_layers = getattr(config, "num_hidden_layers", None) or getattr(
+            config, "n_layer", None
+        )
+        num_kv_heads = (
+            getattr(config, "num_key_value_heads", None)
+            or getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_head", None)
+        )
+        head_dim = getattr(config, "head_dim", None)
+        hidden_size = getattr(config, "hidden_size", None) or getattr(
+            config, "n_embd", None
+        )
+
+        # Calculate head_dim if not directly available
+        if head_dim is None and hidden_size and num_kv_heads:
+            num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
+            head_dim = hidden_size // num_heads
+
+        # Determine dtype size
+        dtype_size = 2  # Default float16
+        if hasattr(model, "dtype"):
+            if model.dtype == mx.float32:
+                dtype_size = 4
+            elif model.dtype == mx.bfloat16:
+                dtype_size = 2
+
+        # Extract num_attention_heads (query heads) for SDPA peak estimation
+        num_attention_heads = (
+            getattr(config, "num_attention_heads", None)
+            or getattr(config, "n_head", None)
+            or num_kv_heads
+        )
+
+        # Count KVCache layers for hybrid models. Mirrors
+        # Scheduler._set_model_info_for_monitor: recurse into CacheList so
+        # wrapped full-attention layers are counted, not just bare KVCache.
+        num_kv_cache_layers = num_layers
+        if hasattr(model, "make_cache"):
+            try:
+                cache_list = model.make_cache()
+                from mlx_lm.models.cache import CacheList, KVCache
+
+                def _count_kv(c: Any) -> int:
+                    if type(c) is KVCache:
+                        return 1
+                    if isinstance(c, CacheList):
+                        return sum(_count_kv(inner) for inner in c.caches)
+                    return 0
+
+                num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                if num_kv_cache_layers == 0:
+                    num_kv_cache_layers = num_layers  # fallback
+            except Exception:
+                pass
+
+        # Truthiness alone isn't enough — MagicMock proxies leaking through the
+        # descent (test scaffolds that don't fully spec ``model.config``) are
+        # truthy but fail any later numeric comparison (``> 128`` etc.) deep
+        # inside MemoryMonitor. Insist on real positive integers before calling.
+        def _pos_int(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+        if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            monitor.set_model_info(
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype_size=dtype_size,
+                num_attention_heads=num_attention_heads,
+                num_kv_cache_layers=num_kv_cache_layers,
+            )
+            logger.debug(
+                f"Model info for memory estimation: "
+                f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
+                f"head_dim={head_dim}, dtype_size={dtype_size}"
+            )
+        else:
+            logger.debug(
+                f"Incomplete model info: layers={num_layers}, "
+                f"kv_heads={num_kv_heads}, head_dim={head_dim}"
+            )
+
+    except Exception as e:
+        logger.debug(f"Failed to extract model info: {e}")
+
+
+def raise_if_prefill_exceeds(
+    monitor: "MemoryMonitor | None",
+    *,
+    prefill_memory_guard: bool,
+    hard_limit_bytes: int,
+    prefill_step_size: int,
+    num_prompt_tokens: int,
+    cached_tokens: int = 0,
+    request_id: str | None = None,
+) -> None:
+    """Raise ``PrefillMemoryExceededError`` if a prompt's prefill peak would
+    push memory past ``hard_limit_bytes``.
+
+    The shared front-door guard, taking token counts + watermarks directly so
+    an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
+    same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
+    disabled, no limit is set, the monitor is missing, or the request fits.
+    Maps to HTTP 400 via the server's ``prefill_memory_exceeded_handler``.
+
+    ``cached_tokens`` means prompt KV *already resident in current memory*
+    (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
+    a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
+    must pass 0.
+    """
+    if not prefill_memory_guard:
+        return
+    if hard_limit_bytes <= 0:
+        return
+    if monitor is None:
+        return
+    if mx is None:  # no MLX runtime → nothing to measure against; no-op
+        return
+
+    new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+    if new_tokens == 0:
+        return
+
+    peak = monitor.estimate_prefill_peak_bytes(
+        new_tokens, prefill_step_size, cached_tokens=cached_tokens
+    )
+    if peak == 0:
+        return
+
+    from omlx.utils.proc_memory import get_phys_footprint
+
+    current = max(mx.get_active_memory(), get_phys_footprint())
+    if current + peak <= hard_limit_bytes:
+        return
+
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    usage_gb = current / (1024**3)
+    ceiling_gb = hard_limit_bytes / (1024**3)
+    message = (
+        f"Prefill would require ~{format_bytes(current + peak)} peak "
+        f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+        f"but ceiling is {format_bytes(hard_limit_bytes)} "
+        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+        f"Reduce context length, free system memory, or loosen "
+        f"memory_guard_tier (safe → balanced → aggressive)."
+    )
+
+    if not request_id:
+        import uuid as _uuid
+
+        request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+    logger.warning(
+        "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+        num_prompt_tokens, cached_tokens, request_id, message,
+    )
+    raise PrefillMemoryExceededError(
+        message=message,
+        request_id=request_id,
+        estimated_bytes=int(current + peak),
+        limit_bytes=int(hard_limit_bytes),
+    )

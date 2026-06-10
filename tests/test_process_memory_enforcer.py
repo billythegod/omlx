@@ -1909,3 +1909,49 @@ class TestTwoWatermarkPressureLevels:
         assert status["current_bytes"] == 88 * 1024**3
         # Utilization computed against the max value
         assert abs(status["utilization"] - 0.88) < 0.01
+
+
+class TestDFlashGuardPropagation:
+    """The enforcer must reach DFlash's primary-mode guard target.
+
+    DFlash bypasses the scheduler: in primary mode it exposes a lightweight
+    ``_prefill_guard``; in fallback mode its ``scheduler`` property resolves
+    the fallback engine's real scheduler (covered by test_dflash_engine.py).
+    Without the ``_prefill_guard`` arm in ``_resolve_scheduler`` the watermarks
+    never reach a primary-mode DFlash and the prefill guard stays dead.
+    """
+
+    def test_resolves_primary_guard(self, enforcer):
+        guard = MagicMock(spec=[])
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = guard
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        assert enforcer._resolve_scheduler(entry) is guard
+
+        enforcer._propagate_memory_limit()
+        assert guard._memory_hard_limit_bytes == 10 * 1024**3
+        assert guard._prefill_memory_guard == enforcer._prefill_memory_guard
+
+    def test_dflash_primary_does_not_warn(self, enforcer, caplog):
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = MagicMock(spec=[])
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        assert not [
+            r for r in caplog.records if "could not resolve scheduler" in r.message
+        ]
+
+    def test_non_dflash_resolution_unchanged(self, enforcer):
+        """A standard engine with a direct ``.scheduler`` still resolves via the
+        existing chain — the DFlash arm must not interfere."""
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=["scheduler"])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        assert enforcer._resolve_scheduler(entry) is scheduler

@@ -718,13 +718,18 @@ class ProcessMemoryEnforcer:
 
     @staticmethod
     def _resolve_scheduler(entry: Any) -> Any | None:
-        """Resolve the Scheduler instance from an EnginePool entry.
+        """Resolve the watermark target (Scheduler or DFlash guard) from an
+        EnginePool entry.
 
         Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
         as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
         EngineCore → Scheduler). Some non-streaming engines may expose
-        ``entry.engine.scheduler`` directly. Returns None if neither
-        path resolves.
+        ``entry.engine.scheduler`` directly — including ``DFlashEngine`` in
+        fallback mode, whose ``scheduler`` property resolves the fallback
+        engine's real scheduler. DFlash's *primary* speculative path has no
+        scheduler at all, so it exposes a lightweight ``_prefill_guard`` that
+        carries the same watermark attrs; tried last so standard engines
+        resolve unchanged. Returns None if nothing resolves.
         """
         eng = entry.engine
         if eng is None:
@@ -733,12 +738,16 @@ class ProcessMemoryEnforcer:
         if sched is not None:
             return sched
         inner = getattr(eng, "_engine", None)
-        if inner is None:
-            return None
-        inner_engine = getattr(inner, "engine", None)
-        if inner_engine is None:
-            return None
-        return getattr(inner_engine, "scheduler", None)
+        if inner is not None:
+            inner_engine = getattr(inner, "engine", None)
+            if inner_engine is not None:
+                sched = getattr(inner_engine, "scheduler", None)
+                if sched is not None:
+                    return sched
+        # DFlash primary mode bypasses the scheduler entirely; the enforcer
+        # still needs to push the ceiling somewhere, so it lands on the
+        # engine's ``_prefill_guard`` (None for every non-DFlash engine).
+        return getattr(eng, "_prefill_guard", None)
 
     def _propagate_memory_limit(self) -> None:
         """Propagate ceiling-derived watermarks to all schedulers.
