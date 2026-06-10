@@ -3004,6 +3004,30 @@ class Scheduler:
         """Return the last MLX active-memory sample taken on the executor."""
         return self._last_mlx_active_memory_bytes
 
+    def _hot_cache_cpu_bytes(self) -> int:
+        """Return serialized hot-cache bytes safe to exclude from phys guard."""
+        budget = getattr(self.config, "hot_cache_budget", None)
+        if budget is not None:
+            try:
+                return max(0, int(getattr(budget, "total_bytes", 0)))
+            except Exception:
+                logger.debug("Failed to read shared hot-cache byte budget")
+                return 0
+
+        manager = getattr(self, "paged_ssd_cache_manager", None)
+        if manager is None:
+            return 0
+
+        try:
+            stats = manager.get_stats()
+            return max(0, int(getattr(stats, "hot_cache_size_bytes", 0)))
+        except Exception:
+            try:
+                return max(0, int(getattr(manager, "_hot_cache_total_bytes", 0)))
+            except Exception:
+                logger.debug("Failed to read local hot-cache byte counter")
+                return 0
+
     def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
         """Current memory usage for scheduler-side guard checks.
 
@@ -3015,7 +3039,8 @@ class Scheduler:
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
-        return max(active, get_phys_footprint())
+        phys = max(0, int(get_phys_footprint()) - self._hot_cache_cpu_bytes())
+        return max(active, phys)
 
     def _record_chunk_transient(
         self,
