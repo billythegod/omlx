@@ -93,7 +93,6 @@ class MLXEmbeddingModel:
 
         Returns True if native loading succeeded, False otherwise.
         """
-        from safetensors import safe_open
         from transformers import AutoTokenizer
 
         model_path = Path(self.model_name)
@@ -139,9 +138,7 @@ class MLXEmbeddingModel:
                 return False
 
             for wf in weight_files:
-                with safe_open(wf, framework="mlx") as f:
-                    for key in f.keys():
-                        weights[key] = f.get_tensor(key)
+                weights.update(mx.load(str(wf)))
 
             weights = model_instance.sanitize(weights)
             self._validate_native_weights(model_instance, weights)

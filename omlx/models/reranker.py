@@ -172,6 +172,9 @@ class MLXRerankerModel:
         # Load weights into model
         model.load_weights(list(weights.items()))
         mx.eval(model.parameters())
+        # Reranker inference must be deterministic: disable dropout in the
+        # native XLM-RoBERTa path just like the native embedding loader does.
+        model.train(False)
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
