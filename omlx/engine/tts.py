@@ -135,6 +135,7 @@ class TTSEngine(BaseNonStreamingEngine):
         self,
         text: str,
         voice: Optional[str] = None,
+        language: Optional[str] = None,
         speed: float = 1.0,
         instructions: Optional[str] = None,
         ref_audio: Optional[str] = None,
@@ -172,8 +173,8 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
-            self._model_name, len(text), voice, speed,
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, language=%s, speed=%.1f, ref_audio=%s",
+            self._model_name, len(text), voice, language or "auto", speed,
             "yes" if ref_audio else "no",
         )
 
@@ -198,6 +199,8 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if language and "lang_code" in gen_params:
+                gen_kwargs["lang_code"] = language
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -264,6 +267,7 @@ class TTSEngine(BaseNonStreamingEngine):
         self,
         text: str,
         voice: Optional[str] = None,
+        language: Optional[str] = None,
         speed: float = 1.0,
         instructions: Optional[str] = None,
         ref_audio: Optional[str] = None,
@@ -286,8 +290,8 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS native stream start: model=%s, text_len=%d, voice=%s, interval=%.2fs",
-            self._model_name, len(text), voice, streaming_interval,
+            "TTS native stream start: model=%s, text_len=%d, voice=%s, language=%s, interval=%.2fs",
+            self._model_name, len(text), voice, language or "auto", streaming_interval,
         )
 
         model = self._model
@@ -309,6 +313,8 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if language and "lang_code" in gen_params:
+                gen_kwargs["lang_code"] = language
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
