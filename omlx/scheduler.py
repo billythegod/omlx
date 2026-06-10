@@ -2711,8 +2711,10 @@ class Scheduler:
             if tracker.bytes_per_token > 0:
                 per_token = max(per_token, tracker.bytes_per_token)
         if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
-            per_token = max(per_token, float(static))
+            static = self.memory_monitor.estimate_chunk_transient_bytes(
+                n_tokens, kv_len + n_tokens
+            )
+            per_token = max(per_token, float(static) / n_tokens)
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
     def _prefill_abort_cap(self) -> int:
@@ -2844,7 +2846,7 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        per_token = self._predicted_chunk_transient(1, kv_len)
+        per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
         if n_fit < n_tokens:
@@ -2885,10 +2887,11 @@ class Scheduler:
             ``bytes_per_token`` (× the same 1.2 safety factor ``predict()``
             applies) — this is measurement-based and model-agnostic.
           - First chunk (no samples yet): fall back to the static SDPA
-            estimate ``memory_monitor.estimate_chunk_transient_bytes(1,
-            kv_len + 1)`` per token. ``kv_len`` is the current context span
-            (cached prefix + already-prefilled tokens), so a large
-            prefix-cache hit with a small suffix is throttled correctly.
+            estimate for the requested candidate chunk. ``kv_len`` is the
+            current context span (cached prefix + already-prefilled tokens),
+            so a large prefix-cache hit with a small suffix is throttled
+            correctly without classifying large prefill chunks as vector-path
+            traffic.
 
         The discrete watermark tiers are retained as a *secondary clamp* —
         they only ever shrink further, never enlarge the predicted size.
@@ -2923,7 +2926,7 @@ class Scheduler:
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks the transient's growth with kv_len instead
         # of lagging behind a long-run average.
-        per_token = self._predicted_chunk_transient(1, kv_len)
+        per_token = self._predicted_chunk_transient(requested, kv_len) / requested
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -2935,9 +2938,8 @@ class Scheduler:
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
 
         if per_token <= 0:
-            # No usable predictor (e.g. head_dim<=128 fused kernel where the
-            # transient is O(n), or model info unavailable). Fall back to the
-            # legacy watermark gate so we never run unbounded.
+            # No usable predictor (e.g. model info unavailable). Fall back to
+            # the legacy watermark gate so we never run unbounded.
             if current < soft_watermark:
                 return requested
             n_fit = requested
@@ -5884,8 +5886,8 @@ class Scheduler:
         (model weights + KV cache + SDPA activation/scratch) and rejects
         if it would exceed the hard limit.
 
-        Current MLX avoids the old full fp32 attention matrix for
-        head_dim > 128, but still needs a bounded tiled scratch term.
+        Mirrors MLX SDPA dispatch closely enough that unsupported prefill
+        head dimensions are charged for the unfused fp32 score matrix.
 
         Returns:
             ``_PreflightRejection`` carrying the message + numeric

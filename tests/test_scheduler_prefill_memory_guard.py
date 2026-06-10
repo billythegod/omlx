@@ -179,9 +179,9 @@ def test_preflight_returns_none_when_request_fully_cached():
 def test_preflight_rejects_heavily_cached_long_context():
     """Regression for M3: a request whose suffix is small but whose
     *full* prompt is long must still trip the guard, because the SDPA
-    tiled scratch spans the full prompt (cached + new), not just the new
-    tokens. Previously the estimator passed only new_tokens to the
-    scratch formula and the heavily-cached path slipped through.
+    fallback score matrix spans the full prompt (cached + new), not just the
+    new tokens. Previously the estimator passed only new_tokens to the
+    fallback formula and the heavily-cached path slipped through.
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
