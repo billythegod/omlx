@@ -870,11 +870,60 @@ class TestLevelBudgetPlan:
     """Tests for per-level target_bpw and budget plan activation."""
 
     def test_bpw_targets_for_level_returns_correct_values(self):
+        assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
+        assert _bpw_targets_for_level(2.7) == (3.35, 3.45)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
         assert _bpw_targets_for_level(5) == (5.5, 5.7)
         assert _bpw_targets_for_level(6) == (6.5, 6.7)
+
+    def test_oq25_base_bits_is_2(self):
+        assert _LEVEL_BITS[2.5] == 2
+        assert _LEVEL_BITS[2.7] == 2
+
+    @pytest.mark.parametrize(
+        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
+    )
+    def test_half_level_mandatory_expert_down_proj_boost(
+        self, oq_level, expected_bits
+    ):
+        """Fractional levels protect routed expert down_proj above base bits
+        even with negligible sensitivity scores."""
+        named_shapes = {
+            "model.layers.0.mlp.switch_mlp.down_proj": (8, 256, 256),
+            "model.layers.0.mlp.switch_mlp.gate_proj": (8, 256, 256),
+            "model.layers.0.self_attn.q_proj": (64, 64),
+        }
+        config = {
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.01},
+        }
+        target, cap = _OQ_BPW_TARGETS[oq_level]
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level, target_bpw=target, hard_cap_bpw=cap
+        )
+        boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
+        assert boost is not None
+        assert boost["bits"] == expected_bits
+
+    @pytest.mark.parametrize(
+        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
+    )
+    def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
+        """The non-budget predicate floor mirrors the mandatory boost."""
+        config = {
+            "num_hidden_layers": 32,
+            "num_experts": 8,
+            "hidden_size": 1024,
+        }
+        result = universal_quant_predicate(
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, oq_level
+        )
+        assert isinstance(result, dict)
+        assert result["bits"] == expected_bits
 
     def test_bpw_targets_for_level_returns_none_for_minimal(self):
         assert _bpw_targets_for_level(8) is None

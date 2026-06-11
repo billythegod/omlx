@@ -4,7 +4,10 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ3, oQ4, oQ6, oQ8 (base bits differ, same predicate).
+Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8 (base
+bits differ, same predicate). Fractional levels keep the lower level's base
+bits and add a mandatory boost for routed expert down_proj (Super Weights
+protection; see _LEVEL_EXPERT_DOWN_BOOST) plus a higher bpw budget.
 """
 
 import json
@@ -30,7 +33,7 @@ from omlx.model_discovery import _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
-OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
+OQ_LEVELS = {2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8}
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -44,10 +47,22 @@ _MAX_MODEL_RAM_FRACTION = 0.8
 _PROXY_QUANT_BITS = 4
 _PROXY_QUANT_GROUP_SIZE = 64
 
-_LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+_LEVEL_BITS: dict[float, int] = {
+    2: 2,
+    2.5: 2,
+    2.7: 2,
+    3: 3,
+    3.5: 3,
+    4: 4,
+    5: 5,
+    6: 6,
+    8: 8,
+}
 
 _LEVEL_PROTECTION: dict[float, str] = {
     2: "full",
+    2.5: "full",
+    2.7: "full",
     3: "full",
     3.5: "full",
     4: "full",
@@ -56,8 +71,15 @@ _LEVEL_PROTECTION: dict[float, str] = {
     8: "full",
 }
 
+# Fractional levels: mandatory protection for routed expert down_proj
+# (Super Weights), expressed as bits above the level's base bits.
+# 2.5 -> 3-bit, 2.7 -> 4-bit, 3.5 -> 4-bit.
+_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 2.7: 2, 3.5: 1}
+
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
+    2.5: (3.1, 3.3),
+    2.7: (3.35, 3.45),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
     4: (4.6, 4.7),
@@ -89,6 +111,9 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
+        oQ2.5/oQ2.7/oQ3.5: fractional levels — lower level's base bits,
+            routed expert down_proj protected above base per
+            _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
         oQ3: base 2-bit + full protection → ~3.3 bpw
         oQ4-oQ6: base N-bit + full protection
         oQ7: base 8-bit + full protection
@@ -264,8 +289,11 @@ def universal_quant_predicate(
             and ("switch_mlp" in path or "experts" in path)
         )
         if is_routed_expert:
-            if oq_level == 3.5:
-                return bits(4)
+            down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
+            if down_boost:
+                # Fractional levels protect routed expert down_proj above
+                # the base bits (Super Weights protection).
+                return bits(base_bits + down_boost)
             return True
         if sensitive:
             return bits(6)
@@ -479,6 +507,7 @@ def _build_quant_plan(
     oq_level: int,
     target_bpw: float = 4.6,
     hard_cap_bpw: float = 4.7,
+    fixed_overrides: dict[str, dict] | None = None,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
@@ -487,11 +516,17 @@ def _build_quant_plan(
     2. Data-driven: all non-expert tensors compete equally, ranked by
        layer sensitivity score. Higher sensitivity → more bits.
     3. Routed experts always stay at base bits (93-98% of params).
+
+    fixed_overrides marks tensors whose output format is fixed up front
+    (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
+    priced into the baseline bpw at their true cost and excluded from every
+    boost decision.
     """
     base_bits = _base_bits_for_level(oq_level)
     base_mode = _mode_for_bits(base_bits)
     base_group_size = _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE)
     boost_map: dict[str, dict] = {}
+    fixed_overrides = fixed_overrides or {}
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
@@ -507,12 +542,15 @@ def _build_quant_plan(
             expert_params += n
 
     current_bpw = _estimate_effective_bpw(
-        named_shapes, base_bits, base_group_size, base_mode
+        named_shapes, base_bits, base_group_size, base_mode,
+        overrides=fixed_overrides,
     )
     total_bits_f = current_bpw * total_params
 
     module = None
     for path, shape in named_shapes.items():
+        if path in fixed_overrides:
+            continue
         pred = universal_quant_predicate(
             path, module, {**config, "_oq_boost_map": {}}, oq_level
         )
@@ -539,16 +577,18 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
-    # oQ3.5: mandatory expert down_proj 4-bit (Super Weights protection)
-    if oq_level == 3.5:
+    # Fractional levels (oQ2.5 / oQ2.7 / oQ3.5): mandatory expert down_proj
+    # boost above base bits (Super Weights protection).
+    _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
+    if _down_boost:
         for path, shape in named_shapes.items():
-            if path in boost_map:
+            if path in boost_map or path in fixed_overrides:
                 continue
             if not _is_routed_expert(path):
                 continue
             if not any(p in path for p in ("down_proj", "w2")):
                 continue
-            cand_bits = base_bits + 1  # 3→4
+            cand_bits = base_bits + _down_boost
             if cand_bits not in (2, 3, 4, 5, 6, 8):
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -573,7 +613,7 @@ def _build_quant_plan(
     # Each floor boost is checked against hard_cap to avoid overshooting.
     floor_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
     for path, shape in named_shapes.items():
-        if path in boost_map:
+        if path in boost_map or path in fixed_overrides:
             continue
         if _is_routed_expert(path):
             continue
@@ -610,7 +650,7 @@ def _build_quant_plan(
     # budget up to hard_cap_bpw.
     candidates = []
     for path, shape in named_shapes.items():
-        if _is_routed_expert(path):
+        if _is_routed_expert(path) or path in fixed_overrides:
             continue
         pred = universal_quant_predicate(
             path, module, {**config, "_oq_boost_map": {}}, oq_level
@@ -669,7 +709,7 @@ def _build_quant_plan(
     if current_bpw < target_bpw:
         fallback_candidates = []
         for path, shape in named_shapes.items():
-            if _is_routed_expert(path):
+            if _is_routed_expert(path) or path in fixed_overrides:
                 continue
             cur = boost_map.get(path)
             if cur is None:
