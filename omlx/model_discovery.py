@@ -38,6 +38,7 @@ VLM_MODEL_TYPES = {
     "gemma3",
     "gemma4",
     "gemma4_unified",
+    "diffusion_gemma",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -573,13 +574,13 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config. gemma4_unified is an
-    # exception: it is always VLM (unified audio+vision architecture) regardless
-    # of vision_config presence in config.json.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified and
+    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
+    # vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type == "gemma4_unified":
+        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
             logger.info(
-                "gemma4_unified detected as VLM (unified models always include vision)"
+                f"{model_type} detected as VLM (mlx-vlm native model)"
             )
             return "vlm"
         if _has_vision_subconfig(config):
