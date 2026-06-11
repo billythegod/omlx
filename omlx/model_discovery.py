@@ -65,6 +65,13 @@ VLM_MODEL_TYPES = {
     "youtu_vl",
 }
 
+# Text-only model families that are implemented in mlx-vlm rather than
+# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# models and adapts their language model to oMLX's scheduler.
+VLM_NATIVE_TEXT_MODEL_TYPES = {
+    "cohere2_moe",
+}
+
 # Known VLM architectures
 VLM_ARCHITECTURES = {
     "LlavaForConditionalGeneration",
@@ -553,6 +560,12 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
+
+    if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
+        logger.info(
+            f"{model_type} detected as mlx-vlm native text model"
+        )
+        return "vlm"
 
     # Check for VLM: architectures field
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM

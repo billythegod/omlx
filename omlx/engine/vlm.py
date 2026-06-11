@@ -81,6 +81,8 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
+COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -102,6 +104,78 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 8192,
     },
 }
+
+
+def _read_config_model_type(model_path: str | Path) -> str | None:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return None
+    model_type = data.get("model_type")
+    return model_type if isinstance(model_type, str) else None
+
+
+def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
+    from mlx_vlm.tokenizer_utils import load_tokenizer
+    from mlx_vlm.utils import StoppingCriteria
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+
+    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+    tokenizer.detokenizer = detokenizer_class(tokenizer)
+
+    final_eos_token_ids = (
+        eos_token_id
+        or getattr(tokenizer, "eos_token_ids", None)
+        or getattr(tokenizer, "eos_token_id", None)
+    )
+    tokenizer.stopping_criteria = StoppingCriteria(final_eos_token_ids, tokenizer)
+    return tokenizer
+
+
+def _load_cohere2_moe_text_model(
+    model_name: str,
+    *,
+    trust_remote_code: bool = False,
+):
+    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    from mlx_vlm.utils import get_model_path, load_model, load_processor
+    from transformers import AutoTokenizer
+
+    model_path = get_model_path(model_name)
+    model = load_model(
+        model_path,
+        lazy=False,
+        strict=True,
+        trust_remote_code=trust_remote_code,
+    )
+
+    eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    try:
+        processor = load_processor(
+            model_path,
+            True,
+            eos_token_ids=eos_token_id,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as exc:
+        logger.debug(
+            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "falling back to AutoTokenizer: %s",
+            model_name,
+            exc,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
+        processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
+
+    return model, processor
 
 _video_processor_patched = False
 
@@ -869,6 +943,12 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
+                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
+                    return _load_cohere2_moe_text_model(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
+
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
                 )
@@ -1632,6 +1712,14 @@ class VLMBatchedEngine(BaseEngine):
         num_images = len(images)
         num_audios = len(audio) if audio else 0
 
+        model_type = self.model_type or ""
+        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+            raise InvalidRequestError(
+                "Cohere2 MoE is a text-only model and does not support "
+                "image or audio input.",
+                field="messages",
+            )
+
         # Normalize audio to numpy float32 arrays expected by processor.
         # extract_images_from_messages produces BytesIO / file-path strings, but
         # the processor's __call__ expects numpy arrays or (array, sample_rate)
@@ -1649,8 +1737,6 @@ class VLMBatchedEngine(BaseEngine):
                 else a
                 for a in audio
             ]
-        model_type = self.model_type or ""
-
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
             raise ValueError(

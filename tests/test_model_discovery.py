@@ -223,6 +223,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
+        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
+        config = {
+            "model_type": "cohere2_moe",
+            "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {

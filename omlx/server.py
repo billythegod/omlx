@@ -97,9 +97,11 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
+    FunctionCall,
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
+    ToolCall,
     Usage,
 )
 from .api.embedding_models import (
@@ -190,6 +192,26 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+
+
+def _convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
+    converted: list[ToolCall] = []
+    for tool_call in tool_calls or []:
+        if not isinstance(tool_call, dict):
+            continue
+        converted.append(
+            ToolCall(
+                id=tool_call.get("id")
+                or tool_call.get("call_id")
+                or f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=tool_call.get("name", ""),
+                    arguments=tool_call.get("arguments", "{}") or "{}",
+                ),
+            )
+        )
+    return converted
 
 
 # =============================================================================
@@ -2972,21 +2994,9 @@ async def create_chat_completion(
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-        # For other models, parse from text output
-        if engine.model_type == "gpt_oss" and output.tool_calls:
-            from .api.openai_models import ToolCall, FunctionCall
-            tool_calls = [
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=tc["name"],
-                        arguments=tc["arguments"],
-                    ),
-                )
-                for tc in output.tool_calls
-            ]
+        # Protocol parsers can return structured tool_calls directly.
+        if output.tool_calls:
+            tool_calls = _convert_parser_tool_calls(output.tool_calls)
             cleaned_text = regular_content
         else:
             extraction = extract_tool_calls_with_thinking(
@@ -3729,19 +3739,8 @@ async def stream_chat_completion(
     tool_calls = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
-        # Harmony model — tool_calls already extracted by parser
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in last_output.tool_calls
-        ]
+        # Protocol parser already extracted structured tool calls.
+        tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
@@ -4136,19 +4135,8 @@ async def stream_anthropic_messages(
     # For other models, parse from accumulated text
     tool_calls = None
     if last_output and last_output.tool_calls:
-        # Harmony model - tool_calls already extracted by parser
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in last_output.tool_calls
-        ]
+        # Protocol parser already extracted structured tool calls.
+        tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
@@ -4159,7 +4147,6 @@ async def stream_anthropic_messages(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
-        cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
     # 4. Close open blocks
@@ -4518,21 +4505,9 @@ async def create_anthropic_message(
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-        # For other models, parse from text output
-        if engine.model_type == "gpt_oss" and output.tool_calls:
-            from .api.openai_models import ToolCall, FunctionCall
-            tool_calls = [
-                ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=tc["name"],
-                        arguments=tc["arguments"],
-                    ),
-                )
-                for tc in output.tool_calls
-            ]
+        # Protocol parsers can return structured tool_calls directly.
+        if output.tool_calls:
+            tool_calls = _convert_parser_tool_calls(output.tool_calls)
             cleaned_text = regular_content
         else:
             extraction = extract_tool_calls_with_thinking(
@@ -4954,7 +4929,7 @@ async def create_response(
         thinking_content, regular_content = extract_thinking(raw_text)
 
         # Parse tool calls
-        if engine.model_type == "gpt_oss" and output.tool_calls:
+        if output.tool_calls:
             tool_calls = output.tool_calls
             cleaned_text = regular_content
         else:
