@@ -238,7 +238,9 @@ class BlockAwarePrefixCache(CacheManager):
         # window padding. CacheList uses last-block-only storage with reject-on-partial
         # strategy, so the sliding window state is either fully restored (exact match)
         # or the entire cache is rejected (partial match).
-        if not layer_cache_types or "RotatingKVCache" not in layer_cache_types:
+        if not layer_cache_types or not any(
+            CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
+        ):
             return None
 
         model_cache_config = ModelCacheConfig.from_type_list(
@@ -252,9 +254,8 @@ class BlockAwarePrefixCache(CacheManager):
             if not meta or len(meta) < 2:
                 continue
             # Check if this layer is RotatingKVCache
-            if (
-                idx < len(layer_cache_types)
-                and layer_cache_types[idx] == "RotatingKVCache"
+            if idx < len(layer_cache_types) and CacheTypeRegistry.is_rotating_family(
+                layer_cache_types[idx]
             ):
                 # RotatingKVCache meta_state: (keep, max_size, offset, _idx)
                 window_size = int(meta[1])
@@ -698,9 +699,7 @@ class BlockAwarePrefixCache(CacheManager):
             and first_new_block_idx is not None
             and 0 < first_new_block_idx < len(block_table.block_ids)
             and layer_cache_types
-            and any(
-                CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
-            )
+            and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
         ):
             prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
             new_tip_id = block_table.block_ids[-1]
@@ -712,9 +711,7 @@ class BlockAwarePrefixCache(CacheManager):
                 and new_tip is not None
                 and new_tip.block_hash is not None
             ):
-                superseded = self._rotating_tip_lineage.pop(
-                    prev_tip.block_hash, None
-                )
+                superseded = self._rotating_tip_lineage.pop(prev_tip.block_hash, None)
                 if superseded is not None:
                     self._strip_rotating_payload(superseded)
                 self._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
@@ -759,7 +756,7 @@ class BlockAwarePrefixCache(CacheManager):
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
         # ArraysCache: no traditional sequence dimension
-        non_sliceable_types = {"RotatingKVCache", "ArraysCache", "CacheList"}
+        non_sliceable_types = {"ArraysCache", "CacheList"}
 
         # Step 1: Search for a sliceable KVCache layer (full attention)
         for layer_idx, layer_state in enumerate(cache_data):
@@ -773,6 +770,8 @@ class BlockAwarePrefixCache(CacheManager):
                 if (
                     cache_type in non_sliceable_types
                     or class_name in non_sliceable_types
+                    or CacheTypeRegistry.is_rotating_family(cache_type)
+                    or CacheTypeRegistry.is_rotating_family(class_name)
                 ):
                     continue
 
@@ -934,8 +933,9 @@ class BlockAwarePrefixCache(CacheManager):
                 )
             return bool(saved)
         except Exception as e:
-            logger.debug("Rotating payload strip failed for %s: %s",
-                         block_hash.hex()[:16], e)
+            logger.debug(
+                "Rotating payload strip failed for %s: %s", block_hash.hex()[:16], e
+            )
             return False
 
     def _extract_block_tensor_slice(
@@ -1074,7 +1074,7 @@ class BlockAwarePrefixCache(CacheManager):
                             self._clone_tensor(values_slice),
                         )
                     )
-                elif cache_type_name == "RotatingKVCache":
+                elif CacheTypeRegistry.is_rotating_family(cache_type_name):
                     # RotatingKVCache: last-block-only or boundary-snapshot strategy
                     has_valid_state = is_last_block or (
                         snapshot_cache_data is not None
@@ -1870,12 +1870,16 @@ class BlockAwarePrefixCache(CacheManager):
                         )
 
                     NON_SLICEABLE_SUB_CLASSES = {
-                        "RotatingKVCache",
                         "PoolingCache",
                         "ArraysCache",
                         "BatchPoolingCache",
-                        "BatchRotatingKVCache",
                     }
+
+                    def _is_non_sliceable_sub_class(class_name: str) -> bool:
+                        return (
+                            class_name in NON_SLICEABLE_SUB_CLASSES
+                            or CacheTypeRegistry.is_rotating_family(class_name)
+                        )
 
                     if len(cl_block_data) > 1:
                         # Per-block storage: concatenate sliceable sub-caches
@@ -1887,7 +1891,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 if j < len(sub_class_names_for_layer)
                                 else ""
                             )
-                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                            if _is_non_sliceable_sub_class(sub_class):
                                 # Each saved block already snapshots the
                                 # full state at its boundary — pick the
                                 # last block, which corresponds to the
@@ -1966,7 +1970,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 if j < len(sub_class_names_for_layer)
                                 else ""
                             )
-                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                            if _is_non_sliceable_sub_class(sub_class):
                                 adjusted_sub_metas.append(
                                     orig_sub_meta if orig_sub_meta else ""
                                 )
@@ -2115,7 +2119,7 @@ class BlockAwarePrefixCache(CacheManager):
                     latest_keys = layer_states[-1].get("keys")
                     latest_values = layer_states[-1].get("values")
 
-                    if cache_type_name == "RotatingKVCache":
+                    if CacheTypeRegistry.is_rotating_family(cache_type_name):
                         # RotatingKVCache: strict last-block restore.
                         # If the last matched block is a placeholder, we only
                         # had a partial prefix hit and must reject.

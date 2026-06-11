@@ -37,7 +37,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.cache.paged_cache import PagedCacheManager
+from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
+from omlx.cache.paged_cache import BlockTable, PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager, SharedHotCacheBudget
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.cache.type_registry import CacheTypeRegistry
@@ -137,9 +138,7 @@ def _store_turn(cache, turn, num_blocks, data_fn=_hybrid_cache_data):
     is allocated and saved.
     """
     tokens = list(range(num_blocks * BLOCK_SIZE))
-    table = cache.store_cache(
-        f"turn-{turn}", tokens, data_fn(seq_len=len(tokens))
-    )
+    table = cache.store_cache(f"turn-{turn}", tokens, data_fn(seq_len=len(tokens)))
     assert table is not None
     assert len(table.block_ids) == num_blocks
     return table
@@ -289,9 +288,7 @@ def test_prefill_ready_rotating_name_stripped(tmp_path):
     cache, ssd = _make_cache(tmp_path)
 
     def data_fn(seq_len):
-        return _hybrid_cache_data(
-            seq_len, rotating_type="PrefillReadyRotatingKVCache"
-        )
+        return _hybrid_cache_data(seq_len, rotating_type="PrefillReadyRotatingKVCache")
 
     t1 = _store_turn(cache, 1, num_blocks=2, data_fn=data_fn)
     tip1 = _block_hash(cache, t1, -1)
@@ -301,6 +298,96 @@ def test_prefill_ready_rotating_name_stripped(tmp_path):
     _store_turn(cache, 3, num_blocks=4, data_fn=data_fn)
 
     assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE
+
+
+def test_prefill_ready_rotating_name_reconstructs_with_rotating_handler():
+    """Restore must route PrefillReadyRotatingKVCache metadata through the
+    strict rotating path, not the ArraysCache-style token_count path."""
+    paged_cache = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="test-model",
+        initial_blocks=100,
+    )
+    mock_ssd = MagicMock()
+    cache = BlockAwarePrefixCache(
+        model=MockModel(num_layers=2),
+        paged_cache_manager=paged_cache,
+        paged_ssd_cache_manager=mock_ssd,
+    )
+
+    block = paged_cache.allocate_block()
+    block.block_hash = b"hash0"
+    block.token_count = BLOCK_SIZE
+    block.ref_count = 2
+    block_table = BlockTable(
+        request_id="req-001",
+        block_ids=[block.block_id],
+        num_tokens=BLOCK_SIZE,
+    )
+
+    kv_slice = (
+        mx.ones((1, 2, BLOCK_SIZE, 8)),
+        mx.ones((1, 2, BLOCK_SIZE, 8)),
+    )
+    rotating_real = (
+        mx.ones((1, 2, WINDOW, 8)),
+        mx.ones((1, 2, WINDOW, 8)),
+    )
+    metadata = {
+        "model_name": "test-model",
+        "num_layers": 2,
+        "layer_cache_types": ["KVCache", "PrefillReadyRotatingKVCache"],
+        "layer_meta_states": [
+            (str(BLOCK_SIZE),),
+            ("0", str(WINDOW), str(BLOCK_SIZE), str(WINDOW)),
+        ],
+    }
+    mock_ssd.load_block_with_metadata.return_value = (
+        [kv_slice, rotating_real],
+        metadata,
+    )
+
+    result = cache.reconstruct_cache(block_table)
+
+    assert result is not None
+    assert isinstance(result[1], PrefillReadyRotatingKVCache)
+    assert result[1].max_size == WINDOW
+    assert result[1].offset == BLOCK_SIZE
+
+
+def test_prefill_ready_rotating_name_detects_window_padding():
+    paged_cache = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="test-model",
+        initial_blocks=100,
+    )
+    mock_ssd = MagicMock()
+    cache = BlockAwarePrefixCache(
+        model=MockModel(num_layers=2),
+        paged_cache_manager=paged_cache,
+        paged_ssd_cache_manager=mock_ssd,
+    )
+    block = paged_cache.allocate_block()
+    block.block_hash = b"hash0"
+
+    mock_ssd.load_block_with_metadata.return_value = (
+        None,
+        {
+            "layer_cache_types": ["KVCache", "PrefillReadyRotatingKVCache"],
+            "layer_meta_states": [
+                (str(BLOCK_SIZE),),
+                ("0", str(WINDOW), str(BLOCK_SIZE), str(WINDOW)),
+            ],
+        },
+    )
+
+    result = cache._detect_window_padding_from_blocks([block.block_id])
+
+    assert result is not None
+    assert result.has_rotating_layers()
+    assert result.get_max_window_size() == WINDOW
 
 
 def test_registry_rotating_family():
