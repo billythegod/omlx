@@ -220,6 +220,18 @@ class BlockAwarePrefixCache(CacheManager):
         except Exception as e:
             logger.debug(f"Failed to forget incompatible SSD block: {e}")
 
+    @staticmethod
+    def _canonical_layer_cache_types(
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> list[str] | tuple[str, ...] | None:
+        """Normalize wrapper class names for metadata compatibility checks."""
+        if layer_cache_types is None:
+            return None
+        return [
+            "ArraysCache" if cache_type == "SizedArraysCache" else cache_type
+            for cache_type in layer_cache_types
+        ]
+
     def _detect_window_padding_from_blocks(
         self,
         block_ids: list[int],
@@ -1703,7 +1715,8 @@ class BlockAwarePrefixCache(CacheManager):
                         layer_cache_types = block_layer_cache_types
                     elif (
                         block_layer_cache_types is not None
-                        and block_layer_cache_types != layer_cache_types
+                        and self._canonical_layer_cache_types(block_layer_cache_types)
+                        != self._canonical_layer_cache_types(layer_cache_types)
                     ):
                         logger.warning(
                             "Cache layer type mismatch at block %s: got %s, "

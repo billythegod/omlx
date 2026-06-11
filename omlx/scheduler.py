@@ -2250,6 +2250,8 @@ class Scheduler:
                 return True
             if isinstance(c, ArraysCache):
                 return True
+            if type(c).__name__ == "SizedArraysCache":
+                return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
             return False
