@@ -34,16 +34,18 @@ class Omlx < Formula
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
 
-    # Build Rust-based packages from source with headerpad to prevent
-    # Homebrew dylib ID fixup failure (Mach-O header too small for absolute paths).
-    # tokenizers is excluded: its wheel ships a stable-ABI .abi3.so that does
-    # not need Homebrew's dylib ID rewrite, and building from source fails on
-    # macOS 15+ due to PyO3 linker errors (missing Python symbols at link time).
+    # Build native extensions from source with headerpad so Homebrew can
+    # rewrite Mach-O install names to absolute Cellar/opt paths. Rust/maturin
+    # extension builds (cohere_melody) need the linker flag via RUSTFLAGS;
+    # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+    ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
-    system libexec/"bin/pip", "install", "--no-binary", "pydantic-core,rpds-py,tiktoken", install_spec
+    system libexec/"bin/pip", "install",
+           "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
+           install_spec
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
