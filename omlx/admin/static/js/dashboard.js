@@ -56,6 +56,11 @@
         'reasoning_effort',
         'preserve_thinking',
     ]);
+    const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
+        'gemma4_assistant',
+        'gemma4_unified_assistant',
+        'qwen3_5_mtp',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
@@ -1296,6 +1301,64 @@
 
             isDiffusionUnsupportedCtKwarg(key) {
                 return DIFFUSION_UNSUPPORTED_CT_KWARGS.has(key);
+            },
+
+            draftModelSearchText(model) {
+                return [
+                    model?.id,
+                    model?.name,
+                    model?.model_path,
+                    model?.source_repo_id,
+                    model?.config_model_type,
+                ].filter(Boolean).join(' ').toLowerCase();
+            },
+
+            isDraftModelBaseCandidate(model) {
+                if (!model || model.virtual) return false;
+                if (model.id === this.selectedModel?.id) return false;
+                return model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type;
+            },
+
+            isDflashDraftModel(model) {
+                return /(^|[-_/\s])dflash($|[-_/\s])/i.test(this.draftModelSearchText(model));
+            },
+
+            isVlmMtpDraftModel(model) {
+                const configType = String(model?.config_model_type || '').toLowerCase();
+                if (configType) {
+                    return VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType);
+                }
+                return /assistant|(^|[-_/\s])mtp($|[-_/\s])/i.test(this.draftModelSearchText(model));
+            },
+
+            isSpecPrefillDraftModel(model) {
+                const text = this.draftModelSearchText(model);
+                return !this.isDflashDraftModel(model)
+                    && !this.isVlmMtpDraftModel(model)
+                    && !/(^|[-_/\s])mtp($|[-_/\s])/i.test(text);
+            },
+
+            draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
+                const base = (this.models || []).filter((model) => (
+                    this.isDraftModelBaseCandidate(model)
+                ));
+                const filtered = base.filter(filterFn);
+                return (filtered.length > 0 || !fallbackToBase) ? filtered : base;
+            },
+
+            specPrefillDraftModelCandidates() {
+                return this.draftModelCandidates((model) => this.isSpecPrefillDraftModel(model));
+            },
+
+            dflashDraftModelCandidates() {
+                return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
+            },
+
+            vlmMtpDraftModelCandidates() {
+                return this.draftModelCandidates(
+                    (model) => this.isVlmMtpDraftModel(model),
+                    { fallbackToBase: false },
+                );
             },
 
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
