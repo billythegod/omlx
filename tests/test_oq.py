@@ -559,6 +559,36 @@ class TestResolveOutputName:
         )
 
 
+class TestOqDtypeModelSupport:
+    def test_rejects_deepseek_v4_float16(self):
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            _validate_oq_dtype_for_model({"model_type": "deepseek_v4"}, "float16")
+
+    def test_rejects_deepseek_v4_architecture_float16(self):
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            _validate_oq_dtype_for_model(
+                {"architectures": ["DeepseekV4ForCausalLM"]}, "float16"
+            )
+
+    def test_allows_deepseek_v4_bfloat16(self):
+        _validate_oq_dtype_for_model({"model_type": "deepseek_v4"}, "bfloat16")
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_streaming_rejects_before_output_dir_is_created(self, tmp_path):
+        src = tmp_path / "DeepSeek-V4-Flash"
+        src.mkdir()
+        (src / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4"}),
+            encoding="utf-8",
+        )
+
+        out = tmp_path / "DeepSeek-V4-Flash-oQ4-fp16"
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            quantize_oq_streaming(str(src), str(out), oq_level=4, dtype="float16")
+
+        assert not out.exists()
+
+
 class TestShouldSkipTensor:
     def test_default_skips_mtp(self):
         from omlx.oq import _should_skip_tensor

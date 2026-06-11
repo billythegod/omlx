@@ -2756,7 +2756,8 @@ def quantize_oq_streaming(
         text_only: Skip vision encoder weights for VLM models.
         dtype: Target fp dtype for non-quantized weights and quant scales/biases.
             Must be "bfloat16" (default) or "float16". float16 yields ~20%
-            faster prefill on M1/M2 Apple Silicon (native fp16 support).
+            faster prefill on M1/M2 Apple Silicon (native fp16 support), but
+            is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
             the Native MTP toggle works after quantization. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
@@ -2790,6 +2791,7 @@ def quantize_oq_streaming(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    _validate_oq_dtype_for_model(config, dtype)
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
     output.mkdir(parents=True, exist_ok=True)
