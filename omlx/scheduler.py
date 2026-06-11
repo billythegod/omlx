@@ -3351,6 +3351,21 @@ class Scheduler:
                 state.request, state.cache, total_tokens
             )
 
+    def _finalize_chunked_prefill_cache_for_insert(
+        self, request: "Request", prompt_cache: list[Any] | None
+    ) -> None:
+        """Mirror external prefill's post-prefill cache epilogue."""
+        if not prompt_cache or self._turboquant_kv_bits is None:
+            return
+        if not self._turboquant_eligible(prompt_cache):
+            return
+
+        self._apply_turboquant_kv_convert(prompt_cache)
+        if getattr(request, "cached_tokens", 0) > 0:
+            with mx.stream(self._stream):
+                _materialize_cache_storage(prompt_cache)
+        _sync_and_clear_cache(self._stream)
+
     def _insert_prefilled_request(
         self,
         request: "Request",
@@ -3366,6 +3381,8 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
+        self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+
         if request.sampling_params.seed is not None:
             mx.random.seed(request.sampling_params.seed)
 

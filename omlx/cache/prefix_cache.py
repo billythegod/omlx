@@ -190,14 +190,30 @@ class BlockAwarePrefixCache(CacheManager):
         if paged_ssd_cache_manager is not None:
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
-    def _forget_incompatible_ssd_block(self, block_hash: bytes | None) -> None:
+    def _forget_incompatible_ssd_block(
+        self,
+        block_hash: bytes | None,
+        block_id: int | None = None,
+    ) -> None:
         """Remove an incompatible block from this manager without unlinking it.
 
         The SSD cache directory can be shared by multiple loaded models. A
         block that is stale for this prefix cache may still be valid for
         another model, so mismatch handling must clear local indexes only.
         """
-        if self.paged_ssd_cache is None or block_hash is None:
+        if block_hash is None:
+            return
+        try:
+            if block_id is None:
+                block = self.paged_cache.cached_block_hash_to_block.get_block(
+                    block_hash
+                )
+                block_id = block.block_id if block is not None else None
+            if block_id is not None:
+                self.paged_cache.cached_block_hash_to_block.pop(block_hash, block_id)
+        except Exception as e:
+            logger.debug(f"Failed to forget incompatible paged block: {e}")
+        if self.paged_ssd_cache is None:
             return
         try:
             self.paged_ssd_cache.forget_block(block_hash)
@@ -1682,8 +1698,25 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # Extract type info from block metadata
                 if block_metadata:
+                    block_layer_cache_types = block_metadata.get("layer_cache_types")
                     if layer_cache_types is None:
-                        layer_cache_types = block_metadata.get("layer_cache_types")
+                        layer_cache_types = block_layer_cache_types
+                    elif (
+                        block_layer_cache_types is not None
+                        and block_layer_cache_types != layer_cache_types
+                    ):
+                        logger.warning(
+                            "Cache layer type mismatch at block %s: got %s, "
+                            "expected %s. Truncating cached prefix before this "
+                            "block.",
+                            block_id,
+                            block_layer_cache_types,
+                            layer_cache_types,
+                        )
+                        self._forget_incompatible_ssd_block(
+                            block.block_hash, block.block_id
+                        )
+                        break
 
                     # Track meta_states from first and last blocks
                     # Non-sliceable caches (RotatingKVCache) need last block's meta_state
