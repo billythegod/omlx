@@ -1312,6 +1312,16 @@ async def _ensure_tokenizer_for_system_probe(
     await engine.start()
 
 
+def _unsupported_mid_system_policy() -> str:
+    settings = _server_state.global_settings
+    preserve_cache = True
+    if settings is not None:
+        preserve_cache = bool(
+            getattr(settings.server, "preserve_mid_system_cache", True)
+        )
+    return "user_note_safe" if preserve_cache else "strict"
+
+
 def _format_generation_speed_for_log(
     output,
     tokens_per_sec: float,
@@ -3010,6 +3020,7 @@ async def create_chat_completion(
         chat_template_kwargs=merged_ct_kwargs or None,
         is_partial=is_partial,
         merge_consecutive_roles=merge_system_fallback_roles,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
     )
     try:
         num_prompt_tokens = engine.count_chat_tokens(
@@ -4809,6 +4820,7 @@ async def create_anthropic_message(
         chat_template_kwargs=merged_ct_kwargs or None,
         is_partial=is_partial,
         merge_consecutive_roles=merge_system_fallback_roles,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
     )
 
     # Validate context window before sending to model
@@ -5184,6 +5196,7 @@ async def create_response(
         chat_template_kwargs=merged_ct_kwargs or None,
         is_partial=False,
         merge_consecutive_roles=True,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
     )
 
     # Validate context window

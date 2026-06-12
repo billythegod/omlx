@@ -393,19 +393,23 @@ def _system_content_as_text(content: Any) -> str:
     return content if isinstance(content, str) else str(content)
 
 
+def _is_system_role(role: Any) -> bool:
+    return role in {"system", "developer"}
+
+
 def _merge_consecutive_system_messages(messages: list[dict]) -> list[dict]:
     """Merge adjacent system messages in-place without moving their position."""
     merged: list[dict] = []
     i = 0
     while i < len(messages):
         msg = messages[i]
-        if msg.get("role") != "system":
+        if not _is_system_role(msg.get("role")):
             merged.append(msg)
             i += 1
             continue
 
         parts: list[str] = []
-        while i < len(messages) and messages[i].get("role") == "system":
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
             content = messages[i].get("content", "")
             if content:
                 text = _system_content_as_text(content)
@@ -429,13 +433,13 @@ def _mid_system_placement_kinds(messages: list[dict]) -> set[str] | None:
     i = 0
     while i < len(messages):
         role = messages[i].get("role")
-        if role != "system":
+        if not _is_system_role(role):
             seen_non_system = True
             i += 1
             continue
 
         start = i
-        while i < len(messages) and messages[i].get("role") == "system":
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
             i += 1
 
         if not seen_non_system:
@@ -459,12 +463,153 @@ def has_nonleading_system_message(messages: list[dict]) -> bool:
     """Return True when a system message appears after a non-system turn."""
     seen_non_system = False
     for msg in messages:
-        if msg.get("role") == "system":
+        if _is_system_role(msg.get("role")):
             if seen_non_system:
                 return True
         else:
             seen_non_system = True
     return False
+
+
+def _is_text_only_content_list(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            return False
+        if part.get("type", "text") != "text":
+            return False
+        text = part.get("text", "")
+        if text is not None and not isinstance(text, str):
+            return False
+    return True
+
+
+def _is_safe_user_note_target(msg: dict | None) -> bool:
+    if not msg or msg.get("role") != "user":
+        return False
+    if msg.get(_PRESERVE_BOUNDARY_KEY):
+        return False
+    if msg.get("tool_calls") or msg.get("tool_call_id") or msg.get("tool_responses"):
+        return False
+    content = msg.get("content", "")
+    return (
+        content is None
+        or isinstance(content, str)
+        or _is_text_only_content_list(content)
+    )
+
+
+def _message_has_tool_calls(msg: dict | None) -> bool:
+    return bool(msg and msg.get("role") == "assistant" and msg.get("tool_calls"))
+
+
+def _format_system_note(parts: list[str]) -> str:
+    return "[System note]\n" + "\n\n".join(parts) + "\n[/System note]"
+
+
+def _merge_note_text(existing: str, note: str, *, placement: str) -> str:
+    if not existing:
+        return note
+    if placement == "prepend":
+        return f"{note}\n\n{existing}"
+    return f"{existing}\n\n{note}"
+
+
+def _rewrite_user_content_with_note(
+    msg: dict,
+    note: str,
+    *,
+    placement: str,
+) -> dict:
+    rewritten = dict(msg)
+    content = rewritten.get("content", "")
+    if isinstance(content, list):
+        parts = [dict(part) for part in content]
+        if not parts:
+            rewritten["content"] = [{"type": "text", "text": note}]
+            return rewritten
+        index = 0 if placement == "prepend" else len(parts) - 1
+        existing = parts[index].get("text") or ""
+        parts[index]["text"] = _merge_note_text(
+            existing,
+            note,
+            placement=placement,
+        )
+        rewritten["content"] = parts
+        return rewritten
+
+    existing = content if isinstance(content, str) else ""
+    rewritten["content"] = _merge_note_text(existing, note, placement=placement)
+    return rewritten
+
+
+def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
+    """Move unsupported non-leading system runs into adjacent safe user text.
+
+    This keeps the native chat template/tool rendering path intact while making
+    volatile tail notes cache-friendly. It deliberately refuses tool-call
+    boundaries and multimodal user content, where changing roles is too risky.
+    """
+    rewritten: list[dict] = []
+    seen_non_system = False
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+        if not _is_system_role(msg.get("role")):
+            rewritten.append(msg)
+            seen_non_system = True
+            i += 1
+            continue
+
+        start = i
+        parts: list[str] = []
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
+            content = messages[i].get("content", "")
+            if content:
+                text = _system_content_as_text(content)
+                if text:
+                    parts.append(text)
+            i += 1
+
+        if not seen_non_system:
+            rewritten.extend(messages[start:i])
+            continue
+        if not parts:
+            continue
+
+        note = _format_system_note(parts)
+        next_msg = messages[i] if i < len(messages) else None
+        next_role = next_msg.get("role") if next_msg is not None else None
+
+        if _is_safe_user_note_target(rewritten[-1] if rewritten else None) and (
+            next_msg is None or next_role == "assistant"
+        ):
+            rewritten[-1] = _rewrite_user_content_with_note(
+                rewritten[-1],
+                note,
+                placement="append",
+            )
+            continue
+
+        if _is_safe_user_note_target(next_msg):
+            if _message_has_tool_calls(rewritten[-1] if rewritten else None):
+                return None
+            rewritten.append(
+                _rewrite_user_content_with_note(
+                    next_msg,
+                    note,
+                    placement="prepend",
+                )
+            )
+            seen_non_system = True
+            i += 1
+            continue
+
+        return None
+
+    return rewritten
 
 
 def prepare_system_messages_for_template(
@@ -475,6 +620,7 @@ def prepare_system_messages_for_template(
     chat_template_kwargs: dict[str, Any] | None = None,
     is_partial: bool = False,
     merge_consecutive_roles: bool = True,
+    unsupported_mid_system_policy: str = "strict",
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
 
@@ -482,20 +628,32 @@ def prepare_system_messages_for_template(
     all system messages are consolidated at the front.
     """
     messages = [dict(msg) for msg in messages]
-    placements = _mid_system_placement_kinds(messages)
-    if not placements:
-        if placements is None:
-            prepared = _consolidate_system_messages(messages)
-            if merge_consecutive_roles:
-                prepared = _merge_consecutive_roles(prepared)
-            return prepared
-        return _merge_consecutive_system_messages(messages)
+    if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
+        unsupported_mid_system_policy = "strict"
 
-    if is_partial:
+    def strict_fallback() -> list[dict]:
         prepared = _consolidate_system_messages(messages)
         if merge_consecutive_roles:
             prepared = _merge_consecutive_roles(prepared)
         return prepared
+
+    def unsupported_fallback() -> list[dict]:
+        if unsupported_mid_system_policy == "user_note_safe":
+            prepared = _downgrade_mid_system_to_user_notes(messages)
+            if prepared is not None:
+                if merge_consecutive_roles:
+                    prepared = _merge_consecutive_roles(prepared)
+                return prepared
+        return strict_fallback()
+
+    placements = _mid_system_placement_kinds(messages)
+    if not placements:
+        if placements is None:
+            return unsupported_fallback()
+        return _merge_consecutive_system_messages(messages)
+
+    if is_partial:
+        return strict_fallback()
 
     can_preserve = all(
         chat_template_preserves_mid_system(
@@ -510,10 +668,7 @@ def prepare_system_messages_for_template(
     if can_preserve:
         return _merge_consecutive_system_messages(messages)
 
-    prepared = _consolidate_system_messages(messages)
-    if merge_consecutive_roles:
-        prepared = _merge_consecutive_roles(prepared)
-    return prepared
+    return unsupported_fallback()
 
 
 def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
@@ -551,7 +706,7 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     system_parts: list[str] = []
     non_system: list[dict] = []
     for msg in messages:
-        if msg.get("role") == "system":
+        if _is_system_role(msg.get("role")):
             content = msg.get("content", "")
             if content:
                 if isinstance(content, list):

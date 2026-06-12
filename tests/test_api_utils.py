@@ -2211,6 +2211,122 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert [m["role"] for m in result] == ["system", "user"]
 
+    def test_user_note_policy_appends_tail_system_to_user(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["user"]
+        assert result[0]["content"] == (
+            "Hello\n\n[System note]\nPlan mode\n[/System note]"
+        )
+
+    def test_user_note_policy_prepends_system_before_next_user(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "OK"},
+            {"role": "system", "content": "Plan mode"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["user", "assistant", "user"]
+        assert result[2]["content"] == (
+            "[System note]\nPlan mode\n[/System note]\n\nContinue"
+        )
+
+    def test_user_note_policy_keeps_native_tool_history_when_safe(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "Answer"},
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+        ]
+        assert result[3]["content"] == (
+            "Answer\n\n[System note]\nRuntime tip\n[/System note]"
+        )
+
+    def test_user_note_policy_refuses_tool_call_boundary(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["system", "user", "assistant", "tool"]
+
+    def test_user_note_policy_refuses_multimodal_user_target(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png,..."}},
+                ],
+            },
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+        assert result[0]["content"] == "Runtime tip"
+
     def test_falls_back_for_unsupported_mid_system_placement(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2235,6 +2351,7 @@ class TestPrepareSystemMessagesForTemplate:
             messages,
             self.PreserveTokenizer(),
             is_partial=True,
+            unsupported_mid_system_policy="user_note_safe",
         )
 
         assert [m["role"] for m in result] == ["system", "user"]
