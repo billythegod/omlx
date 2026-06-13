@@ -407,6 +407,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        hot_cache_write_back: bool = True,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -427,6 +428,8 @@ class BlockAwarePrefixCache(CacheManager):
             boundary_snapshots: Optional mapping of token_count -> extracted cache
                 states for intermediate block boundaries. Used to store per-block
                 ArraysCache state instead of placeholders in hybrid models.
+            hot_cache_write_back: When False, SSD-backed hot cache is bypassed
+                for newly stored dirty blocks.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -688,14 +691,25 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
-                    saved = self.paged_ssd_cache.save_block(
-                        block_hash=block.block_hash,
-                        cache_data=block_kv_data,
-                        token_count=block.token_count,
-                        model_name=self.paged_cache.model_name,
-                        layer_cache_types=layer_cache_types,
-                        layer_meta_states=block_meta,
-                    )
+                    if hot_cache_write_back:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                        )
+                    else:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                            hot_cache_write_back=False,
+                        )
                     if saved:
                         blocks_saved_to_ssd += 1
                         if is_last_block:
@@ -1582,6 +1596,7 @@ class BlockAwarePrefixCache(CacheManager):
     def reconstruct_cache(
         self,
         block_table: BlockTable,
+        promote_to_hot_cache: bool = True,
     ) -> list[Any] | None:
         """
         Reconstruct cache objects from paged SSD-stored block data.
@@ -1600,7 +1615,9 @@ class BlockAwarePrefixCache(CacheManager):
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from.
-                        Will be modified in-place if partial reconstruction.
+                Will be modified in-place if partial reconstruction.
+            promote_to_hot_cache: When False, SSD-loaded blocks are not retained
+                in hot cache after active KV reconstruction.
 
         Returns:
             List of reconstructed cache objects (one per layer),
@@ -1671,9 +1688,19 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
-                block_data, block_metadata = (
-                    self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
-                )
+                if promote_to_hot_cache:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash
+                        )
+                    )
+                else:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash,
+                            promote_to_hot_cache=False,
+                        )
+                    )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "

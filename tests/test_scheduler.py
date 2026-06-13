@@ -347,6 +347,30 @@ class TestSchedulerInitialization:
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""
 
+    def _scheduler_with_mock_block_cache(
+        self,
+        mock_model,
+        mock_tokenizer,
+        *,
+        hot_cache_max_size: int = 1024,
+        hot_cache_only: bool = False,
+    ):
+        config = SchedulerConfig(
+            hot_cache_max_size=hot_cache_max_size,
+            hot_cache_only=hot_cache_only,
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=config,
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_ssd_cache_manager = MagicMock()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        return scheduler
+
     def test_add_request_with_string_prompt(self, mock_model, mock_tokenizer):
         """Test adding a request with string prompt."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -524,6 +548,153 @@ class TestSchedulerAddRequest:
         assert request.prompt_cache is None
         scheduler.paged_cache_manager.delete_block_table.assert_called_once_with(
             "req-rotating"
+        )
+
+    def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
+        self, mock_model, mock_tokenizer
+    ):
+        """Memory pressure should bypass optional SSD hot-cache RAM copies."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=100)
+
+        block_table = BlockTable(
+            request_id="req-pressure",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-pressure",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table,
+            promote_to_hot_cache=False,
+        )
+        scheduler._current_usage_bytes.assert_called_once_with()
+
+    def test_add_request_below_pressure_keeps_hot_cache_preload_and_promotion(
+        self, mock_model, mock_tokenizer
+    ):
+        """Normal memory state should preserve existing hot-cache acceleration."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=99)
+
+        block_table = BlockTable(
+            request_id="req-normal",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-normal",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table
+        )
+
+    def test_add_request_hot_cache_only_ignores_pressure_bypass(
+        self, mock_model, mock_tokenizer
+    ):
+        """hot_cache_only mode must keep RAM hot-cache behavior unchanged."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+            hot_cache_only=True,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=100)
+
+        block_table = BlockTable(
+            request_id="req-hot-only",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-hot-only",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table
+        )
+        scheduler._current_usage_bytes.assert_not_called()
+
+    def test_async_store_cache_worker_forwards_hot_cache_write_back_flag(
+        self, mock_model, mock_tokenizer
+    ):
+        """The async store worker must pass pressure mode to store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = None
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_cache_manager.get_block_table.return_value = None
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._async_store_cache_worker(
+                "req-store",
+                [1, 2, 3, 4],
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                hot_cache_write_back=False,
+            )
+
+        scheduler.block_aware_cache.store_cache.assert_called_once_with(
+            "req-store",
+            [1, 2, 3, 4],
+            [],
+            model_cache_config=None,
+            boundary_snapshots=None,
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+            hot_cache_write_back=False,
         )
 
 

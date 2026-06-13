@@ -1169,6 +1169,8 @@ class PagedSSDCacheManager(CacheManager):
         #    Must precede _index.add so load_block never sees an index hit
         #    for a block that has no file and no buffer entry yet.
         with self._pending_write_hashes_lock:
+            if block_hash in self._pending_write_buffers:
+                return True
             self._pending_write_buffers[block_hash] = entry
             self._pending_write_hashes.add(block_hash)
 
@@ -1625,6 +1627,7 @@ class PagedSSDCacheManager(CacheManager):
         model_name: str = "",
         layer_cache_types: list[str] | None = None,
         layer_meta_states: list[tuple] | None = None,
+        hot_cache_write_back: bool = True,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -1644,6 +1647,8 @@ class PagedSSDCacheManager(CacheManager):
                 (e.g., ["KVCache", "ArraysCache", "KVCache", "CacheList"]).
             layer_meta_states: Optional list of meta_state tuples per layer
                 for reconstruction (e.g., [(offset,), (keep, max_size, offset, _idx)]).
+            hot_cache_write_back: When False in SSD-backed hot-cache mode, enqueue
+                through the SSD writer path instead of retaining a hot-cache copy.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -1669,10 +1674,26 @@ class PagedSSDCacheManager(CacheManager):
             return True
 
         # Also check hot cache / pending writes buffer
+        hot_entry = None
         with self._hot_cache_lock:
             if block_hash in self._hot_cache:
+                hot_entry = self._hot_cache[block_hash]
+
+        if hot_entry is not None:
+            if hot_cache_write_back or self._hot_cache_only:
                 self._stats["hits"] += 1
                 return True
+            if not hot_entry.get("dirty", True):
+                self._stats["hits"] += 1
+                return True
+            # Pressure write-through for an already-dirty hot-cache entry:
+            # use the same pending-buffer / SSD-writer path as hot-cache
+            # eviction, then drop the long-lived hot-cache reference.
+            if self._enqueue_ssd_write(block_hash, hot_entry):
+                self._hot_cache_remove(block_hash)
+                self._stats["hits"] += 1
+                return True
+            return False
 
         file_path = self._get_file_path(block_hash)
 
@@ -1897,7 +1918,9 @@ class PagedSSDCacheManager(CacheManager):
                 "dirty": True,
             }
 
-            if self._hot_cache_enabled:
+            if self._hot_cache_enabled and (
+                hot_cache_write_back or self._hot_cache_only
+            ):
                 # Write-back mode: store only in hot cache, no SSD index entry.
                 # SSD index entry is created later when block is evicted or
                 # flushed to SSD (in _enqueue_ssd_write).
@@ -1908,6 +1931,19 @@ class PagedSSDCacheManager(CacheManager):
             if self._hot_cache_only:
                 # Hot cache disabled but hot_cache_only set: block is not retained.
                 return False
+
+            if self._hot_cache_enabled and not hot_cache_write_back:
+                # Pressure write-through: keep the dirty-block durability path
+                # but avoid retaining this block as a hot-cache entry.
+                ok = self._enqueue_ssd_write(block_hash, cache_entry)
+                if ok:
+                    self._stats["saves"] += 1
+                    logger.debug(
+                        f"Enqueued block for SSD write-through: "
+                        f"{block_hash.hex()[:16]}..., "
+                        f"size={format_bytes(estimated_size)}"
+                    )
+                return ok
 
             # Evict LRU blocks to make room for the new block. Done here
             # (post-tensor-build) so the actual block size is known and the
@@ -2174,10 +2210,7 @@ class PagedSSDCacheManager(CacheManager):
             arrays[name] = _restore_tensor_from_bytes(raw, dtype_str, shape)
         return arrays
 
-    def load_block(
-        self,
-        block_hash: bytes,
-    ) -> list[Any] | None:
+    def load_block(self, block_hash: bytes) -> list[Any] | None:
         """
         Load a KV cache block from SSD storage.
 
@@ -2335,6 +2368,7 @@ class PagedSSDCacheManager(CacheManager):
     def load_block_with_metadata(
         self,
         block_hash: bytes,
+        promote_to_hot_cache: bool = True,
     ) -> tuple[list[Any] | None, dict[str, Any] | None]:
         """
         Load a KV cache block with its metadata from SSD storage.
@@ -2344,6 +2378,8 @@ class PagedSSDCacheManager(CacheManager):
 
         Args:
             block_hash: Content hash for the block.
+            promote_to_hot_cache: When False, do not retain SSD-loaded data in
+                the hot cache after reconstructing it for the active request.
 
         Returns:
             Tuple of (cache_data, metadata_dict) where:
@@ -2511,7 +2547,7 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["hits"] += 1
 
             # Promote to hot cache for faster access next time
-            if self._hot_cache_enabled:
+            if self._hot_cache_enabled and promote_to_hot_cache:
                 self._promote_to_hot_cache(
                     block_hash, arrays, file_metadata, block_metadata
                 )

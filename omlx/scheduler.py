@@ -1634,6 +1634,7 @@ class Scheduler:
         extra_keys: tuple[Any, ...] | None,
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+        hot_cache_write_back: bool = True,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -1678,16 +1679,29 @@ class Scheduler:
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
                     _safe_sync_stream(self._stream)
-                block_table = self.block_aware_cache.store_cache(
-                    request_id,
-                    token_sequence_to_store,
-                    cache_to_store,
-                    model_cache_config=model_cache_config,
-                    boundary_snapshots=intermediate_snapshots,
-                    extra_keys=extra_keys,
-                    extra_key_token_start=extra_key_token_start,
-                    extra_key_ranges=extra_key_ranges,
-                )
+                if hot_cache_write_back:
+                    block_table = self.block_aware_cache.store_cache(
+                        request_id,
+                        token_sequence_to_store,
+                        cache_to_store,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=intermediate_snapshots,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                    )
+                else:
+                    block_table = self.block_aware_cache.store_cache(
+                        request_id,
+                        token_sequence_to_store,
+                        cache_to_store,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=intermediate_snapshots,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                        hot_cache_write_back=False,
+                    )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -3149,6 +3163,28 @@ class Scheduler:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
+
+    def _bypass_hot_cache_under_pressure(self) -> bool:
+        """Return True when SSD-backed hot-cache acceleration should be bypassed."""
+        if not self._prefill_memory_guard:
+            return False
+        if self._memory_limit_bytes <= 0:
+            return False
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        if getattr(config, "hot_cache_only", False):
+            return False
+        if int(getattr(config, "hot_cache_max_size", 0) or 0) <= 0:
+            return False
+        if getattr(self, "paged_ssd_cache_manager", None) is None:
+            return False
+        try:
+            current = self._current_usage_bytes()
+        except Exception:
+            logger.debug("Failed to sample memory for hot-cache pressure bypass")
+            return False
+        return current >= self._memory_limit_bytes
 
     def _record_chunk_transient(
         self,
@@ -4969,12 +5005,27 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
-                self.block_aware_cache.preload_blocks(block_table)
+                bypass_hot_cache = self._bypass_hot_cache_under_pressure()
+                if bypass_hot_cache:
+                    logger.info(
+                        "Skipping hot-cache preload for %s under memory pressure",
+                        request.request_id,
+                    )
+                else:
+                    self.block_aware_cache.preload_blocks(block_table)
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
                 original_tokens = block_table.num_tokens
-                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
+                if bypass_hot_cache:
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table,
+                        promote_to_hot_cache=False,
+                    )
+                else:
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table
+                    )
                 if reconstructed:
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
@@ -7472,6 +7523,16 @@ class Scheduler:
                                         # completion fence moves onto this thread.
                                         mx.eval(*pre_eval_arrays)
 
+                            hot_cache_write_back = (
+                                not self._bypass_hot_cache_under_pressure()
+                            )
+                            if not hot_cache_write_back:
+                                logger.info(
+                                    "Using SSD write-through for %s "
+                                    "under memory pressure",
+                                    request_id,
+                                )
+
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
@@ -7498,6 +7559,7 @@ class Scheduler:
                                         request.vlm_extra_keys_for_cache,
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
+                                        hot_cache_write_back,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -7515,6 +7577,7 @@ class Scheduler:
                                     request.vlm_extra_keys_for_cache,
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
+                                    hot_cache_write_back,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

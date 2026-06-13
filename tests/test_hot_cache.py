@@ -355,6 +355,81 @@ class TestHotCachePromotion:
         finally:
             mgr.close()
 
+    def test_ssd_load_can_skip_hot_cache_promotion(self, tmp_path):
+        """SSD loads can reconstruct a request without retaining a hot RAM copy."""
+        mgr_cold = PagedSSDCacheManager(
+            cache_dir=tmp_path / "skip_promote_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+
+        block_hash = b"skip_promote_blk_1"
+        cache_data = self._make_cache_data()
+        mgr_cold.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test",
+            layer_cache_types=["KVCache"] * 4,
+        )
+        mgr_cold.close()
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "skip_promote_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+
+        try:
+            loaded, metadata = mgr.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
+
+            assert loaded is not None
+            assert metadata is not None
+            assert mgr._hot_cache_get(block_hash) is None
+
+            loaded_again, _ = mgr.load_block_with_metadata(block_hash)
+            assert loaded_again is not None
+            assert mgr._hot_cache_get(block_hash) is not None
+        finally:
+            mgr.close()
+
+    def test_write_through_save_bypasses_hot_cache_retention(self, tmp_path):
+        """Pressure write-through keeps SSD durability without hot-cache RAM."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "write_through_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+
+        try:
+            block_hash = b"write_through_blk1"
+            cache_data = self._make_cache_data()
+            result = mgr.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=64,
+                model_name="test",
+                layer_cache_types=["KVCache"] * 4,
+                hot_cache_write_back=False,
+            )
+
+            assert result is True
+            assert mgr.has_block(block_hash)
+            assert mgr._hot_cache_get(block_hash) is None
+
+            loaded, metadata = mgr.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
+            assert loaded is not None
+            assert metadata is not None
+            assert mgr._hot_cache_get(block_hash) is None
+        finally:
+            mgr.close()
+
     def test_promotion_does_not_happen_when_disabled(self, tmp_path):
         """No promotion when hot cache is disabled."""
         mgr = PagedSSDCacheManager(
