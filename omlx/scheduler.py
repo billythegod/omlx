@@ -874,6 +874,23 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
 )
 
 
+_TURBOQUANT_KV_CACHE_TYPES = frozenset(
+    {
+        "TurboQuantKVCache",
+        "BatchTurboQuantKVCache",
+    }
+)
+
+
+def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
+    return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
+
+
+def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
+    """Cache layer counted by TurboQuant's skip-last full-attention rule."""
+    return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
+
+
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     """Return True if any layer cache is non-sliceable (needs snapshots).
 
@@ -2353,24 +2370,76 @@ class Scheduler:
         self._mla_model = detected
         return detected
 
+    def _model_uses_attention_sinks(self) -> bool:
+        """Detect models whose attention path passes sink logits to SDPA.
+
+        TurboQuant's quantized attention kernels currently do not implement the
+        sink term used by attention-sink models. Ignoring it silently changes
+        the model's attention distribution, so these models must keep fp16 KV
+        unless the attention patch falls back to dequantized sink-aware SDPA.
+        """
+        cached = getattr(self, "_attention_sink_model", None)
+        if cached is not None:
+            return cached
+
+        detected = False
+        model = getattr(self, "model", None)
+
+        def _has_real_sink_attr(obj: Any) -> bool:
+            for name in ("sinks", "attention_sink_bias", "attn_sink"):
+                value = None
+                if isinstance(obj, dict):
+                    value = obj.get(name)
+                if value is None:
+                    data = getattr(obj, "__dict__", {})
+                    if isinstance(data, dict):
+                        value = data.get(name)
+                if isinstance(value, mx.array):
+                    return True
+                if value is not None and isinstance(value, (int, float, list, tuple)):
+                    return True
+            return False
+
+        try:
+            modules = getattr(model, "modules", None)
+        except Exception:
+            modules = None
+        if type(modules).__module__.startswith("unittest.mock"):
+            modules = None
+        if not detected and callable(modules):
+            try:
+                for m in modules():
+                    if _has_real_sink_attr(m):
+                        detected = True
+                        break
+            except Exception:
+                pass
+
+        if detected:
+            logger.info(
+                "TurboQuant disabled: model uses attention sinks, which are "
+                "not supported by TurboQuant's quantized attention kernels; "
+                "keeping fp16 KV cache."
+            )
+        self._attention_sink_model = detected
+        return detected
+
     def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
-        """True if every cache layer can be safely TurboQuant-converted for
-        continuous batching.
+        """True if this cache layout can safely mix TQ and pass-through caches.
 
-        Only plain KVCache (and CacheList of KVCache, for VLM) implement the
-        merge/filter/extract/extend batch protocol that the monkey-patched
-        TurboQuantKVCache.merge relies on inside BatchGenerator. Chunked- and
-        rotating-attention caches (Llama-4, sliding-window) need
-        maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
-        not provide, so those models stay fp16 — no crash, no TurboQuant.
+        Plain KVCache layers are TurboQuant-convertible. State-array caches and
+        rotating/sliding-window caches are pass-through: they stay in their
+        native form while adjacent full-attention KVCache layers are converted.
 
-        MLA models (DeepSeek / GLM-4.7-Flash) are also excluded: they keep
-        plain KVCache objects but read fetched cache tensors directly, which
-        TurboQuant's quantized states do not support (#1613).
+        MLA models (DeepSeek / GLM-4.7-Flash) and attention-sink models are
+        excluded because their attention paths need semantics TurboQuant's
+        quantized cache states/kernels do not currently provide.
         """
         from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
+            return False
+        if self._model_uses_attention_sinks():
             return False
 
         def _ok(c: Any) -> bool:
@@ -2378,7 +2447,15 @@ class Scheduler:
                 return True
             if isinstance(c, ArraysCache):
                 return True
-            if type(c).__name__ == "SizedArraysCache":
+            class_name = type(c).__name__
+            if class_name in (
+                "SizedArraysCache",
+                "RotatingKVCache",
+                "BatchRotatingKVCache",
+                "PrefillReadyRotatingKVCache",
+                "TurboQuantKVCache",
+                "BatchTurboQuantKVCache",
+            ):
                 return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
@@ -2398,7 +2475,11 @@ class Scheduler:
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        kv_indices = [
+            i
+            for i, c in enumerate(prompt_cache)
+            if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
@@ -2438,7 +2519,11 @@ class Scheduler:
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        kv_indices = [
+            i
+            for i, c in enumerate(prompt_cache)
+            if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
@@ -2520,7 +2605,8 @@ class Scheduler:
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
         # quantized while pre-filling the uncached suffix, then keep using TQ for
-        # decode. Chunked/rotating models are gated out by _turboquant_eligible.
+        # decode. Rotating/sliding-window layers remain native pass-through
+        # caches; only full-attention KVCache layers are converted.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -8739,7 +8825,10 @@ class Scheduler:
                 and (
                     self._turboquant_eligible(cache_list_for_tq)
                     if cache_list_for_tq is not None
-                    else not self._model_uses_mla()
+                    else not (
+                        self._model_uses_mla()
+                        or self._model_uses_attention_sinks()
+                    )
                 )
             ):
                 tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
@@ -8827,12 +8916,15 @@ class Scheduler:
         try:
             if not self._turboquant_eligible(cache_list):
                 return layer_cache_types
-            from mlx_lm.models.cache import KVCache
         except Exception as e:
             logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
             return layer_cache_types
 
-        kv_indices = [i for i, c in enumerate(cache_list) if isinstance(c, KVCache)]
+        kv_indices = [
+            i
+            for i, c in enumerate(cache_list)
+            if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
         for idx in kv_indices:

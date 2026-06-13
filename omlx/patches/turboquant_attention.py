@@ -54,6 +54,22 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            if sinks is not None:
+                # TurboQuant's quantized kernels do not implement attention
+                # sinks. Preserve correctness by falling back to MLX's
+                # sink-aware SDPA over dequantized states.
+                dequantized_keys, dequantized_values = real_cache.dequantize(
+                    keys_state=keys,
+                    values_state=values,
+                )
+                return mx.fast.scaled_dot_product_attention(
+                    queries,
+                    dequantized_keys.astype(queries.dtype),
+                    dequantized_values.astype(queries.dtype),
+                    scale=scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
             if queries.shape[-2] == 1:
                 # Decode (B=1 and B>1). Continuous-batching decode passes a
                 # per-request left-padding array mask; the masked decode_attention
