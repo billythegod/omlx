@@ -1275,6 +1275,8 @@ class Scheduler:
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
+        self._memory_admission_blocked_request_id: str | None = None
+        self._memory_admission_blocked_since: float = 0.0
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -2790,6 +2792,7 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+    _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3163,6 +3166,85 @@ class Scheduler:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
+
+    def get_active_hot_cache_block_hashes(self) -> set[bytes]:
+        """Return hot-cache block hashes owned by active in-flight requests."""
+        manager = getattr(self, "paged_cache_manager", None)
+        if manager is None:
+            return set()
+
+        hashes: set[bytes] = set()
+        active_requests = list(self.running.values()) + list(self.prefilling)
+        for request in active_requests:
+            block_table = getattr(request, "block_table", None)
+            if block_table is None:
+                continue
+            for block_id in getattr(block_table, "block_ids", []) or []:
+                try:
+                    block = manager.blocks[block_id]
+                    block_hash = getattr(block, "block_hash", None)
+                except Exception:
+                    continue
+                if block_hash is not None:
+                    hashes.add(bytes(block_hash))
+        return hashes
+
+    def _clear_memory_admission_blocker(self, request_id: str | None = None) -> None:
+        if (
+            request_id is not None
+            and request_id != self._memory_admission_blocked_request_id
+        ):
+            return
+        self._memory_admission_blocked_request_id = None
+        self._memory_admission_blocked_since = 0.0
+
+    def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
+        """Fail one head-of-line request after persistent memory admission stall."""
+        if not self.waiting:
+            self._clear_memory_admission_blocker()
+            return None
+
+        request = self.waiting[0]
+        request_id = request.request_id
+        now = time.monotonic()
+        if request_id != self._memory_admission_blocked_request_id:
+            self._memory_admission_blocked_request_id = request_id
+            self._memory_admission_blocked_since = now
+            return None
+
+        timeout = getattr(
+            self,
+            "_MEMORY_ADMISSION_STALL_TIMEOUT_S",
+            Scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S,
+        )
+        if now - self._memory_admission_blocked_since < timeout:
+            return None
+
+        stalled_for = now - self._memory_admission_blocked_since
+        self.waiting.popleft()
+        self._release_paged_cache_for_request(request_id)
+        self.requests.pop(request_id, None)
+        get_prefill_tracker().remove(request_id)
+        self._clear_memory_admission_blocker(request_id)
+
+        message = (
+            "Request could not be admitted because memory pressure persisted "
+            f"for {stalled_for:.1f}s ({reason}). Reduce context length, free "
+            "memory, lower hot_cache_max_size, or loosen memory_guard_tier."
+        )
+        logger.warning("Memory admission stalled for %s: %s", request_id, message)
+        return RequestOutput(
+            request_id=request_id,
+            finished=True,
+            finish_reason="error",
+            error=message,
+            error_code="memory_admission_stalled",
+            error_metadata={
+                "request_id": request_id,
+                "reason": reason,
+                "stalled_seconds": int(stalled_for),
+            },
+        )
 
     def _bypass_hot_cache_under_pressure(self) -> bool:
         """Return True when SSD-backed hot-cache acceleration should be bypassed."""
@@ -6425,6 +6507,9 @@ class Scheduler:
                     "Admission paused by memory pressure, %d admitted",
                     admitted,
                 )
+                stalled = self._memory_admission_stall_output("admission_paused")
+                if stalled is not None:
+                    rejected_outputs.append(stalled)
                 break
 
             # Store-cache backpressure: when the post-completion pipeline is
@@ -6448,6 +6533,24 @@ class Scheduler:
                     gate.cap,
                     len(self.running),
                 )
+                memory_related_gate = self._admission_paused
+                if (
+                    not memory_related_gate
+                    and self._prefill_memory_guard
+                    and self._memory_limit_bytes > 0
+                ):
+                    try:
+                        memory_related_gate = (
+                            self._current_usage_bytes() >= self._memory_limit_bytes
+                        )
+                    except Exception:
+                        memory_related_gate = False
+                if memory_related_gate:
+                    stalled = self._memory_admission_stall_output(
+                        "store_cache_backpressure"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
                 break
 
             # Generation memory guard: when requests are already admitted,
@@ -6464,9 +6567,15 @@ class Scheduler:
                         self._memory_limit_bytes,
                         admitted,
                     )
+                    stalled = self._memory_admission_stall_output(
+                        "generation_memory_guard"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
                     break
 
             request = self.waiting.popleft()
+            self._clear_memory_admission_blocker(request.request_id)
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)

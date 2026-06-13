@@ -2890,6 +2890,34 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
+    def test_memory_guard_fails_persistent_admission_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = self._make_request("req-stalled")
+        self._queue_request(scheduler, request)
+        running = self._make_request("req-running")
+        scheduler.running[running.request_id] = running
+        scheduler.requests[running.request_id] = running
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=101)
+        scheduler._memory_admission_blocked_request_id = request.request_id
+        scheduler._memory_admission_blocked_since = 0.0
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "memory_admission_stalled"
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        assert scheduler.running[running.request_id] is running
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):
@@ -3124,9 +3152,7 @@ class TestBatchGeneratorAllTokens:
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert call_kwargs["all_tokens"] == [[]]
 
-    def test_concurrent_inserts_keep_per_request_seed(
-        self, mock_model, mock_tokenizer
-    ):
+    def test_concurrent_inserts_keep_per_request_seed(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         first = Request(
             request_id="req-concurrent-a",

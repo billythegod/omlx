@@ -830,6 +830,45 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def shrink_to(
+        self,
+        target_bytes: int,
+        protected_hashes: set[bytes] | None = None,
+    ) -> int:
+        """Shrink the shared hot cache to ``target_bytes`` by global LRU order.
+
+        Returns the budgeted bytes removed from hot-cache ownership. Dirty
+        evictions are handed back to each owner so the existing SSD write-through
+        path can preserve them.
+        """
+        target_bytes = max(0, int(target_bytes))
+        protected_hashes = protected_hashes or set()
+        victims: list[tuple[Any, bytes, int]] = []
+
+        with self._lock:
+            while self._total_bytes > target_bytes and self._entries:
+                victim_key = None
+                victim = None
+                for key, candidate in self._entries.items():
+                    if candidate.block_hash not in protected_hashes:
+                        victim_key = key
+                        victim = candidate
+                        break
+                if victim_key is None or victim is None:
+                    break
+
+                self._entries.pop(victim_key)
+                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victims.append((victim.owner, victim.block_hash, victim.size_bytes))
+
+        freed = 0
+        for owner, block_hash, size_bytes in victims:
+            evicted = owner._hot_cache_remove(block_hash, update_budget=False)
+            if evicted is not None:
+                freed += size_bytes
+                owner._handle_hot_cache_eviction(block_hash, evicted)
+        return freed
+
     def put(
         self, owner: Any, block_hash: bytes, size_bytes: int
     ) -> list[tuple[Any, bytes]]:
@@ -1883,7 +1922,9 @@ class PagedSSDCacheManager(CacheManager):
             except (TypeError, ValueError):
                 metadata_json_len = 1024
             header_overhead = metadata_json_len + 256 + 128 * len(tensors_raw)
-            estimated_size = sum(len(raw) for raw, _, _ in tensors_raw.values()) + header_overhead
+            estimated_size = (
+                sum(len(raw) for raw, _, _ in tensors_raw.values()) + header_overhead
+            )
 
             now = time.time()
             block_metadata = PagedSSDBlockMetadata(
@@ -2297,9 +2338,7 @@ class PagedSSDCacheManager(CacheManager):
             # mx.load() in a worker thread contested Metal GPU resources
             # with the main inference thread.
             try:
-                arrays, file_metadata = mx.load(
-                    str(file_path), return_metadata=True
-                )
+                arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
             except FileNotFoundError:
                 # Concurrent evictor unlinked the file between the
                 # exists() check above and this load. Treat as a miss
@@ -2889,7 +2928,10 @@ class PagedSSDCacheManager(CacheManager):
         # with a stale timestamp (or vice versa).
         now = time.monotonic()
         with self._lock:
-            if self._disk_usage_cache is None or now - self._disk_usage_cache_time > 30.0:
+            if (
+                self._disk_usage_cache is None
+                or now - self._disk_usage_cache_time > 30.0
+            ):
                 try:
                     self._disk_usage_cache = shutil.disk_usage(self._cache_dir)
                 except OSError as e:
@@ -3067,6 +3109,51 @@ class PagedSSDCacheManager(CacheManager):
         if count:
             logger.info("Cleared %d hot cache entries", count)
         return count
+
+    def shrink_hot_cache_to(
+        self,
+        target_bytes: int,
+        protected_hashes: set[bytes] | None = None,
+    ) -> int:
+        """Shrink this manager's hot cache to ``target_bytes`` by local LRU."""
+        target_bytes = max(0, int(target_bytes))
+        protected_hashes = protected_hashes or set()
+
+        if self._hot_cache_budget is not None:
+            return self._hot_cache_budget.shrink_to(
+                target_bytes, protected_hashes=protected_hashes
+            )
+
+        evicted_entries: list[tuple[bytes, dict, int]] = []
+        with self._hot_cache_lock:
+            while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
+                victim_hash = None
+                for block_hash in self._hot_cache:
+                    if block_hash not in protected_hashes:
+                        victim_hash = block_hash
+                        break
+                if victim_hash is None:
+                    break
+
+                evicted = self._hot_cache.pop(victim_hash)
+                size = self._hot_cache_entry_size(evicted)
+                self._hot_cache_total_bytes = max(0, self._hot_cache_total_bytes - size)
+                evicted_entries.append((victim_hash, evicted, size))
+
+        freed = 0
+        for block_hash, evicted, size in evicted_entries:
+            freed += size
+            self._handle_hot_cache_eviction(block_hash, evicted)
+
+        if freed and self._hot_cache_only:
+            logger.warning(
+                "Shrank hot-cache-only tier by %s; evicted chains are not "
+                "persisted to SSD",
+                format_bytes(freed),
+            )
+        elif freed:
+            logger.info("Shrank hot cache by %s", format_bytes(freed))
+        return freed
 
     def clear(self) -> int:
         """
