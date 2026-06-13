@@ -1119,6 +1119,7 @@ class VLMBatchedEngine(BaseEngine):
                     from mlx_lm import load as mlx_lm_load
 
                     from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
@@ -1140,7 +1141,15 @@ class VLMBatchedEngine(BaseEngine):
                             if custom_loaded is not None:
                                 draft_model, _ = custom_loaded
                             else:
-                                draft_model, _ = mlx_lm_load(specprefill_draft)
+                                draft_tokenizer_config = get_tokenizer_config(
+                                    specprefill_draft,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
+                                draft_model, _ = mlx_lm_load(
+                                    specprefill_draft,
+                                    tokenizer_config=draft_tokenizer_config,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
                             # mx.eval(model.parameters()) and leaves siblings
@@ -3068,12 +3077,8 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..adapter.output_parser import detect_output_parser
 
-            model_config = (
-                {"model_type": self.model_type} if self.model_type else None
-            )
-            factory = detect_output_parser(
-                self._model_name, tokenizer, model_config
-            )
+            model_config = {"model_type": self.model_type} if self.model_type else None
+            factory = detect_output_parser(self._model_name, tokenizer, model_config)
             if factory is not None:
                 session = factory.create_session(tokenizer)
                 if hasattr(session, "process_text"):
@@ -3098,6 +3103,7 @@ class VLMBatchedEngine(BaseEngine):
             if final:
                 parsed += parser_session.finalize().visible_text
             return parsed
+
         try:
             with limit_ctx:
                 results = stream_diffusion_generate(
