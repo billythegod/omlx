@@ -66,8 +66,7 @@ class TestIntegrationCommands:
             cmd = ClaudeCodeIntegration().get_command(ctx())
 
         assert (
-            cmd
-            == "'/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli' launch claude"
+            cmd == "'/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli' launch claude"
         )
 
 
@@ -246,14 +245,12 @@ name = "old-omlx"
 
 class TestCodexAppIntegration:
     def test_get_command(self):
-        from omlx.integrations.codex_app import CodexAppIntegration
         codex_app = CodexAppIntegration()
         cmd = codex_app.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
         assert "omlx launch codex_app" in cmd
         assert "--model qwen3.5" in cmd
 
     def test_configure(self, tmp_path):
-        from omlx.integrations.codex_app import CodexAppIntegration
         codex_app = CodexAppIntegration()
         config_path = tmp_path / "codex" / "config.toml"
         with patch.object(CodexAppIntegration, "CONFIG_PATH", config_path):
@@ -267,7 +264,6 @@ class TestCodexAppIntegration:
         assert 'env_key = "OMLX_API_KEY"' in content
 
     def test_launch_app(self, tmp_path):
-        from omlx.integrations.codex_app import CodexAppIntegration
         codex_app = CodexAppIntegration()
         config_path = tmp_path / "codex" / "config.toml"
         captured = {}
@@ -304,7 +300,6 @@ class TestCodexAppIntegration:
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
     def test_type(self):
-        from omlx.integrations.codex_app import CodexAppIntegration
         codex_app = CodexAppIntegration()
         assert codex_app.type == "config_file"
         assert codex_app.display_name == "Codex App"
