@@ -510,12 +510,15 @@ def _patched_generation_batch_filter(self, keep):
 GenerationBatch.filter = _patched_generation_batch_filter
 
 
+_TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
+
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
 try:
     from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
 
     from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
 
+    _TQ_SINGLETON_CACHE_TYPE = _TQCache
     if not hasattr(_TQCache, "merge"):
         _TQCache.merge = _BTQCache.merge
 except ImportError:
@@ -578,6 +581,27 @@ def _regular_cache_extend_singleton(self, other):
     )
 
 
+def _turboquant_filter_singleton(self, batch_indices):
+    n = _batch_indices_len(batch_indices)
+    if n == 0:
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if hasattr(self, "_shadow_keys"):
+            self._shadow_keys = None
+        if hasattr(self, "_shadow_values"):
+            self._shadow_values = None
+        return
+    if n == 1:
+        return
+    raise NotImplementedError(
+        f"{type(self).__name__}.filter only supports singleton pass-through; "
+        "convert to a batched cache before keeping multiple rows."
+    )
+
+
 if not hasattr(_MLXKVCache, "filter"):
     _MLXKVCache.filter = _regular_kv_filter_singleton
 if not hasattr(_MLXKVCache, "extract"):
@@ -591,6 +615,14 @@ if not hasattr(_MLXRotatingKVCache, "extract"):
     _MLXRotatingKVCache.extract = _regular_cache_extract_singleton
 if not hasattr(_MLXRotatingKVCache, "extend"):
     _MLXRotatingKVCache.extend = _regular_cache_extend_singleton
+
+if _TQ_SINGLETON_CACHE_TYPE is not None:
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "filter"):
+        _TQ_SINGLETON_CACHE_TYPE.filter = _turboquant_filter_singleton
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extract"):
+        _TQ_SINGLETON_CACHE_TYPE.extract = _regular_cache_extract_singleton
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extend"):
+        _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
@@ -613,6 +645,11 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
             return cache_obj
         return type(cache_obj)(*converted)
     if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
+        return cache_obj.merge([cache_obj])
+    if (
+        _TQ_SINGLETON_CACHE_TYPE is not None
+        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+    ):
         return cache_obj.merge([cache_obj])
     return cache_obj
 
@@ -2480,10 +2517,10 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # TurboQuant runs in fp16 during the prefill loop below and is
-        # quantized once at the end (see the _apply_turboquant_kv_convert call
-        # before the return). Chunked/rotating models are gated out by
-        # _turboquant_eligible and stay fp16.
+        # Fresh TurboQuant requests run fp16 during the cold prefill loop and
+        # are quantized once at the end. Restored TurboQuant prefix caches stay
+        # quantized while pre-filling the uncached suffix, then keep using TQ for
+        # decode. Chunked/rotating models are gated out by _turboquant_eligible.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -2562,6 +2599,9 @@ class Scheduler:
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
             n_to_process = min(prefill_step_size, remaining)
+
+            if processed_tokens == 0:
+                _sync_and_clear_cache(self._stream)
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -3279,6 +3319,18 @@ class Scheduler:
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker."""
         delta = post_bytes - pre_bytes
+        min_chunk = max(1, self._prefill_min_chunk_tokens)
+        if n_tokens < min_chunk:
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "(skipped: tail < min_chunk=%d)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta / 1024**2,
+                min_chunk,
+            )
+            return
         if delta <= 0:
             logger.debug(
                 "[throttle:%s] measure rid=%s n=%d delta=%dB (skipped: <=0)",
@@ -3403,6 +3455,9 @@ class Scheduler:
             return True
 
         n = min(self.config.prefill_step_size, state.tokens_remaining.shape[1])
+
+        if state.tokens_processed == 0:
+            _sync_and_clear_cache(self._stream)
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:

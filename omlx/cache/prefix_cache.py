@@ -2118,7 +2118,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
                     from ..turboquant_kv import (
-                        _concat_state,
+                        _concat_state_token_axis,
                         _rebuild_codecs,
                         _state_length,
                     )
@@ -2139,14 +2139,9 @@ class BlockAwarePrefixCache(CacheManager):
                         logger.debug(f"TQ layer {layer_idx}: no block data")
                         return None
                     # Concatenate along token dimension
-                    cat_ks = key_states[0]
-                    for s in key_states[1:]:
-                        cat_ks = _concat_state(cat_ks, s)
-                    cat_vs = value_states[0]
-                    for s in value_states[1:]:
-                        cat_vs = _concat_state(cat_vs, s)
+                    cat_ks = _concat_state_token_axis(key_states)
+                    cat_vs = _concat_state_token_axis(value_states)
                     try:
-                        from mlx_lm.models.cache import KVCache
                         from mlx_vlm.turboquant import TurboQuantKVCache
 
                         tq_bits = 4.0
@@ -2159,19 +2154,12 @@ class BlockAwarePrefixCache(CacheManager):
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
                             tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
-                        # TQ will be re-applied at decode start (lazy quantization).
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
                         _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+                        reconstructed_caches.append(tq)
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"

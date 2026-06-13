@@ -3,16 +3,21 @@
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache
-
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
+    _build_codec,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
-    _build_codec,
     turboquant_enabled,
 )
 
-from omlx.turboquant_kv import BatchTurboQuantKVCache, _rebuild_codecs, _infer_head_dim
+from omlx.turboquant_kv import (
+    BatchTurboQuantKVCache,
+    _concat_state,
+    _concat_state_token_axis,
+    _infer_head_dim,
+    _rebuild_codecs,
+)
 
 pytestmark = pytest.mark.turboquant
 
@@ -351,6 +356,105 @@ def test_attention_patch_routes_tq():
     assert out.shape == (1, 4, 1, 32)
 
 
+def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    calls = []
+    prefill_calls = []
+
+    def fake_prefill_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        prefill_calls.append((keys_state, values_state))
+        return None
+
+    def fake_quantized_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        calls.append((keys_state, values_state, self.prefill_query_block_size))
+        assert self.prefill_key_chunk_size == 16384
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "prefill_attention",
+        fake_prefill_attention,
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "quantized_attention",
+        fake_quantized_attention,
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+
+    assert out.shape == queries.shape
+    assert prefill_calls == [(ks, vs)]
+    assert len(calls) == 1
+    assert calls[0][0] is ks
+    assert calls[0][1] is vs
+    assert calls[0][2] == 256
+
+
+def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    calls = {"quantized": 0, "dequantize": 0}
+
+    def failing_quantized_attention(self, *args, **kwargs):
+        calls["quantized"] += 1
+        raise RuntimeError("forced quantized prefill failure")
+
+    original_dequantize = TurboQuantKVCache.dequantize
+
+    def spy_dequantize(self, *args, **kwargs):
+        calls["dequantize"] += 1
+        return original_dequantize(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "quantized_attention",
+        failing_quantized_attention,
+    )
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+    mx.eval(out)
+
+    assert out.shape == queries.shape
+    assert calls == {"quantized": 1, "dequantize": 1}
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------
@@ -409,13 +513,28 @@ def test_infer_head_dim():
     assert _infer_head_dim(ks, 4) == 128
 
 
+def test_concat_state_token_axis_mse_matches_pairwise_concat():
+    codec = _TurboQuantMSECodec(32, 4, seed=0)
+    first = codec.quantize(mx.random.normal((1, 2, 3, 32)))
+    second = codec.quantize(mx.random.normal((1, 2, 5, 32)))
+
+    got = _concat_state_token_axis([first, second])
+    expected = _concat_state(first, second)
+    mx.eval(got.norms, got.indices, expected.norms, expected.indices)
+
+    assert got.norms.shape == (1, 2, 8)
+    assert got.indices.shape == expected.indices.shape
+    assert mx.all(got.norms == expected.norms).item()
+    assert mx.all(got.indices == expected.indices).item()
+
+
 def test_ssd_type_map_completeness():
     """All TQ state types from turboquant_kv must be in SSD type_map."""
     from omlx.turboquant_kv import (
         TurboQuantMSEState,
-        TurboQuantProdState,
-        TurboQuantPolarState,
         TurboQuantPolarProdState,
+        TurboQuantPolarState,
+        TurboQuantProdState,
         TurboQuantSplitState,
     )
 
