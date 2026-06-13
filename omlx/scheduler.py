@@ -5181,6 +5181,7 @@ class Scheduler:
                 request.request_id,
             )
             return None
+        target_model = self.model
 
         if not last_tokens:
             logger.warning(
@@ -5193,7 +5194,10 @@ class Scheduler:
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
         try:
             with mx.stream(self._stream):
-                out = lm(
+                set_batch_rope = getattr(target_model, "set_batch_rope_deltas", None)
+                if callable(set_batch_rope):
+                    set_batch_rope(mx.array([request.rope_deltas]))
+                out = target_model(
                     last_arr,
                     cache=prefilled_cache,
                     return_hidden=True,
@@ -5238,7 +5242,7 @@ class Scheduler:
 
         try:
             generator = run_vlm_mtp_decode(
-                target_language_model=lm,
+                target_language_model=target_model,
                 drafter=drafter,
                 prompt_cache=prefilled_cache,
                 hidden=hidden,
@@ -5786,6 +5790,12 @@ class Scheduler:
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
+            if uid < 0:
+                mtp_state = self._vlm_mtp_active.pop(uid, None)
+                if mtp_state is not None:
+                    close = getattr(mtp_state.generator, "close", None)
+                    if callable(close):
+                        close()
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
