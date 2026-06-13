@@ -2990,10 +2990,13 @@ async def create_chat_completion(
     # Merge MCP tools with user-provided tools unless the request explicitly
     # disables tool use.
     tools_disabled = request.tool_choice == "none"
-    if getattr(engine, "is_diffusion_model", False):
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
         if request.tools and not tools_disabled:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         tools_disabled = True
@@ -3363,16 +3366,18 @@ def _reject_diffusion_structured_outputs(
 ) -> None:
     if not getattr(engine, "is_diffusion_model", False):
         return
-    response_format_needs_grammar = _response_format_requests_grammar(response_format)
-    if (
-        structured_outputs is None
-        and not guided_grammar
-        and not response_format_needs_grammar
-    ):
+    # ``response_format`` (json_object / json_schema) is NOT rejected here:
+    # it degrades to prompt-injected JSON with a Warning header, the same
+    # fallback used when xgrammar is unavailable (#1241).  Only explicit
+    # grammar requests — ``structured_outputs`` and ``guided_grammar`` —
+    # are rejected, because logit-mask enforcement has no equivalent in
+    # the parallel denoising loop.
+    if structured_outputs is None and not guided_grammar:
         return
     raise InvalidRequestError(
-        "Structured response_format and guided grammar are not supported "
-        "with diffusion models.",
+        "structured_outputs and guided grammar are not supported "
+        "with diffusion models (response_format degrades to "
+        "prompt-injected JSON).",
         field="response_format",
     )
 
@@ -4778,10 +4783,13 @@ async def create_anthropic_message(
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
-    if getattr(engine, "is_diffusion_model", False):
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
         if user_internal:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         internal_tools = None
@@ -5110,9 +5118,14 @@ async def create_response(
 
     # Convert tools: flat → nested
     openai_tools = convert_responses_tools(request.tools)
-    if getattr(engine, "is_diffusion_model", False) and openai_tools:
+    if (
+        getattr(engine, "is_diffusion_model", False)
+        and not getattr(engine, "supports_tool_calling", False)
+        and openai_tools
+    ):
         raise InvalidRequestError(
-            "Tool calling is not supported with diffusion models.",
+            "Tool calling is not supported for this diffusion model "
+            "(no tool parser matched its chat template).",
             field="tools",
         )
 
@@ -5176,7 +5189,12 @@ async def create_response(
 
     # Merge MCP tools
     effective_tools = (
-        None if getattr(engine, "is_diffusion_model", False) else openai_tools
+        None
+        if (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+        )
+        else openai_tools
     )
     if _server_state.mcp_manager and effective_tools:
         effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
