@@ -28,19 +28,16 @@ limit being below the chosen ceiling.
 from __future__ import annotations
 
 import asyncio
-import ctypes
-import ctypes.util
 import inspect
 import logging
 import subprocess
-import sys
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-import psutil
 
+from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -99,29 +96,6 @@ def _format_gb(b: int) -> str:
     return f"{b / 1024**3:.1f}GB"
 
 
-_HOST_VM_INFO64 = 4
-_HOST_INFO64_MAX_COUNT = 256
-_VM_STATS_MIN_COUNT = 4
-_VM_PAGE_SIZE = 16384  # default on Apple Silicon; refined at import
-
-if sys.platform == "darwin":
-    try:
-        _libc = ctypes.CDLL(ctypes.util.find_library("c"))
-        _libc.mach_host_self.restype = ctypes.c_uint
-        _MACH_HOST = _libc.mach_host_self()
-        # Read actual page size once at import time
-        _ps = ctypes.c_uint(0)
-        _libc.host_page_size(_MACH_HOST, ctypes.byref(_ps))
-        if _ps.value > 0:
-            _VM_PAGE_SIZE = _ps.value
-    except Exception:  # noqa: BLE001
-        _libc = None
-        _MACH_HOST = None
-else:
-    _libc = None
-    _MACH_HOST = None
-
-
 def get_macos_vm_stats() -> dict[str, int] | None:
     """Snapshot of mach `vm_statistics64` in bytes.
 
@@ -134,25 +108,7 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     `vm_statistics64`; using a max-sized `host_info64_t` buffer avoids
     pinning oMLX to an SDK-specific tail layout.
     """
-    if _libc is None or _MACH_HOST is None:
-        return None
-    try:
-        stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
-        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
-        rc = _libc.host_statistics64(
-            _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
-        )
-        if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
-            return None
-        ps = _VM_PAGE_SIZE
-        return {
-            "free": int(stats[0]) * ps,
-            "active": int(stats[1]) * ps,
-            "inactive": int(stats[2]) * ps,
-            "wired": int(stats[3]) * ps,
-        }
-    except Exception:  # noqa: BLE001
-        return None
+    return psutil_compat.get_macos_vm_stats()
 
 
 def get_iogpu_wired_limit_bytes() -> int:
@@ -515,10 +471,12 @@ class ProcessMemoryEnforcer:
             subsets of free / inactive, so we deliberately do not add
             them (would double count).
 
-        Non-macOS or vm_stat failure: falls back to psutil's available
-        (= roughly free + inactive on macOS, similar elsewhere). If psutil
-        is also unavailable or broken, fall back to the static ceiling so
-        telemetry failures do not disable the server's health endpoints.
+        VM stats failure: falls back to psutil_compat.virtual_memory().available
+        (= roughly free + inactive on macOS, similar elsewhere). On macOS that
+        compat layer avoids psutil's HOST_VM_INFO64 adapter and uses a cached
+        vm_stat fallback only if the fast host_statistics64 path is unavailable.
+        If all telemetry is unavailable, fall back to the static ceiling so
+        server health endpoints and the enforcer keep running.
         """
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
@@ -526,10 +484,8 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            if sys.platform == "darwin":
-                return self._get_static_ceiling()
             try:
-                available = int(psutil.virtual_memory().available)
+                available = int(psutil_compat.virtual_memory().available)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Memory guard could not read available memory; "
