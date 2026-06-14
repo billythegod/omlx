@@ -153,7 +153,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking
+from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -1268,6 +1268,20 @@ def get_sampling_params(
         xtc_probability,
         xtc_threshold,
     )
+
+
+def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
+    """Drop the scheduler's synthetic think opener from a raw completions chunk.
+
+    Raw completions are a pure continuation of the prompt. When the prompt
+    itself ends with an open think tag, the scheduler still prepends a
+    synthetic ``"<think>\\n"`` to the first streamed chunk (chat streams rely
+    on it to rebuild the reasoning block), but the opener belongs to the
+    prompt and the non-streaming completions path never returns it. Stripping
+    it keeps both completion paths returning the same continuation.
+    """
+    prefix = f"{think_tag}\n"
+    return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -2691,9 +2705,11 @@ async def create_completion(
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
     # Validate context window for each prompt
+    prompt_token_ids_by_prompt = []
     for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        prompt_token_ids = list(engine.tokenizer.encode(prompt))
+        prompt_token_ids_by_prompt.append(prompt_token_ids)
+        validate_context_window(len(prompt_token_ids), request.model)
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
@@ -2708,7 +2724,11 @@ async def create_completion(
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_completion(
-                    engine, prompts[0], request, model_load_duration=model_load_duration
+                    engine,
+                    prompts[0],
+                    request,
+                    model_load_duration=model_load_duration,
+                    prompt_token_ids=prompt_token_ids_by_prompt[0],
                 ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("openai_completion"),
@@ -3727,11 +3747,18 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     model_load_duration: float = 0.0,
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
+    # Parity with the non-streaming path: when the prompt opens a thinking
+    # block, the first chunk carries the scheduler's synthetic think opener;
+    # strip it once so the stream is a pure continuation of the prompt.
+    pending_think_prefix_strip, think_tag = prompt_opens_thinking(
+        getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
+    )
 
     (
         temperature,
@@ -3782,6 +3809,11 @@ async def stream_completion(
                 first_token_time = time.perf_counter()
             last_output = output
 
+            chunk_text = output.new_text
+            if pending_think_prefix_strip and chunk_text:
+                chunk_text = _strip_synthetic_think_prefix(chunk_text, think_tag)
+                pending_think_prefix_strip = False
+
             data = {
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
@@ -3790,7 +3822,7 @@ async def stream_completion(
                 "choices": [
                     {
                         "index": 0,
-                        "text": output.new_text,
+                        "text": chunk_text,
                         "finish_reason": (
                             output.finish_reason if output.finished else None
                         ),
