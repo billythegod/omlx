@@ -60,7 +60,10 @@ class TestLogitsProcessorsCallShape:
             Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
         ).read_text()
         # The variable name and the wrapping pattern.
-        assert "per_row_lps = list(logits_processors) if logits_processors else []" in scheduler_src, (
+        assert (
+            "per_row_lps = list(logits_processors) if logits_processors else []"
+            in scheduler_src
+        ), (
             "scheduler.py must wrap per-request logits_processors as a "
             "list before passing to BatchGenerator.insert. See #934."
         )
@@ -212,9 +215,7 @@ class TestFilterStaleProcessorAlignment:
         survivor = _bare_generation_batch(uid=0, logits_processors=[[]])
         survivor.filter([])  # request A removed; batch now empty
 
-        joiner = _bare_generation_batch(
-            uid=1, logits_processors=[[budget_processor]]
-        )
+        joiner = _bare_generation_batch(uid=1, logits_processors=[[budget_processor]])
         survivor.extend(joiner)  # request B joins the long-lived batch
 
         assert survivor.uids == [1]
@@ -267,8 +268,7 @@ class TestFilterStaleProcessorAlignment:
             Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
         ).read_text()
         assert (
-            "GenerationBatch.filter = _patched_generation_batch_filter"
-            in scheduler_src
+            "GenerationBatch.filter = _patched_generation_batch_filter" in scheduler_src
         ), (
             "scheduler.py must install _patched_generation_batch_filter on "
             "GenerationBatch.filter: mlx-lm's filter leaves a stale "
@@ -292,9 +292,7 @@ class TestCorruptionPatternRecovery:
     def test_not_iterable_with_traceback_text(self):
         """Match should work even when the message has extra context
         (e.g., when re-raised with formatting)."""
-        err = TypeError(
-            "in GenerationBatch._step: 'NoneType' object is not iterable"
-        )
+        err = TypeError("in GenerationBatch._step: 'NoneType' object is not iterable")
         assert is_cache_corruption_error(err) is True
 
 
@@ -471,7 +469,10 @@ class TestRowRealignment:
         # the constrained one (grammar + thinking budget).
         scheduler._register_uid_rows(FakeBatch.model, [1], [None], [[]])
         scheduler._register_uid_rows(
-            FakeBatch.model, [2], [sampler_uid2], [[budget_processor, grammar_processor]]
+            FakeBatch.model,
+            [2],
+            [sampler_uid2],
+            [[budget_processor, grammar_processor]],
         )
 
         batch = FakeBatch()
@@ -565,7 +566,6 @@ class TestRowRealignment:
         assert captured["logits_processors"][0] == [legacy_processor]
         assert captured["logits_processors"][1] == []
         assert len(batch.samplers) == len(batch.uids)
-
 
     def test_same_uid_on_two_models_does_not_cross_contaminate(self, monkeypatch):
         """mlx-lm numbers uids per BatchGenerator instance, so two engines
@@ -711,6 +711,30 @@ class TestRowRealignment:
             assert lps == [[]]
         finally:
             scheduler._uid_row_registry = original
+
+    def test_realign_hook_rebuilds_rows_for_non_step_callers(self, monkeypatch):
+        """Native MTP calls GenerationBatch.next before _step, so the shared
+        hook must realign rows independently of the patched step wrapper."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+
+        model = object()
+        expected_sampler = object()
+        scheduler._register_uid_rows(model, [1], [expected_sampler], [[]])
+
+        batch = type("FakeBatch", (), {})()
+        batch.model = model
+        batch.uids = [1]
+        batch.logits_processors = [[], []]
+        batch.samplers = [None, expected_sampler]
+
+        scheduler._omlx_realign_generation_batch_rows(batch)
+
+        assert batch.samplers == [expected_sampler]
+        assert batch.logits_processors == [[]]
 
     def test_model_scoped_clear_drops_only_that_model(self):
         """Reset/recovery/shutdown release by model: every row of the reset
@@ -860,9 +884,11 @@ class TestRegistryCleanupPaths:
                 and node.name == func_name
             ):
                 return {
-                    call.func.id
-                    if isinstance(call.func, ast.Name)
-                    else getattr(call.func, "attr", None)
+                    (
+                        call.func.id
+                        if isinstance(call.func, ast.Name)
+                        else getattr(call.func, "attr", None)
+                    )
                     for call in ast.walk(node)
                     if isinstance(call, ast.Call)
                 }

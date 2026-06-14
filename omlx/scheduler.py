@@ -450,7 +450,9 @@ def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
     """
     with _uid_row_registry_lock:
         for uid, sampler, lps in zip(uids, samplers, lps_rows):
-            _uid_row_registry[(id(model), uid)] = _RegisteredRow(sampler, list(lps or ()))
+            _uid_row_registry[(id(model), uid)] = _RegisteredRow(
+                sampler, list(lps or ())
+            )
         while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
             _uid_row_registry.popitem(last=False)
 
@@ -526,7 +528,11 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
                     drift = row.sampler is not None
                 elif cur_samplers[i] is not row.sampler:
                     drift = True
-            if not drift and i < len(cur_lps) and cur_lps[i] is not row.logits_processors:
+            if (
+                not drift
+                and i < len(cur_lps)
+                and cur_lps[i] is not row.logits_processors
+            ):
                 drift = _row_drifted(cur_lps[i], row.logits_processors)
             samplers.append(row.sampler)
             lps.append(row.logits_processors)
@@ -534,6 +540,31 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
             samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
             lps.append(cur_lps[i] if i < len(cur_lps) else [])
     return samplers, lps, drift
+
+
+def _omlx_realign_generation_batch_rows(self) -> None:
+    """Realign positional row state with ``uids`` before any decode path reads it."""
+    if self.logits_processors is None:
+        self.logits_processors = []
+    else:
+        self.logits_processors = [
+            procs if procs is not None else [] for procs in self.logits_processors
+        ]
+
+    uids = getattr(self, "uids", None) or []
+    if not uids:
+        return
+
+    new_samplers, new_lps, drift = _realigned_rows(
+        getattr(self, "model", None),
+        uids,
+        getattr(self, "samplers", None) or [],
+        self.logits_processors,
+    )
+    if drift:
+        _log_drift_correction(uids, len(self.logits_processors))
+    self.logits_processors = new_lps
+    self.samplers = new_samplers
 
 
 _original_generation_batch_step = GenerationBatch._step
@@ -567,26 +598,7 @@ def _patched_generation_batch_step(self):
     # that is serving a structured json_schema request).  Per-row normalisation
     # at this chokepoint is the only place that covers both insert and merge.
     # See #934 / #1747.
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
-
-    # Realign per-row samplers and logits processors with ``uids`` from the
-    # per-uid registry; stale or offset slots left by batch extend/filter/
-    # split would otherwise run another request's — or no — rows. See #1823.
-    new_samplers, new_lps, drift = _realigned_rows(
-        getattr(self, "model", None),
-        self.uids,
-        getattr(self, "samplers", None) or [],
-        self.logits_processors,
-    )
-    if drift:
-        _log_drift_correction(self.uids, len(self.logits_processors))
-    self.logits_processors = new_lps
-    self.samplers = new_samplers
+    _omlx_realign_generation_batch_rows(self)
 
     result = _original_generation_batch_step(self)
 
@@ -612,6 +624,7 @@ def _patched_generation_batch_step(self):
     return result
 
 
+GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
 
 
@@ -2619,9 +2632,7 @@ class Scheduler:
         from mlx_vlm.turboquant import TurboQuantKVCache
 
         kv_indices = [
-            i
-            for i, c in enumerate(prompt_cache)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
@@ -2663,9 +2674,7 @@ class Scheduler:
         from mlx_vlm.turboquant import TurboQuantKVCache
 
         kv_indices = [
-            i
-            for i, c in enumerate(prompt_cache)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
@@ -8979,8 +8988,7 @@ class Scheduler:
                     self._turboquant_eligible(cache_list_for_tq)
                     if cache_list_for_tq is not None
                     else not (
-                        self._model_uses_mla()
-                        or self._model_uses_attention_sinks()
+                        self._model_uses_mla() or self._model_uses_attention_sinks()
                     )
                 )
             ):
@@ -9074,9 +9082,7 @@ class Scheduler:
             return layer_cache_types
 
         kv_indices = [
-            i
-            for i, c in enumerate(cache_list)
-            if _is_turboquant_kv_family_cache(c)
+            i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
         ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
