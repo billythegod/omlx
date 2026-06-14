@@ -1047,6 +1047,11 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                # MiniMax M3 markers start with ``]``. A single closing
+                # bracket at end-of-stream is much more likely to be literal
+                # prose than an incomplete MiniMax control marker.
+                if tail == "]":
+                    continue
                 return True
 
         for close_marker in self._orphan_close_markers:
@@ -1194,6 +1199,9 @@ class ToolCallStreamFilter:
 
         if keep:
             buf = self._buffer[:-keep]
+            tail = self._buffer[-keep:]
+            if not self._should_drop_tail_at_finish(tail):
+                buf += tail
         else:
             buf = self._buffer
         self._buffer = ""
