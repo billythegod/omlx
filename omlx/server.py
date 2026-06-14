@@ -1115,8 +1115,11 @@ def get_sampling_params(
     Get effective sampling parameters with per-model settings support.
 
     Priority:
-    - If force_sampling is True (global or model level): use forced values
-    - Otherwise: request > model settings > ocr_defaults > global defaults
+    - If force_sampling is True (global or model level): force sampling knobs
+      that affect token selection.
+    - max_tokens is an output length cap, so it always uses
+      request > model settings > ocr_defaults > global defaults.
+    - Otherwise: request > model settings > ocr_defaults > global defaults.
 
     Returns:
         tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
@@ -1224,23 +1227,16 @@ def get_sampling_params(
     else:
         frequency_penalty = 0.0
 
-    # Max tokens: same hierarchy as other params
-    if force:
-        if model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+    # Max tokens is an output length cap, not a sampling knob. Honor request
+    # bounds even when force_sampling pins token-selection parameters.
+    if req_max_tokens is not None:
+        max_tokens = req_max_tokens
+    elif model_settings and model_settings.max_tokens is not None:
+        max_tokens = model_settings.max_tokens
+    elif ocr_defaults and "max_tokens" in ocr_defaults:
+        max_tokens = ocr_defaults["max_tokens"]
     else:
-        if req_max_tokens is not None:
-            max_tokens = req_max_tokens
-        elif model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+        max_tokens = global_sampling.max_tokens
 
     # XTC probability: request > default (0.0 = disabled)
     xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
