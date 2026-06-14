@@ -811,7 +811,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
         # ArraysCache: no traditional sequence dimension
-        non_sliceable_types = {"ArraysCache", "CacheList"}
+        non_sliceable_types = {
+            "ArraysCache",
+            "CacheList",
+            "MiniMaxM3KVCache",
+            "MiniMaxM3BatchKVCache",
+        }
 
         # Step 1: Search for a sliceable KVCache layer (full attention)
         for layer_idx, layer_state in enumerate(cache_data):
@@ -865,7 +870,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Only skip cache types that do not expose a sequence dimension here.
         # RotatingKVCache must be included because pure RotatingKVCache models
         # have no sliceable KVCache layers for Step 1 to find.
-        step2_skip_types = {"ArraysCache", "CacheList"}
+        step2_skip_types = {
+            "ArraysCache",
+            "CacheList",
+            "MiniMaxM3KVCache",
+            "MiniMaxM3BatchKVCache",
+        }
         max_seq_len = 0
         for layer_idx, layer_state in enumerate(cache_data):
             try:
@@ -1282,7 +1292,9 @@ class BlockAwarePrefixCache(CacheManager):
                         else:
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 else:
-                    # Other non-sliceable cache (ArraysCache/MambaCache)
+                    # Other non-sliceable cache (ArraysCache/MambaCache or
+                    # model-specific caches such as MiniMax M3). N-tuple
+                    # caches keep every element via the SSD V3 marker format.
                     # GDN recurrent state summarizes the ENTIRE sequence in a
                     # fixed-size matrix. Each block boundary snapshot captures
                     # the state at that point in the sequence. Without a snapshot,
@@ -1302,7 +1314,17 @@ class BlockAwarePrefixCache(CacheManager):
                             state = snapshot_cache_data[layer_idx]["state"]
                         else:
                             state = layer_state["state"]
-                        if isinstance(state, (list, tuple)) and len(state) >= 2:
+                        if isinstance(state, (list, tuple)) and len(state) > 2:
+                            cloned = [
+                                (
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                                for elem in state
+                            ]
+                            block_slices.append(("__nstate__", cache_type_name, cloned))
+                        elif isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = (
                                 state[0] if state[0] is not None else mx.array([])
                             )
@@ -1881,13 +1903,6 @@ class BlockAwarePrefixCache(CacheManager):
                         f"{new_count} block(s) ({valid_token_count} tokens)"
                     )
 
-            # Build model cache config if we have type info
-            model_cache_config = None
-            if layer_cache_types and len(layer_cache_types) == num_layers:
-                model_cache_config = ModelCacheConfig.from_type_list(
-                    layer_cache_types, model_name=""
-                )
-
             # Reconstruct caches for each layer
             reconstructed_caches = []
 
@@ -1975,7 +1990,7 @@ class BlockAwarePrefixCache(CacheManager):
                             last_block_meta_states[layer_idx][0]
                         )
 
-                    NON_SLICEABLE_SUB_CLASSES = {
+                    non_sliceable_sub_classes = {
                         "PoolingCache",
                         "ArraysCache",
                         "BatchPoolingCache",
@@ -1983,7 +1998,7 @@ class BlockAwarePrefixCache(CacheManager):
 
                     def _is_non_sliceable_sub_class(class_name: str) -> bool:
                         return (
-                            class_name in NON_SLICEABLE_SUB_CLASSES
+                            class_name in non_sliceable_sub_classes
                             or CacheTypeRegistry.is_rotating_family(class_name)
                         )
 
@@ -2165,6 +2180,34 @@ class BlockAwarePrefixCache(CacheManager):
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"
                         )
                         return None
+                    continue
+
+                # === Generic N-tuple non-sliceable cache: use latest boundary ===
+                last_block_layer_data = all_block_data[-1][layer_idx]
+                if (
+                    isinstance(last_block_layer_data, tuple)
+                    and len(last_block_layer_data) >= 3
+                    and last_block_layer_data[0] == "__nstate__"
+                ):
+                    marker_class = last_block_layer_data[1] or cache_type_name
+                    elements = last_block_layer_data[2]
+                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
+                        marker_class
+                    )
+                    meta_state = None
+                    if last_block_meta_states and layer_idx < len(
+                        last_block_meta_states
+                    ):
+                        meta_state = last_block_meta_states[layer_idx]
+                    cache = marker_handler.deserialize_state(
+                        tuple(elements), meta_state
+                    )
+                    if cache is None:
+                        logger.error(
+                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
+                        )
+                        return None
+                    reconstructed_caches.append(cache)
                     continue
 
                 # Collect layer data from all blocks
@@ -2531,6 +2574,8 @@ class BlockAwarePrefixCache(CacheManager):
             "RotatingKVCache",
             "BatchRotatingKVCache",
             "CacheList",
+            "MiniMaxM3KVCache",
+            "MiniMaxM3BatchKVCache",
         }
 
         expected_seq_len = None

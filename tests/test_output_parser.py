@@ -424,6 +424,59 @@ class TestGemma4OutputParserSession:
 
 
 class TestOutputParserFactory:
+    def test_detects_minimax_m3_by_config(self):
+        tokenizer = CohereTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "minimax_m3"
+
+    def test_minimax_m3_parser_extracts_tool_calls(self, monkeypatch):
+        module = types.ModuleType("mlx_vlm.tool_parsers.minimax_m3")
+
+        def parse_tool_call(text):
+            assert "lookup" in text
+            return {"name": "lookup", "arguments": {"query": "mlx"}}
+
+        module.parse_tool_call = parse_tool_call
+        monkeypatch.setitem(sys.modules, "mlx_vlm.tool_parsers.minimax_m3", module)
+
+        start = "]<]minimax[>[<tool_call>"
+        end = "]<]minimax[>[</tool_call>"
+        tokenizer = CohereTokenizer(
+            {
+                1: "before ",
+                2: start,
+                3: ']<]minimax[>[<invoke name="lookup">',
+                4: "]<]minimax[>[</invoke>",
+                5: end,
+                6: " after",
+            }
+        )
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        session = factory.create_session(tokenizer)
+
+        visible = []
+        stream = []
+        for token_id in [1, 2, 3, 4, 5, 6]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+        final = session.finalize()
+
+        assert start in "".join(stream)
+        assert "".join(visible) + final.visible_text == "before  after"
+        assert final.tool_calls == [{"name": "lookup", "arguments": '{"query":"mlx"}'}]
+        assert final.finish_reason == "tool_calls"
+
     def test_detects_gemma4(self):
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(

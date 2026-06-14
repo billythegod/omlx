@@ -24,9 +24,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from jsonschema import validate, ValidationError
+from jsonschema import ValidationError, validate
 
-from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -875,6 +875,7 @@ class ToolCallStreamFilter:
         if marker_end is None:
             marker_end = ""
         self._marker_pairs: List[Tuple[str, str]] = [
+            ("]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>"),
             ("<|tool_call_start|>", "<|tool_call_end|>"),
             ("<tool_call>", "</tool_call>"),
         ]

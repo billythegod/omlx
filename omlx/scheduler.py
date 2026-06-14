@@ -2613,6 +2613,8 @@ class Scheduler:
                 "BatchTurboQuantKVCache",
             ):
                 return True
+            if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
+                return False
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
             return False
@@ -5128,10 +5130,12 @@ class Scheduler:
 
                 # Determine cache type using registry if available
                 cache_type_name = class_name
+                handler = None
                 if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                     try:
                         cache_type = CacheTypeRegistry.detect_cache_type(layer_cache)
                         cache_type_name = cache_type.value
+                        handler = CacheTypeRegistry.get_handler(cache_type)
                     except Exception:
                         pass
 
@@ -5186,8 +5190,15 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    state = layer_cache.state
-                    meta = getattr(layer_cache, "meta_state", ())
+                    if handler is not None and class_name in (
+                        "MiniMaxM3KVCache",
+                        "MiniMaxM3BatchKVCache",
+                    ):
+                        state = handler.serialize_state(layer_cache)
+                        meta = handler.serialize_meta_state(layer_cache)
+                    else:
+                        state = layer_cache.state
+                        meta = getattr(layer_cache, "meta_state", ())
 
                     if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
                         state, meta = self._normalize_rotating_snapshot_state(

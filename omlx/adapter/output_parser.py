@@ -9,6 +9,7 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -153,6 +154,118 @@ def _is_cohere2_moe_model(
         model_config is not None
         and model_config.get("model_type") == "cohere2_moe"
     )
+
+
+_MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+_MINIMAX_TOOL_CALL_START = "]<]minimax[>[<tool_call>"
+_MINIMAX_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
+
+
+def _serialize_minimax_tool_arguments(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        return arguments or "{}"
+    if arguments is None:
+        return "{}"
+    try:
+        return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        return str(arguments)
+
+
+def _is_minimax_m3_model(
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    model_type = model_config.get("model_type") if model_config else None
+    if model_type in _MINIMAX_M3_MODEL_TYPES:
+        return True
+    lowered = model_name.lower()
+    return "minimax" in lowered and "m3" in lowered
+
+
+class MiniMaxM3OutputParserSession:
+    """Parser session for MiniMax M3 XML-style tool calls."""
+
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
+        self._tokenizer = tokenizer
+        self._raw_text = ""
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+        try:
+            from ..api.tool_calling import ToolCallStreamFilter
+
+            self._visible_filter = ToolCallStreamFilter(tokenizer)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("MiniMax M3 stream filter unavailable: %s", e)
+            self._visible_filter = None
+
+    def _decode_token(self, token_id: int) -> str:
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+        try:
+            return self._tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            return self._tokenizer.decode([token_id])
+
+    def _visible_text(self, text: str) -> str:
+        if not text:
+            return ""
+        if self._visible_filter is None:
+            return text
+        return self._visible_filter.feed(text)
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        decoded_text = self._decode_token(token_id)
+        self._raw_text += decoded_text
+        return OutputParserTokenResult(
+            stream_text=decoded_text,
+            visible_text=self._visible_text(decoded_text),
+            record_token=True,
+        )
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        stream_text = ""
+        visible_text = ""
+        if self._detokenizer is not None:
+            self._detokenizer.finalize()
+            final_text = self._detokenizer.last_segment
+            if final_text:
+                self._raw_text += final_text
+                stream_text += final_text
+                visible_text += self._visible_text(final_text)
+
+        if self._visible_filter is not None:
+            visible_text += self._visible_filter.finish()
+
+        tool_calls: list[dict[str, str]] = []
+        if _MINIMAX_TOOL_CALL_START in self._raw_text:
+            try:
+                from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
+
+                parsed = parse_tool_call(self._raw_text)
+                parsed_calls = parsed if isinstance(parsed, list) else [parsed]
+                tool_calls = [
+                    {
+                        "name": str(call.get("name", "")),
+                        "arguments": _serialize_minimax_tool_arguments(
+                            call.get("arguments")
+                        ),
+                    }
+                    for call in parsed_calls
+                    if isinstance(call, dict) and call.get("name")
+                ]
+            except Exception as e:  # noqa: BLE001
+                logger.debug("MiniMax M3 tool-call parse failed: %s", e)
+
+        return OutputParserFinalizeResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else None,
+        )
 
 
 def _create_cohere2_moe_filter():
@@ -344,6 +457,21 @@ def detect_output_parser(
             ),
             stop_token_ids=set(),
             thinking_end_text="</think>",
+        )
+
+    if _is_minimax_m3_model(model_name, model_config):
+        return OutputParserFactory(
+            kind="minimax_m3",
+            create_session=lambda session_tokenizer: MiniMaxM3OutputParserSession(
+                session_tokenizer,
+                model_path=model_name,
+            ),
+            stop_token_ids=set(),
+            thinking_end_text="</think>",
+            protocol_marker_texts=(
+                _MINIMAX_TOOL_CALL_START,
+                _MINIMAX_TOOL_CALL_END,
+            ),
         )
 
     return None
