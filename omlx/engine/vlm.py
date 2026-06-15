@@ -82,6 +82,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -557,6 +558,131 @@ _VISION_TOWER_PREFIX = "vision_tower."
 
 
 @contextlib.contextmanager
+def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
+    """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
+
+    mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
+    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
+    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
+    the unpacked MoE layout, so strict loading sees those tensors as unknown.
+    Hide only the safetensors ``format=mlx`` metadata during this load so the
+    upstream sanitize path runs before quantization and load_weights.
+    """
+    if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
+        yield
+        return
+
+    import safetensors
+    from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
+
+    original_safe_open = safetensors.safe_open
+    original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
+        pack_shared = (
+            args.n_shared_experts == 1
+            and args.shared_intermediate_size == args.intermediate_size
+        )
+        if not pack_shared:
+            return 0
+
+        packed = 0
+        for layer_idx in range(args.num_hidden_layers):
+            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+            for suffix in ("weight", "scales", "biases", "bias"):
+                gate_key = f"{prefix}.switch_mlp.gate_proj.{suffix}"
+                up_key = f"{prefix}.switch_mlp.up_proj.{suffix}"
+                shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
+                shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
+                gate_up_key = f"{prefix}.switch_mlp.gate_up_proj.{suffix}"
+
+                if (
+                    gate_up_key not in weights
+                    and gate_key in weights
+                    and up_key in weights
+                    and shared_gate_key in weights
+                    and shared_up_key in weights
+                ):
+                    gate = weights.pop(gate_key)
+                    up = weights.pop(up_key)
+                    shared_gate = weights.pop(shared_gate_key)
+                    shared_up = weights.pop(shared_up_key)
+                    routed_gate_up = mx.concatenate([gate, up], axis=1)
+                    shared_gate_up = mx.expand_dims(
+                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
+                    )
+                    weights[gate_up_key] = mx.concatenate(
+                        [routed_gate_up, shared_gate_up], axis=0
+                    )
+                    packed += 1
+
+                down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
+                packed_down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                if down_key in weights and shared_down_key in weights:
+                    down = weights.pop(down_key)
+                    shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
+                    weights[packed_down_key] = mx.concatenate(
+                        [down, shared_down], axis=0
+                    )
+                    packed += 1
+        return packed
+
+    def _patched_sanitize_moe_weights(weights: dict, args: Any) -> None:
+        original_sanitize_moe_weights(weights, args)
+        packed = _pack_mlx_unpacked_moe_weights(weights, args)
+        if packed:
+            logger.info(
+                "MiniMax M3 MLX-format MoE sanitize packed %d tensor groups",
+                packed,
+            )
+
+    safetensors.safe_open = _patched_safe_open
+    _minimax_m3_vl._sanitize_moe_weights = _patched_sanitize_moe_weights
+    try:
+        logger.info(
+            "MiniMax M3 MLX-format MoE sanitize patch active for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+        _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
+
+
+@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -977,6 +1103,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
