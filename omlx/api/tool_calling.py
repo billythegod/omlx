@@ -21,11 +21,11 @@ import bisect
 import json
 import logging
 import re
-import regex
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import regex
 from jsonschema import ValidationError, validate
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
@@ -457,7 +457,7 @@ _GEMMA4_MAX_ARGS_LEN = 262_144
 _GEMMA4_MAX_DEPTH = 64
 
 
-class _Gemma4ArgsTooComplex(ValueError):
+class _Gemma4ArgsTooComplexError(ValueError):
     """A defensive bound (length/depth) was breached parsing args.
 
     Distinct from an ordinary parse failure so the orchestrator can reject
@@ -602,7 +602,7 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
     """
     try:
         return _gemma4_transcode_to_json(args_str)
-    except _Gemma4ArgsTooComplex:
+    except _Gemma4ArgsTooComplexError:
         # Defensive bound breached: reject hard.  The legacy parser ignores
         # these bounds and would parse the input anyway, defeating the DoS
         # guard, so it must NOT see oversized/deeply-nested args.
@@ -625,10 +625,10 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
     - ``<|"|>``-delimited strings, arrays, and nested objects
 
     Implemented as a single-pass transcode to JSON text followed by one
-    ``json.loads`` (CPython's loads is iterative, so deep input cannot
-    recurse).  Every piece of captured string content is emitted through
-    ``json.dumps`` and structural characters are emitted only by the state
-    machine, so model output cannot inject JSON structure.  The legacy
+    ``json.loads`` after local length/depth checks.  Every piece of captured
+    string content is emitted through ``json.dumps`` and structural characters
+    are emitted only by the state machine, so model output cannot inject JSON
+    structure.  The legacy
     implementation substituted ``\\x00N\\x00`` placeholders, which literal
     NUL bytes in model output could forge, cross-contaminating argument
     values; transcoding directly leaves nothing to forge.
@@ -638,14 +638,8 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
     (``_gemma4_args_to_json_robust``) recovers it via the legacy
     key-anchored fallback.
     """
-    # Fast path: the model may emit valid JSON args.
-    try:
-        return json.loads(args_str)
-    except json.JSONDecodeError:
-        pass
-
     if len(args_str) > _GEMMA4_MAX_ARGS_LEN:
-        raise _Gemma4ArgsTooComplex("Gemma 4 args too large to parse")
+        raise _Gemma4ArgsTooComplexError("Gemma 4 args too large to parse")
 
     squote_closes = _squote_close_positions(args_str)
     n = len(args_str)
@@ -744,7 +738,7 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 # clean parse failure on the existing drop path, never as a
                 # RecursionError (uncaught by the parse chain's excepts).
                 if len(stack) >= _GEMMA4_MAX_DEPTH:
-                    raise _Gemma4ArgsTooComplex(
+                    raise _Gemma4ArgsTooComplexError(
                         "Gemma 4 args nested too deeply"
                     )
                 out.append(ch)
@@ -946,11 +940,8 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
             continue
         args_str = text[open_idx:end]
         try:
-            try:
-                arguments = json.loads(args_str)
-            except json.JSONDecodeError:
-                arguments = _gemma4_args_to_json_robust(args_str)
-        except (ValueError, json.JSONDecodeError):
+            arguments = _gemma4_args_to_json_robust(args_str)
+        except (ValueError, json.JSONDecodeError, RecursionError):
             continue  # one malformed call must not drop its siblings
         if not isinstance(arguments, dict):
             continue

@@ -2044,6 +2044,18 @@ class TestParseToolCallsGemma4Integration:
         args = json.loads(tool_calls[0].function.arguments)
         assert args["content"] == 'a " } b'
 
+    def test_deep_standard_json_failure_strips_markers(self):
+        """Deep valid JSON args are dropped cleanly, not surfaced as 500s."""
+        tok = self._make_gemma4_tokenizer()
+        args = '{"a": ' * 80 + "1" + "}" * 80
+        text = f"<|tool_call>\ncall:ns:create{args}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
     def test_markers_stripped_on_total_failure(self, caplog):
         """Even when fallback fails, markers are stripped and warning is logged."""
         tok = self._make_gemma4_tokenizer()
@@ -2178,6 +2190,12 @@ class TestGemma4SingleQuotedArgs:
         the parse chain catches; it would escape as a 500.
         """
         deep = "call:f" + "{a: " * 80 + "1" + "}" * 80
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_deep_standard_json_nesting_fails_cleanly(self):
+        """Valid JSON args must not bypass the Gemma 4 depth bound."""
+        deep = "call:f" + '{"a": ' * 80 + "1" + "}" * 80
         with pytest.raises(ValueError):
             _parse_gemma4_tool_call_fallback(deep)
 
