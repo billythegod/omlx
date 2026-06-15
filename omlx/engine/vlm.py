@@ -945,8 +945,9 @@ class VLMBatchedEngine(BaseEngine):
 
     @property
     def model_type(self) -> str | None:
-        if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
-            config = self._vlm_model.config
+        vlm_model = getattr(self, "_vlm_model", None)
+        if vlm_model is not None and hasattr(vlm_model, "config"):
+            config = vlm_model.config
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
@@ -1605,8 +1606,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
+            image_grid_thw = extra_model_inputs.get("image_grid_thw")
             image_position_ids = extra_model_inputs.get("image_position_ids")
-            if image_position_ids is not None:
+            if image_grid_thw is not None or image_position_ids is not None:
                 try:
                     signature = inspect.signature(model.encode_image)
                 except (TypeError, ValueError):
@@ -1614,12 +1616,16 @@ class VLMBatchedEngine(BaseEngine):
 
                 if signature is None:
                     try:
+                        if image_grid_thw is not None:
+                            return model.encode_image(
+                                pixel_values, image_grid_thw=image_grid_thw
+                            )
                         return model.encode_image(
                             pixel_values, image_position_ids=image_position_ids
                         )
                     except TypeError:
                         logger.debug(
-                            "encode_image rejected image_position_ids; "
+                            "encode_image rejected image metadata; "
                             "retrying without it",
                             exc_info=True,
                         )
@@ -1629,7 +1635,16 @@ class VLMBatchedEngine(BaseEngine):
                         p.kind == inspect.Parameter.VAR_KEYWORD
                         for p in parameters.values()
                     )
-                    if "image_position_ids" in parameters or accepts_kwargs:
+                    if image_grid_thw is not None and (
+                        "image_grid_thw" in parameters or accepts_kwargs
+                    ):
+                        return model.encode_image(
+                            pixel_values, image_grid_thw=image_grid_thw
+                        )
+
+                    if image_position_ids is not None and (
+                        "image_position_ids" in parameters or accepts_kwargs
+                    ):
                         return model.encode_image(
                             pixel_values, image_position_ids=image_position_ids
                         )
@@ -1643,7 +1658,7 @@ class VLMBatchedEngine(BaseEngine):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
                         )
                     ]
-                    if len(positional_parameters) >= 2:
+                    if image_position_ids is not None and len(positional_parameters) >= 2:
                         return model.encode_image(pixel_values, image_position_ids)
 
             return model.encode_image(pixel_values)

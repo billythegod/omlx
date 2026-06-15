@@ -297,13 +297,44 @@ class TestMiniMaxM3CacheHandlers:
 
         handler = MiniMaxM3KVCacheHandler()
 
-        assert handler.supports_block_slicing is False
+        assert handler.supports_block_slicing is True
         assert handler.serialize_state(cache) == (keys, values, index_keys)
         assert handler.serialize_meta_state(cache) == (12,)
 
         extracted = handler.extract_state(cache)
         assert extracted["states"] == (keys, values, index_keys)
-        assert extracted["is_full_state"] is True
+        assert "is_full_state" not in extracted
+
+    def test_single_cache_axis_info_is_sliceable(self):
+        handler = MiniMaxM3KVCacheHandler()
+
+        info = handler.get_state_axis_info()
+
+        assert [i.name for i in info] == ["keys", "values", "index_keys"]
+        assert [i.sequence_axis for i in info] == [2, 2, 2]
+        assert all(i.sliceable is True for i in info)
+
+    def test_single_cache_slices_and_concatenates_index_keys(self):
+        mx = pytest.importorskip("mlx.core")
+        keys = mx.arange(1 * 2 * 8 * 3, dtype=mx.float32).reshape(1, 2, 8, 3)
+        values = keys + 100
+        index_keys = mx.arange(1 * 1 * 8 * 3, dtype=mx.float32).reshape(1, 1, 8, 3)
+        handler = MiniMaxM3KVCacheHandler()
+
+        first = handler.slice_state(
+            {"keys": keys, "values": values, "index_keys": index_keys}, 0, 4
+        )
+        second = handler.slice_state(
+            {"keys": keys, "values": values, "index_keys": index_keys}, 4, 8
+        )
+        concatenated = handler.concatenate_states([first, second])
+
+        assert concatenated["states"][0].shape == keys.shape
+        assert concatenated["states"][1].shape == values.shape
+        assert concatenated["states"][2].shape == index_keys.shape
+        assert mx.max(mx.abs(concatenated["states"][0] - keys)).item() == 0.0
+        assert mx.max(mx.abs(concatenated["states"][1] - values)).item() == 0.0
+        assert mx.max(mx.abs(concatenated["states"][2] - index_keys)).item() == 0.0
 
     def test_batch_cache_serializes_kv_metadata_and_index_keys(self):
         keys = MagicMock()
@@ -351,7 +382,7 @@ class TestMiniMaxM3CacheHandlers:
 
         assert restored.kv_cache.state == (keys, values)
         assert restored.index_keys is index_keys
-        assert restored.index_offset == 7
+        assert restored.index_offset == 12
 
     def test_batch_cache_deserialize_rebuilds_nested_state(self, monkeypatch):
         self._install_fake_minimax_module(monkeypatch)
@@ -370,6 +401,35 @@ class TestMiniMaxM3CacheHandlers:
         assert restored.left_padding_arg is left_padding
         assert restored.state == ((keys, values, offset, left_padding), index_keys)
         assert restored.index_offset == 9
+
+    def test_restored_single_caches_merge_and_extract_for_batch_requests(self):
+        mx = pytest.importorskip("mlx.core")
+        language = pytest.importorskip("mlx_vlm.models.minimax_m3_vl.language")
+        handler = MiniMaxM3KVCacheHandler()
+
+        restored = []
+        for row, length in enumerate((4, 6)):
+            keys = mx.full((1, 2, length, 3), row + 1, dtype=mx.float32)
+            values = mx.full((1, 2, length, 3), (row + 1) * 10, dtype=mx.float32)
+            index_keys = mx.full((1, 1, length, 3), (row + 1) * 100, dtype=mx.float32)
+            restored.append(
+                handler.deserialize_state((keys, values, index_keys), (999,))
+            )
+
+        batch = language.MiniMaxM3BatchKVCache.merge(restored)
+
+        assert batch.left_padding.tolist() == [2, 0]
+        assert batch.offset.tolist() == [4, 6]
+        assert batch.index_offset == 6
+        for row, length in enumerate((4, 6)):
+            extracted = batch.extract(row)
+            row_keys, row_values = extracted.kv_cache.state
+            assert row_keys.shape[2] == length
+            assert row_values.shape[2] == length
+            assert extracted.index_keys.shape[2] == length
+            assert float(row_keys[0, 0, 0, 0].item()) == row + 1
+            assert float(row_values[0, 0, 0, 0].item()) == (row + 1) * 10
+            assert float(extracted.index_keys[0, 0, 0, 0].item()) == (row + 1) * 100
 
 
 class TestRotatingKVCacheHandler:

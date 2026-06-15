@@ -814,7 +814,6 @@ class BlockAwarePrefixCache(CacheManager):
         non_sliceable_types = {
             "ArraysCache",
             "CacheList",
-            "MiniMaxM3KVCache",
             "MiniMaxM3BatchKVCache",
         }
 
@@ -873,7 +872,6 @@ class BlockAwarePrefixCache(CacheManager):
         step2_skip_types = {
             "ArraysCache",
             "CacheList",
-            "MiniMaxM3KVCache",
             "MiniMaxM3BatchKVCache",
         }
         max_seq_len = 0
@@ -1099,6 +1097,43 @@ class BlockAwarePrefixCache(CacheManager):
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
                         # Placeholder from boundary snapshot (skipped sliceable layer).
                         continue
+
+                    axis_info = handler.get_state_axis_info()
+                    if len(state) != 2 or len(axis_info) != 2:
+                        seq_len = handler.get_state_seq_len_from_tuple(tuple(state))
+                        actual_end = min(end_idx, seq_len)
+                        if seq_len <= 0 or start_idx >= actual_end:
+                            continue
+
+                        sliced_elements = []
+                        for info, elem in zip(axis_info, state):
+                            if elem is None:
+                                sliced_elements.append(None)
+                                continue
+                            if (
+                                info.sliceable
+                                and info.sequence_axis is not None
+                                and hasattr(elem, "shape")
+                                and info.sequence_axis < len(elem.shape)
+                            ):
+                                slices = [slice(None)] * len(elem.shape)
+                                slices[info.sequence_axis] = slice(
+                                    start_idx, actual_end
+                                )
+                                sliced_elements.append(
+                                    self._clone_tensor(elem[tuple(slices)])
+                                )
+                            else:
+                                sliced_elements.append(
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                        block_slices.append(
+                            ("__nstate__", cache_type_name, sliced_elements)
+                        )
+                        continue
+
                     keys, values = state
 
                     # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
@@ -2182,8 +2217,58 @@ class BlockAwarePrefixCache(CacheManager):
                         return None
                     continue
 
-                # === Generic N-tuple non-sliceable cache: use latest boundary ===
+                # === Generic N-tuple sliceable cache: concatenate block slices ===
                 last_block_layer_data = all_block_data[-1][layer_idx]
+                if (
+                    handler.supports_block_slicing
+                    and isinstance(last_block_layer_data, tuple)
+                    and len(last_block_layer_data) >= 3
+                    and last_block_layer_data[0] == "__nstate__"
+                ):
+                    marker_class = last_block_layer_data[1] or cache_type_name
+                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
+                        marker_class
+                    )
+                    axis_info = marker_handler.get_state_axis_info()
+                    layer_states = []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            logger.debug(
+                                f"Layer {layer_idx}: missing block data for "
+                                f"{marker_class}"
+                            )
+                            return None
+                        block_layer_data = block_data[layer_idx]
+                        if (
+                            not isinstance(block_layer_data, tuple)
+                            or len(block_layer_data) < 3
+                            or block_layer_data[0] != "__nstate__"
+                        ):
+                            logger.debug(
+                                f"Layer {layer_idx}: expected N-tuple block data "
+                                f"for {marker_class}"
+                            )
+                            return None
+                        elements = tuple(block_layer_data[2])
+                        state_dict = {
+                            "states": elements,
+                            "cache_type": marker_class,
+                        }
+                        for info, elem in zip(axis_info, elements):
+                            state_dict[info.name] = elem
+                        layer_states.append(state_dict)
+
+                    concat_state = marker_handler.concatenate_states(layer_states)
+                    cache = marker_handler.reconstruct_cache(concat_state, None)
+                    if cache is None:
+                        logger.error(
+                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
+                        )
+                        return None
+                    reconstructed_caches.append(cache)
+                    continue
+
+                # === Generic N-tuple non-sliceable cache: use latest boundary ===
                 if (
                     isinstance(last_block_layer_data, tuple)
                     and len(last_block_layer_data) >= 3
@@ -2568,13 +2653,13 @@ class BlockAwarePrefixCache(CacheManager):
             "BatchKVCache",
             "TurboQuantKVCache",
             "BatchTurboQuantKVCache",
+            "MiniMaxM3KVCache",
         }
         non_sliceable_types = {
             "ArraysCache",
             "RotatingKVCache",
             "BatchRotatingKVCache",
             "CacheList",
-            "MiniMaxM3KVCache",
             "MiniMaxM3BatchKVCache",
         }
 
@@ -2601,14 +2686,21 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     return False
 
-                keys, values = layer_data[0], layer_data[1]
-
-                # Check for None
-                if keys is None or values is None:
-                    logger.debug(
-                        f"Block validation failed: layer {layer_idx} has None keys/values"
-                    )
-                    return False
+                if (
+                    isinstance(layer_data, tuple)
+                    and len(layer_data) >= 3
+                    and layer_data[0] == "__nstate__"
+                ):
+                    elements = layer_data[2]
+                    if not isinstance(elements, (list, tuple)) or len(elements) < 2:
+                        logger.debug(
+                            f"Block validation failed: layer {layer_idx} has "
+                            "invalid N-tuple state"
+                        )
+                        return False
+                    keys, values = elements[0], elements[1]
+                else:
+                    keys, values = layer_data[0], layer_data[1]
 
                 # Skip seq_len check for non-sliceable types (e.g., ArraysCache, RotatingKVCache)
                 # This includes placeholder entries (1D tensors from non-last blocks)
@@ -2617,6 +2709,15 @@ class BlockAwarePrefixCache(CacheManager):
                     continue
                 if layer_cache_types and cache_type not in sliceable_types:
                     continue
+
+                # Check for None after non-sliceable N-tuple caches have been
+                # accepted. Pooling-style states can legitimately store None
+                # in their first elements.
+                if keys is None or values is None:
+                    logger.debug(
+                        f"Block validation failed: layer {layer_idx} has None keys/values"
+                    )
+                    return False
 
                 # Check shape consistency for sliceable types (KVCache, RotatingKVCache)
                 if hasattr(keys, "shape") and len(keys.shape) >= 3:

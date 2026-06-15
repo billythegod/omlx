@@ -1025,6 +1025,7 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
         "ChunkedKVCache",
+        "MiniMaxM3KVCache",
     }
 )
 

@@ -1084,6 +1084,12 @@ class CacheListHandler(CacheTypeHandler):
 
 
 def _minimax_index_offset(index_keys: Any, meta_state: Any | None = None) -> int:
+    if (
+        index_keys is not None
+        and hasattr(index_keys, "shape")
+        and len(index_keys.shape) >= 3
+    ):
+        return int(index_keys.shape[2])
     if isinstance(meta_state, str):
         try:
             return int(meta_state)
@@ -1094,12 +1100,6 @@ def _minimax_index_offset(index_keys: Any, meta_state: Any | None = None) -> int
             return int(meta_state[0])
         except (TypeError, ValueError):
             pass
-    if (
-        index_keys is not None
-        and hasattr(index_keys, "shape")
-        and len(index_keys.shape) >= 3
-    ):
-        return int(index_keys.shape[2])
     return 0
 
 
@@ -1162,6 +1162,17 @@ class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
     def cache_type(self) -> CacheType:
         return CacheType.MINIMAX_M3_KVCACHE
 
+    @property
+    def supports_block_slicing(self) -> bool:
+        return True
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("index_keys", 2, True),
+        )
+
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
         kv_state, index_state = cache_obj.state
         if kv_state is None:
@@ -1177,7 +1188,73 @@ class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
             "values": values,
             "index_keys": index_keys,
             "states": (keys, values, index_keys),
-            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+
+        keys = state.get("keys")
+        values = state.get("values")
+        index_keys = state.get("index_keys")
+        if keys is None or values is None:
+            return None
+
+        try:
+            seq_len = int(keys.shape[2])
+            actual_end = min(end_idx, seq_len)
+            if start_idx >= actual_end:
+                return None
+
+            keys_slice = keys[:, :, start_idx:actual_end, :]
+            values_slice = values[:, :, start_idx:actual_end, :]
+            if index_keys is not None:
+                index_end = min(actual_end, int(index_keys.shape[2]))
+                index_slice = index_keys[:, :, start_idx:index_end, :]
+            else:
+                index_slice = None
+
+            return {
+                "keys": keys_slice,
+                "values": values_slice,
+                "index_keys": index_slice,
+                "states": (keys_slice, values_slice, index_slice),
+                "cache_type": self.cache_type.value,
+            }
+        except Exception as e:
+            logger.warning("Failed to slice MiniMax M3 cache state: %s", e)
+            return None
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+
+        keys_list = [s.get("keys") for s in states if s.get("keys") is not None]
+        values_list = [
+            s.get("values") for s in states if s.get("values") is not None
+        ]
+        index_list = [
+            s.get("index_keys")
+            for s in states
+            if s.get("index_keys") is not None
+        ]
+        if not keys_list or not values_list:
+            return {}
+
+        keys = mx.concatenate(keys_list, axis=2)
+        values = mx.concatenate(values_list, axis=2)
+        index_keys = mx.concatenate(index_list, axis=2) if index_list else None
+        return {
+            "keys": keys,
+            "values": values,
+            "index_keys": index_keys,
+            "states": (keys, values, index_keys),
             "cache_type": self.cache_type.value,
         }
 

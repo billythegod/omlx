@@ -171,6 +171,7 @@ from .api.utils import (
     extract_text_content,
     has_nonleading_system_message,
     prepare_system_messages_for_template,
+    uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
@@ -981,23 +982,23 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     # Import audio engine classes lazily so that oMLX without the [audio]
     # extra still imports this module.
     try:
-        from omlx.engine.stt import STTEngine
+        from omlx.engine.stt import STTEngine as stt_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STTEngine = None  # type: ignore[assignment]
+        stt_engine_cls = None
     try:
-        from omlx.engine.tts import TTSEngine
+        from omlx.engine.tts import TTSEngine as tts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        TTSEngine = None  # type: ignore[assignment]
+        tts_engine_cls = None
     try:
-        from omlx.engine.sts import STSEngine
+        from omlx.engine.sts import STSEngine as sts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STSEngine = None  # type: ignore[assignment]
+        sts_engine_cls = None
 
-    if STTEngine is not None and isinstance(engine, STTEngine):
+    if stt_engine_cls is not None and isinstance(engine, stt_engine_cls):
         return "Use /v1/audio/transcriptions for speech-to-text models."
-    if TTSEngine is not None and isinstance(engine, TTSEngine):
+    if tts_engine_cls is not None and isinstance(engine, tts_engine_cls):
         return "Use /v1/audio/speech for text-to-speech models."
-    if STSEngine is not None and isinstance(engine, STSEngine):
+    if sts_engine_cls is not None and isinstance(engine, sts_engine_cls):
         return "Use /v1/audio/process for speech-to-speech / audio processing models."
     if isinstance(engine, EmbeddingEngine):
         return "Use /v1/embeddings for embedding models."
@@ -2925,7 +2926,18 @@ async def create_chat_completion(
     # get reasoning as a separate field; others fall back to <think> inlined
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     is_vlm = isinstance(engine, VLMBatchedEngine)
     is_dflash_vlm = not is_vlm and getattr(
         engine, "supports_multimodal_fallback", False
@@ -4723,7 +4735,18 @@ async def create_anthropic_message(
         engine, "supports_multimodal_fallback", False
     )
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request,
