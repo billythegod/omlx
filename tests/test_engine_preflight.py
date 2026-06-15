@@ -684,6 +684,7 @@ class TestRejectionMessageNamesBindingCeiling:
         dynamic: int,
         metal_cap: int,
         tier: str = "balanced",
+        hot_cache_reserved: int = 0,
     ) -> None:
         """Set the four propagated ceiling fields directly.
 
@@ -692,12 +693,14 @@ class TestRejectionMessageNamesBindingCeiling:
         fields plus ``_memory_hard_limit_bytes``.
         """
         sched._prefill_memory_guard = True
-        sched._memory_hard_limit_bytes = min(
-            v for v in (static, dynamic, metal_cap) if v > 0
-        )
+        hard_limit = min(v for v in (static, dynamic, metal_cap) if v > 0)
+        if hot_cache_reserved > 0:
+            hard_limit = max(1, hard_limit - hot_cache_reserved)
+        sched._memory_hard_limit_bytes = hard_limit
         sched._memory_static_ceiling_bytes = static
         sched._memory_dynamic_ceiling_bytes = dynamic
         sched._memory_metal_cap_bytes = metal_cap
+        sched._memory_hot_cache_reserved_bytes = hot_cache_reserved
         sched._memory_guard_tier = tier
         # Set_model_info populated dims at scheduler construction; we
         # only need a non-zero peak estimate to drive the rejection
@@ -710,9 +713,7 @@ class TestRejectionMessageNamesBindingCeiling:
         # Peak chosen larger than any ceiling tested below so the
         # rejection branch fires deterministically.
         sched.memory_monitor = MagicMock()
-        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = (
-            512 * 1024**3
-        )
+        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = 512 * 1024**3
 
         import omlx.scheduler as scheduler_mod
 
@@ -740,10 +741,11 @@ class TestRejectionMessageNamesBindingCeiling:
             sched, static=64 * 1024**3, dynamic=32 * 1024**3, metal_cap=16 * 1024**3
         )
         rej = self._force_rejection(sched, monkeypatch)
-        assert "iogpu.wired_limit_mb" in rej.message, (
-            f"metal_cap binding must steer user to the sysctl knob; got: {rej.message}"
-        )
+        assert (
+            "iogpu.wired_limit_mb" in rej.message
+        ), f"metal_cap binding must steer user to the sysctl knob; got: {rej.message}"
         assert "metal_cap ceiling" in rej.message
+        assert "caps Metal at 16.00 GB" in rej.message
 
     def test_dynamic_binding_under_custom_names_admin_setting(self, monkeypatch):
         sched = _make_scheduler()
@@ -778,6 +780,20 @@ class TestRejectionMessageNamesBindingCeiling:
             f"apps; got: {rej.message}"
         )
         assert "memory_guard_tier" in rej.message
+
+    def test_hot_cache_reservation_preserves_binding_label(self, monkeypatch):
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=32 * 1024**3,
+            metal_cap=16 * 1024**3,
+            hot_cache_reserved=2 * 1024**3,
+        )
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "metal_cap ceiling" in rej.message
+        assert "effective ceiling" not in rej.message
+        assert "caps Metal at 16.00 GB" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
         sched = _make_scheduler()

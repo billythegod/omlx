@@ -1481,6 +1481,7 @@ class Scheduler:
         self._memory_static_ceiling_bytes: int = 0
         self._memory_dynamic_ceiling_bytes: int = 0
         self._memory_metal_cap_bytes: int = 0
+        self._memory_hot_cache_reserved_bytes: int = 0
         # Tier name propagated alongside the breakdown. For ``custom`` the
         # "dynamic" ceiling is the user-pinned ``custom_ceiling_bytes``
         # rather than computed reclaimable memory, so the advice ladder
@@ -6567,7 +6568,6 @@ class Scheduler:
                 requested_tokens=min(new_tokens, self.config.prefill_step_size),
                 reason="prefill_preflight",
             )
-            from .utils.hardware import format_bytes
 
             message = self._format_rejection_message(
                 estimated=estimated,
@@ -6600,6 +6600,14 @@ class Scheduler:
             return safety_rejection
         return None
 
+    def _memory_component_limit_for_rejection(self, component_limit: int) -> int:
+        if component_limit <= 0:
+            return 0
+        hot_reserved = max(0, int(self._memory_hot_cache_reserved_bytes or 0))
+        if hot_reserved <= 0:
+            return component_limit
+        return max(1, component_limit - hot_reserved)
+
     def _format_rejection_message(
         self,
         *,
@@ -6625,11 +6633,17 @@ class Scheduler:
         metal_cap = self._memory_metal_cap_bytes
 
         binding: list[str] = []
-        if static and static == hard_limit:
+        if static and self._memory_component_limit_for_rejection(static) == hard_limit:
             binding.append("static")
-        if dynamic and dynamic == hard_limit:
+        if (
+            dynamic
+            and self._memory_component_limit_for_rejection(dynamic) == hard_limit
+        ):
             binding.append("dynamic")
-        if metal_cap and metal_cap == hard_limit:
+        if (
+            metal_cap
+            and self._memory_component_limit_for_rejection(metal_cap) == hard_limit
+        ):
             binding.append("metal_cap")
         binding_str = "/".join(binding) if binding else "effective"
 
@@ -6672,12 +6686,13 @@ class Scheduler:
                 "reduce context length or raise memory_guard_tier "
                 "(safe → balanced → aggressive)"
             )
+        advice = advice[:1].upper() + advice[1:]
 
         return (
             f"Prefill would require ~{format_bytes(estimated)} peak "
             f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
             f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
-            f"{advice.capitalize()}."
+            f"{advice}."
         )
 
     def preflight_or_raise(

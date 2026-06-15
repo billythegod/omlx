@@ -541,7 +541,10 @@ class TestDisabledWhenCeilingZero:
             mock_engine_pool,
             ceiling=0,
             breakdown={
-                "static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0,
+                "static": 0,
+                "dynamic": 0,
+                "metal_cap": 0,
+                "hard_limit": 0,
             },
         )
         bg = MagicMock(spec=[])
@@ -564,9 +567,7 @@ class TestDisabledWhenCeilingZero:
         assert bg._memory_hard_limit_bytes == 0
 
     @pytest.mark.asyncio
-    async def test_propagate_ceiling_components_to_scheduler(
-        self, mock_engine_pool
-    ):
+    async def test_propagate_ceiling_components_to_scheduler(self, mock_engine_pool):
         """All three component ceilings + the tier name must reach the
         scheduler so the binding-aware rejection message has the inputs
         it needs to identify which knob the operator should turn."""
@@ -602,14 +603,58 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_static_ceiling_bytes == static_b
         assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
         assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == 0
         assert scheduler._memory_guard_tier == "custom", (
             "tier name must reach the scheduler so the advice ladder can "
             "distinguish dynamic-on-custom (raise custom_ceiling_bytes) "
             "from dynamic-on-reclaim-tier (close other apps)"
         )
-        assert scheduler._memory_hard_limit_bytes == dynamic_b, (
-            "hard limit must be min of the three components"
+        assert (
+            scheduler._memory_hard_limit_bytes == dynamic_b
+        ), "hard limit must be min of the three components"
+
+    @pytest.mark.asyncio
+    async def test_propagates_hot_cache_reservation_for_binding_messages(
+        self, mock_engine_pool
+    ):
+        """The scheduler hard limit subtracts hot-cache reservation, so the
+        rejection formatter needs the same reservation to identify which
+        original component is binding."""
+        static_b = 64 * 1024**3
+        dynamic_b = 32 * 1024**3
+        metal_b = 16 * 1024**3
+        hot_reserved_b = 2 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=metal_b,
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": metal_b,
+            },
         )
+        enforcer._hot_cache_reserved_bytes = lambda: hot_reserved_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_hot_cache_reserved_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hard_limit_bytes == metal_b - hot_reserved_b
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
 
 
 class TestPrefillMemoryGuardToggle:

@@ -754,10 +754,13 @@ class ProcessMemoryEnforcer:
         used = self._hot_cache_used_bytes()
         return min(max_bytes, used + _HOT_CACHE_RESERVATION_SLACK_BYTES)
 
-    def _scheduler_limit_bytes(self, process_limit: int) -> int:
+    def _scheduler_limit_bytes(
+        self, process_limit: int, *, reserved: int | None = None
+    ) -> int:
         if process_limit <= 0:
             return 0
-        reserved = self._hot_cache_reserved_bytes()
+        if reserved is None:
+            reserved = self._hot_cache_reserved_bytes()
         if reserved <= 0:
             return process_limit
         return max(1, process_limit - reserved)
@@ -897,14 +900,20 @@ class ProcessMemoryEnforcer:
         """
         breakdown = self._get_ceiling_breakdown()
         ceiling = breakdown["hard_limit"]
-        scheduler_ceiling = self._scheduler_limit_bytes(ceiling)
+        abort_limit = self._get_abort_limit_bytes()
+        hot_cache_reserved = (
+            self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
+        )
+        scheduler_ceiling = self._scheduler_limit_bytes(
+            ceiling, reserved=hot_cache_reserved
+        )
         soft_limit = (
             int(scheduler_ceiling * self._soft_threshold)
             if scheduler_ceiling > 0
             else 0
         )
         scheduler_abort_limit = self._scheduler_limit_bytes(
-            self._get_abort_limit_bytes()
+            abort_limit, reserved=hot_cache_reserved
         )
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
@@ -962,6 +971,7 @@ class ProcessMemoryEnforcer:
             scheduler._memory_static_ceiling_bytes = breakdown["static"]
             scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
+            scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs
@@ -1343,9 +1353,15 @@ class ProcessMemoryEnforcer:
         dynamic_ceiling = self._get_dynamic_ceiling() if self._running else 0
         current = self._current_usage_bytes() if self._running else 0
         hot_reserved = self._hot_cache_reserved_bytes() if self._running else 0
-        scheduler_ceiling = self._scheduler_limit_bytes(ceiling) if self._running else 0
+        scheduler_ceiling = (
+            self._scheduler_limit_bytes(ceiling, reserved=hot_reserved)
+            if self._running
+            else 0
+        )
         scheduler_abort = (
-            self._scheduler_limit_bytes(self._get_abort_limit_bytes())
+            self._scheduler_limit_bytes(
+                self._get_abort_limit_bytes(), reserved=hot_reserved
+            )
             if self._running
             else 0
         )
