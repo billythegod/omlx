@@ -83,6 +83,7 @@ VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
+MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -119,6 +120,23 @@ def _read_config_model_type(model_path: str | Path) -> str | None:
         return None
     model_type = data.get("model_type")
     return model_type if isinstance(model_type, str) else None
+
+
+def _apply_minimax_m3_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX enable_thinking to MiniMax M3's thinking_mode template kwarg."""
+    if model_type not in MINIMAX_M3_MODEL_TYPES:
+        return
+    if "thinking_mode" in template_kwargs or "enable_thinking" not in template_kwargs:
+        return
+
+    enable_thinking = template_kwargs["enable_thinking"]
+    if enable_thinking is True:
+        template_kwargs["thinking_mode"] = "enabled"
+    elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -1971,6 +1989,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         # Use processor or its tokenizer for chat template application
         template_target = self._processor
@@ -2036,6 +2055,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
+                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -2293,6 +2313,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
+            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -3053,6 +3074,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         template_target = self._processor
         if not hasattr(template_target, "apply_chat_template"):

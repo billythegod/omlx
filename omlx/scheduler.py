@@ -2325,7 +2325,7 @@ class Scheduler:
         NOTE: Detokenizers are NOT pooled - each request gets a fresh instance
         to prevent state contamination that causes text corruption.
         """
-        detok = self._request_detokenizers.pop(request_id, None)
+        self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
     def _get_output_parser_session(
@@ -2773,9 +2773,6 @@ class Scheduler:
             block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
-        )
-        all_boundaries = (
-            boundary_enabled  # always stop at every boundary for hybrid models
         )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
@@ -4235,6 +4232,20 @@ class Scheduler:
             return None
         return getattr(factory, "thinking_end_text", None)
 
+    def _get_output_parser_thinking_start_text(self) -> str | None:
+        """Return parser-provided thinking open text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_text", None)
+
+    def _get_output_parser_thinking_start_output_text(self) -> str | None:
+        """Return normalized text to prepend when parser thinking starts in prompt."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_output_text", None)
+
     def _encode_thinking_marker(self, text: str) -> list[int] | None:
         """Encode a parser/tokenizer thinking marker into token IDs."""
         try:
@@ -4435,29 +4446,48 @@ class Scheduler:
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
+        think_start_ids = None
         think_start_id = self._get_think_token_id("think_start_id")
-        if think_start_id is None:
+        if think_start_id is not None:
+            think_start_ids = [think_start_id]
+        else:
+            think_start_text = self._get_output_parser_thinking_start_text() or "<think>"
             try:
-                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                if think_start_id == getattr(self.tokenizer, "unk_token_id", None):
-                    return False
+                token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
+                if (
+                    isinstance(token_id, int)
+                    and token_id != getattr(self.tokenizer, "unk_token_id", None)
+                ):
+                    think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
-                return False
+                think_start_ids = None
 
-        if not think_start_id or not request.prompt_token_ids:
+            if think_start_ids is None:
+                think_start_ids = self._encode_thinking_marker(think_start_text)
+
+        if not think_start_ids or not request.prompt_token_ids:
             return False
 
-        last_tokens = list(request.prompt_token_ids[-3:])
-        if think_start_id not in last_tokens:
+        lookback = max(3, len(think_start_ids) + 2)
+        last_tokens = list(request.prompt_token_ids[-lookback:])
+        last_idx = None
+        for idx in range(len(last_tokens) - len(think_start_ids), -1, -1):
+            if last_tokens[idx : idx + len(think_start_ids)] == think_start_ids:
+                last_idx = idx
+                break
+        if last_idx is None:
             return False
 
         # <think> found. Check if </think> follows it (disabled thinking pattern).
-        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1 :]
+        after_start = last_tokens[last_idx + len(think_start_ids) :]
 
         if after_start:
             think_end_ids = self._resolve_think_end_token_ids()
-            if think_end_ids and think_end_ids[0] in after_start:
+            if think_end_ids and len(after_start) >= len(think_end_ids):
+                for idx in range(len(after_start) - len(think_end_ids) + 1):
+                    if after_start[idx : idx + len(think_end_ids)] == think_end_ids:
+                        return False
+            elif think_end_ids and think_end_ids[0] in after_start:
                 return False
 
         return True
@@ -7148,9 +7178,9 @@ class Scheduler:
                     # Phase 2: conversation sparse prefill
                     conv_tokens = all_tokens[sys_count:]
                     selected = request.specprefill_indices
-                    M = len(conv_tokens)
+                    conv_len = len(conv_tokens)
                     pos_offset = request.specprefill_position_offset
-                    last_idx = M - 1
+                    last_idx = conv_len - 1
 
                     # Remove last token from selected set — BatchGenerator
                     # will process it separately for generation kickoff.
@@ -7169,11 +7199,11 @@ class Scheduler:
                             phase="specprefill_sparse",
                             detail="sparse target prefill",
                             extra={
-                                "scored_tokens": M,
+                                "scored_tokens": conv_len,
                                 "selected_tokens": int(selected.shape[0]),
                                 "keep_percent": (
-                                    round(int(selected.shape[0]) / M * 100)
-                                    if M > 0
+                                    round(int(selected.shape[0]) / conv_len * 100)
+                                    if conv_len > 0
                                     else 0
                                 ),
                                 "prompt_tokens": request.num_prompt_tokens,
@@ -7194,7 +7224,7 @@ class Scheduler:
                         progress_callback=_sparse_progress,
                     )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
-                    # adjustment = M - N'. Subtract 1 to account for the
+                    # adjustment = conv_len - selected_len'. Subtract 1 to account for the
                     # extra token BatchGenerator will process.
                     for _, layer in _find_attention_layers(self.model):
                         attn = _get_attn_module(layer)
@@ -7205,14 +7235,14 @@ class Scheduler:
                         ):
                             attn.rope._adjustment -= 1
 
-                    N = int(selected.shape[0])
+                    selected_len = int(selected.shape[0])
                     t_prefill = time.monotonic() - t0
                     total_prompt = request.num_prompt_tokens
                     cached = request.cached_tokens
                     logger.info(
-                        f"SpecPrefill: sparse prefill {N}/{M} conv tokens in {t_prefill:.1f}s "
+                        f"SpecPrefill: sparse prefill {selected_len}/{conv_len} conv tokens in {t_prefill:.1f}s "
                         f"(total {total_prompt}, cached {cached}, "
-                        f"system {sys_count} full, conv {M} sparse)"
+                        f"system {sys_count} full, conv {conv_len} sparse)"
                     )
 
                     # Set up request as if we had a prefix cache hit
@@ -7631,12 +7661,23 @@ class Scheduler:
                             new_text = ""
                         break
 
-            # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip when a protocol parser already manages reasoning formatting)
-            if parser_session is None and getattr(request, "needs_think_prefix", False):
+            # Prepend <think> tag for first chunk if this is a reasoning model.
+            # Protocol parsers may expose a normalized prefix when their prompt
+            # uses a model-specific open-think marker (e.g. MiniMax <mm:think>).
+            if getattr(request, "needs_think_prefix", False):
                 if not getattr(request, "think_prefix_sent", False):
-                    think_tag = getattr(self.tokenizer, "think_start", "<think>")
-                    new_text = think_tag + "\n" + new_text
+                    if parser_session is None:
+                        think_tag = getattr(self.tokenizer, "think_start", "<think>")
+                        prefix_text = think_tag + "\n"
+                    else:
+                        prefix_text = (
+                            self._get_output_parser_thinking_start_output_text()
+                            or ""
+                        )
+                    if prefix_text:
+                        new_text = prefix_text + new_text
+                        if parser_session is not None:
+                            request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)

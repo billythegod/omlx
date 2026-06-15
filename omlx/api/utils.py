@@ -48,6 +48,7 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|image\|>|<\|audio\|>|"  # Gemma 4 VLM special tokens
+    r"\[e~\[|\]~b\]|\]~!b\[|\]!p~\[|\]!d~\[|"  # MiniMax M3 special tokens
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
     r"<eos>|<bos>|<end_of_turn>|<start_of_turn>"  # Gemma special tokens (fixes #1087)
 )

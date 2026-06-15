@@ -472,10 +472,68 @@ class TestOutputParserFactory:
             visible.append(result.visible_text)
         final = session.finalize()
 
-        assert start in "".join(stream)
+        assert "".join(stream) == "before  after"
+        assert start not in "".join(stream)
         assert "".join(visible) + final.visible_text == "before  after"
         assert final.tool_calls == [{"name": "lookup", "arguments": '{"query":"mlx"}'}]
         assert final.finish_reason == "tool_calls"
+
+    def test_minimax_m3_parser_normalizes_thinking_and_strips_eos(self):
+        tokenizer = CohereTokenizer(
+            {
+                1: "<mm:think>",
+                2: "reasoning",
+                3: "</mm:think>",
+                4: "Answer",
+                5: "[e~[",
+                6: "]!d~[",
+            }
+        )
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        visible = []
+        stop_seen = False
+        record_flags = []
+        for token_id in [1, 2, 3, 4, 6, 5]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            stop_seen = stop_seen or result.is_stop
+            record_flags.append(result.record_token)
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert "".join(stream) == "<think>reasoning</think>Answer"
+        assert "".join(visible) == "<think>reasoning</think>Answer"
+        assert stop_seen is True
+        assert record_flags[-1] is False
+
+    def test_minimax_m3_factory_exposes_native_thinking_markers(self):
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: {
+            "[e~[": 200020,
+            "<mm:think>": 200059,
+            "</mm:think>": 200060,
+        }.get(text, -1)
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+
+        assert factory.thinking_start_text == "<mm:think>"
+        assert factory.thinking_start_output_text == "<think>\n"
+        assert factory.thinking_end_text == "</mm:think>"
+        assert factory.stop_token_ids == {200020}
 
     def test_detects_gemma4(self):
         tokenizer = GemmaTokenizer({1: "x"})

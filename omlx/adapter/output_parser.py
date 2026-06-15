@@ -63,6 +63,8 @@ class OutputParserFactory:
     kind: str
     create_session: Callable[[Any], OutputParserSession]
     stop_token_ids: set[int] = field(default_factory=set)
+    thinking_start_text: str | None = None
+    thinking_start_output_text: str | None = None
     thinking_end_text: str | None = None
     thinking_end_trailing_text: str | None = None
     # Marker strings that must survive special-token stripping so the
@@ -157,6 +159,10 @@ def _is_cohere2_moe_model(
 
 
 _MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+_MINIMAX_THINK_START = "<mm:think>"
+_MINIMAX_THINK_END = "</mm:think>"
+_MINIMAX_EOS_TOKEN = "[e~["
+_MINIMAX_SPECIAL_TOKENS = (_MINIMAX_EOS_TOKEN, "]~b]", "]~!b[", "]!p~[", "]!d~[")
 _MINIMAX_TOOL_CALL_START = "]<]minimax[>[<tool_call>"
 _MINIMAX_TOOL_CALL_END = "]<]minimax[>[</tool_call>"
 
@@ -183,6 +189,83 @@ def _is_minimax_m3_model(
     return "minimax" in lowered and "m3" in lowered
 
 
+class _MiniMaxM3ProtocolNormalizer:
+    """Normalize MiniMax M3 protocol markers to oMLX-visible markers."""
+
+    _REPLACEMENTS = (
+        (_MINIMAX_THINK_START, "<think>"),
+        (_MINIMAX_THINK_END, "</think>"),
+        *tuple((token, "") for token in _MINIMAX_SPECIAL_TOKENS),
+    )
+    _MARKERS = tuple(marker for marker, _ in _REPLACEMENTS)
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    @classmethod
+    def _replace_markers(cls, text: str) -> str:
+        for marker, replacement in cls._REPLACEMENTS:
+            text = text.replace(marker, replacement)
+        return text
+
+    @classmethod
+    def _partial_suffix_len(cls, text: str) -> int:
+        max_len = min(len(text), max(len(marker) for marker in cls._MARKERS) - 1)
+        for size in range(max_len, 0, -1):
+            suffix = text[-size:]
+            if any(marker.startswith(suffix) for marker in cls._MARKERS):
+                return size
+        return 0
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+
+        self._buffer += text
+        keep = self._partial_suffix_len(self._buffer)
+        if keep:
+            ready = self._buffer[:-keep]
+            self._buffer = self._buffer[-keep:]
+        else:
+            ready = self._buffer
+            self._buffer = ""
+        return self._replace_markers(ready)
+
+    def finish(self) -> str:
+        text = self._replace_markers(self._buffer)
+        self._buffer = ""
+        return text
+
+
+def _token_id_for_text(tokenizer: Any, text: str) -> int | None:
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(text)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        token_id = None
+    if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
+        try:
+            return int(token_id)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        try:
+            token_ids = tokenizer.encode(text)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if len(token_ids) == 1:
+        try:
+            return int(token_ids[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 class MiniMaxM3OutputParserSession:
     """Parser session for MiniMax M3 XML-style tool calls."""
 
@@ -196,10 +279,14 @@ class MiniMaxM3OutputParserSession:
         try:
             from ..api.tool_calling import ToolCallStreamFilter
 
+            self._stream_filter = ToolCallStreamFilter(tokenizer)
             self._visible_filter = ToolCallStreamFilter(tokenizer)
         except Exception as e:  # noqa: BLE001
             logger.debug("MiniMax M3 stream filter unavailable: %s", e)
+            self._stream_filter = None
             self._visible_filter = None
+        self._stream_normalizer = _MiniMaxM3ProtocolNormalizer()
+        self._visible_normalizer = _MiniMaxM3ProtocolNormalizer()
 
     def _decode_token(self, token_id: int) -> str:
         if self._detokenizer is not None:
@@ -210,20 +297,46 @@ class MiniMaxM3OutputParserSession:
         except TypeError:
             return self._tokenizer.decode([token_id])
 
-    def _visible_text(self, text: str) -> str:
+    def _filtered_text(
+        self,
+        text: str,
+        tool_filter: Any,
+        normalizer: _MiniMaxM3ProtocolNormalizer,
+    ) -> str:
         if not text:
             return ""
-        if self._visible_filter is None:
-            return text
-        return self._visible_filter.feed(text)
+        if tool_filter is not None:
+            text = tool_filter.feed(text)
+        return normalizer.feed(text)
+
+    def _finish_filtered_text(
+        self,
+        tool_filter: Any,
+        normalizer: _MiniMaxM3ProtocolNormalizer,
+    ) -> str:
+        text = ""
+        if tool_filter is not None:
+            text += normalizer.feed(tool_filter.finish())
+        text += normalizer.finish()
+        return text
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         decoded_text = self._decode_token(token_id)
         self._raw_text += decoded_text
+        is_stop = decoded_text == _MINIMAX_EOS_TOKEN
         return OutputParserTokenResult(
-            stream_text=decoded_text,
-            visible_text=self._visible_text(decoded_text),
-            record_token=True,
+            stream_text=self._filtered_text(
+                decoded_text,
+                self._stream_filter,
+                self._stream_normalizer,
+            ),
+            visible_text=self._filtered_text(
+                decoded_text,
+                self._visible_filter,
+                self._visible_normalizer,
+            ),
+            is_stop=is_stop,
+            record_token=not is_stop,
         )
 
     def finalize(self) -> OutputParserFinalizeResult:
@@ -234,11 +347,25 @@ class MiniMaxM3OutputParserSession:
             final_text = self._detokenizer.last_segment
             if final_text:
                 self._raw_text += final_text
-                stream_text += final_text
-                visible_text += self._visible_text(final_text)
+                stream_text += self._filtered_text(
+                    final_text,
+                    self._stream_filter,
+                    self._stream_normalizer,
+                )
+                visible_text += self._filtered_text(
+                    final_text,
+                    self._visible_filter,
+                    self._visible_normalizer,
+                )
 
-        if self._visible_filter is not None:
-            visible_text += self._visible_filter.finish()
+        stream_text += self._finish_filtered_text(
+            self._stream_filter,
+            self._stream_normalizer,
+        )
+        visible_text += self._finish_filtered_text(
+            self._visible_filter,
+            self._visible_normalizer,
+        )
 
         tool_calls: list[dict[str, str]] = []
         if _MINIMAX_TOOL_CALL_START in self._raw_text:
@@ -460,15 +587,24 @@ def detect_output_parser(
         )
 
     if _is_minimax_m3_model(model_name, model_config):
+        minimax_stop_ids = set()
+        eos_id = _token_id_for_text(tokenizer, _MINIMAX_EOS_TOKEN)
+        if eos_id is not None:
+            minimax_stop_ids.add(eos_id)
+
         return OutputParserFactory(
             kind="minimax_m3",
             create_session=lambda session_tokenizer: MiniMaxM3OutputParserSession(
                 session_tokenizer,
                 model_path=model_name,
             ),
-            stop_token_ids=set(),
-            thinking_end_text="</think>",
+            stop_token_ids=minimax_stop_ids,
+            thinking_start_text=_MINIMAX_THINK_START,
+            thinking_start_output_text="<think>\n",
+            thinking_end_text=_MINIMAX_THINK_END,
             protocol_marker_texts=(
+                _MINIMAX_THINK_START,
+                _MINIMAX_THINK_END,
                 _MINIMAX_TOOL_CALL_START,
                 _MINIMAX_TOOL_CALL_END,
             ),
