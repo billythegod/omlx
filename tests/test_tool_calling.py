@@ -7,10 +7,17 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 
 import json
 import logging
-import pytest
-
 from unittest.mock import MagicMock
 
+import pytest
+
+from omlx.api.openai_models import (
+    FunctionCall,
+    ResponseFormat,
+    ResponseFormatJsonSchema,
+    ToolCall,
+    ToolDefinition,
+)
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _gemma4_args_to_json_robust,
@@ -27,13 +34,6 @@ from omlx.api.tool_calling import (
     parse_tool_calls_with_thinking_fallback,
     restore_gemma4_param_names,
     validate_json_schema,
-)
-from omlx.api.openai_models import (
-    FunctionCall,
-    ResponseFormat,
-    ResponseFormatJsonSchema,
-    ToolCall,
-    ToolDefinition,
 )
 
 
@@ -734,6 +734,14 @@ class TestToolCallStreamFilter:
         result = f.feed(
             'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> After'
         )
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_minimax_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """MiniMax M3 namespaced envelope suppression should not eat prose."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed('Before ]<]minimax[>[<tool_call><invoke name="x">')
+        result += f.feed("]<]minimax[>[</invoke>]<]minimax[>[</tool_call> After")
         result += f.finish()
         assert result == "Before  After"
 

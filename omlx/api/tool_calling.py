@@ -24,9 +24,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from jsonschema import validate, ValidationError
+from jsonschema import ValidationError, validate
 
-from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -875,6 +875,7 @@ class ToolCallStreamFilter:
         if marker_end is None:
             marker_end = ""
         self._marker_pairs: List[Tuple[str, str]] = [
+            ("]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>"),
             ("<|tool_call_start|>", "<|tool_call_end|>"),
             ("<tool_call>", "</tool_call>"),
         ]
@@ -1046,6 +1047,11 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                # MiniMax M3 markers start with ``]``. A single closing
+                # bracket at end-of-stream is much more likely to be literal
+                # prose than an incomplete MiniMax control marker.
+                if tail == "]":
+                    continue
                 return True
 
         for close_marker in self._orphan_close_markers:
@@ -1193,6 +1199,9 @@ class ToolCallStreamFilter:
 
         if keep:
             buf = self._buffer[:-keep]
+            tail = self._buffer[-keep:]
+            if not self._should_drop_tail_at_finish(tail):
+                buf += tail
         else:
             buf = self._buffer
         self._buffer = ""

@@ -13,12 +13,13 @@ import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
 
-
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
 _CLOSE_TAG = "</think>"
 _OPEN_LEN = len(_OPEN_TAG)   # 7
 _CLOSE_LEN = len(_CLOSE_TAG)  # 8
+_MINIMAX_OPEN_TAG = "<mm:think>"
+_MINIMAX_CLOSE_TAG = "</mm:think>"
 
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
@@ -167,6 +168,10 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     """
     if not text:
         return ("", "")
+
+    text = text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG).replace(
+        _MINIMAX_CLOSE_TAG, _CLOSE_TAG
+    )
 
     thinking_parts = []
     remaining = text

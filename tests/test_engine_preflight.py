@@ -348,7 +348,6 @@ async def test_vlm_preflight_chat_converts_pydantic_tools(monkeypatch):
     scheduler.preflight_or_raise = lambda **k: None  # type: ignore[assignment]
 
     called_with = {}
-    original_apply = engine._apply_chat_template
 
     def _spy(messages, tools, **kwargs):
         called_with["tools"] = tools
