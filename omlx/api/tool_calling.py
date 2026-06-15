@@ -33,6 +33,64 @@ from .openai_models import FunctionCall, ResponseFormat, ToolCall
 logger = logging.getLogger(__name__)
 
 
+def _template_safe_description(value: Any) -> str:
+    """Return a string description safe for strict chat templates."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
+    """Copy JSON Schema data while filling missing schema descriptions."""
+    if isinstance(value, dict):
+        copied = {}
+        for key, child in value.items():
+            if key == "properties" and isinstance(child, dict):
+                copied[key] = {
+                    name: _copy_schema_with_template_defaults(
+                        prop_schema, is_schema=True
+                    )
+                    for name, prop_schema in child.items()
+                }
+            elif key in {
+                "items",
+                "additionalProperties",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+            }:
+                copied[key] = _copy_schema_with_template_defaults(child, is_schema=True)
+            elif key in {"oneOf", "anyOf", "allOf", "prefixItems"} and isinstance(
+                child, list
+            ):
+                copied[key] = [
+                    _copy_schema_with_template_defaults(item, is_schema=True)
+                    for item in child
+                ]
+            else:
+                copied[key] = _copy_schema_with_template_defaults(
+                    child, is_schema=False
+                )
+
+        if is_schema:
+            copied["description"] = _template_safe_description(
+                copied.get("description")
+            )
+        return copied
+
+    if isinstance(value, list):
+        return [
+            _copy_schema_with_template_defaults(item, is_schema=False) for item in value
+        ]
+
+    return value
+
+
 def _serialize_tool_call_arguments(arguments: Any) -> str:
     """Serialize parser output to a JSON-object arguments string.
 
@@ -1712,13 +1770,18 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
                     tool_func, "parameters", {"type": "object", "properties": {}}
                 )
 
+            if func_params is None:
+                func_params = {"type": "object", "properties": {}}
+
             converted.append(
                 {
                     "type": "function",
                     "function": {
                         "name": func_name,
-                        "description": func_desc,
-                        "parameters": func_params,
+                        "description": _template_safe_description(func_desc),
+                        "parameters": _copy_schema_with_template_defaults(
+                            func_params, is_schema=False
+                        ),
                     },
                 }
             )

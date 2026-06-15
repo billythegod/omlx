@@ -580,6 +580,81 @@ class TestConvertToolsForTemplate:
             "properties": {},
         }
 
+    def test_missing_descriptions_are_template_safe(self):
+        """Missing function and parameter descriptions render under strict Jinja."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "filters": {
+                                "type": "object",
+                                "properties": {
+                                    "limit": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        func = result[0]["function"]
+        assert func["description"] == ""
+        props = func["parameters"]["properties"]
+        assert props["query"]["description"] == ""
+        assert props["filters"]["description"] == ""
+        assert props["filters"]["properties"]["limit"]["description"] == ""
+
+        from jinja2 import Environment, StrictUndefined
+
+        template = Environment(undefined=StrictUndefined).from_string(
+            "{% for tool in tools %}"
+            "{% set tool = tool.function %}"
+            "{{ '// ' + tool.description }}"
+            "{% for param_name, param_spec in tool.parameters.properties.items() %}"
+            "{{ '// ' + param_spec.description }}"
+            "{% endfor %}"
+            "{% endfor %}"
+        )
+        template.render(tools=result)
+
+    def test_schema_defaults_do_not_mutate_input(self):
+        """Template safety normalization copies the input schema."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        assert (
+            "description"
+            not in tools[0]["function"]["parameters"]["properties"]["query"]
+        )
+        assert (
+            result[0]["function"]["parameters"]["properties"]["query"]["description"]
+            == ""
+        )
+
 
 class TestFormatToolCallForMessage:
     """Tests for format_tool_call_for_message function."""
