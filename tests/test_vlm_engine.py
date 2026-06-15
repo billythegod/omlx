@@ -711,7 +711,7 @@ class TestApplyChatTemplate:
         engine._apply_chat_template(messages)
 
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
-        assert call_kwargs["enable_thinking"] is False
+        assert "enable_thinking" not in call_kwargs
         assert call_kwargs["thinking_mode"] == "disabled"
 
     def test_minimax_m3_preserves_explicit_thinking_mode(self):
@@ -730,8 +730,26 @@ class TestApplyChatTemplate:
         )
 
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
-        assert call_kwargs["enable_thinking"] is False
+        assert "enable_thinking" not in call_kwargs
         assert call_kwargs["thinking_mode"] == "adaptive"
+
+    def test_minimax_m3_maps_request_enable_thinking_kwarg(self):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(
+            model_type="minimax_m3_vl",
+            tokenizer=tokenizer,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        engine._apply_chat_template(
+            messages,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert "enable_thinking" not in call_kwargs
+        assert call_kwargs["thinking_mode"] == "enabled"
 
     def test_fallback_when_no_template(self):
         """Tokenizer without apply_chat_template → manual concatenation."""

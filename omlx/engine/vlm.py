@@ -129,10 +129,10 @@ def _apply_minimax_m3_thinking_mode(
     """Map oMLX enable_thinking to MiniMax M3's thinking_mode template kwarg."""
     if model_type not in MINIMAX_M3_MODEL_TYPES:
         return
-    if "thinking_mode" in template_kwargs or "enable_thinking" not in template_kwargs:
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    if "thinking_mode" in template_kwargs:
         return
 
-    enable_thinking = template_kwargs["enable_thinking"]
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
