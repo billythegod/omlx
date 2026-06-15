@@ -23,6 +23,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let isLoading: Bool
     let estimatedSize: Int64
     let estimatedSizeFormatted: String?
+    let actualSize: Int64?
+    let actualSizeFormatted: String?
     let pinned: Bool?
     let isDefault: Bool?
     let engineType: String?
@@ -47,6 +49,21 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
     let settings: ModelSettingsDTO?
+}
+
+extension ModelDTO {
+    var sizeLabel: String {
+        if isLoading {
+            return estimatedSizeFormatted ?? ""
+        }
+        if let actual = actualSizeFormatted {
+            if let est = estimatedSizeFormatted, est != actual {
+                return "~\(actual) obs / \(est) est"
+            }
+            return "~\(actual) obs"
+        }
+        return estimatedSizeFormatted ?? ""
+    }
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {

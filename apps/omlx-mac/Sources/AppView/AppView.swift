@@ -45,6 +45,17 @@ struct AppView: View {
                 services.requestedSection = nil
             }
         }
+        .onAppear {
+            // Apply any pending requestedSection set before the window
+            // first mounted (e.g. "Model Settings…" from the menubar
+            // while AppView had never been opened). onChange does not
+            // fire for values already set at mount time.
+            if let requested = services.requestedSection {
+                if requested != .models { services.modelDetailID = nil }
+                selection = requested
+                services.requestedSection = nil
+            }
+        }
         .onChange(of: services.updates.confirmationUpdate, initial: true) { _, update in
             presentedUpdate = update
         }

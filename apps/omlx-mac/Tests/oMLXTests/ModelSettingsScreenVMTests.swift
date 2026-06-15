@@ -51,6 +51,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             isLoading: false,
             estimatedSize: 0,
             estimatedSizeFormatted: nil,
+            actualSize: nil,
+            actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
             engineType: nil,
