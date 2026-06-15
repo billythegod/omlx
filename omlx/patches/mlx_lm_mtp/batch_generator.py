@@ -195,6 +195,23 @@ def apply() -> bool:
                 gen_batch._omlx_mtp_activation_safe = (
                     _batch_generator_allows_mtp_activation(self)
                 )
+            if _generation_batch_has_active_mtp(gen_batch):
+                old_completion_batch_size = getattr(
+                    self,
+                    "completion_batch_size",
+                    None,
+                )
+                had_completion_batch_size = hasattr(self, "completion_batch_size")
+                # Force mlx-lm's "hands full" early return after generation,
+                # even if an active row-wise MTP batch shrinks during next().
+                self.completion_batch_size = 0
+                try:
+                    return original_bg_next(self, *args, **kwargs)
+                finally:
+                    if had_completion_batch_size:
+                        self.completion_batch_size = old_completion_batch_size
+                    elif hasattr(self, "completion_batch_size"):
+                        delattr(self, "completion_batch_size")
             return original_bg_next(self, *args, **kwargs)
 
         BatchGenerator._next = patched_bg_next
@@ -245,6 +262,28 @@ def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
         )
     except Exception:
         return False
+
+
+def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
+    """True while a generation batch owns Native MTP cache state.
+
+    mlx-lm's ``BatchGenerator._next`` generates first and then may promote
+    pending prompt work into the same ``GenerationBatch`` via ``extend()``. That
+    merge path forces MTP reconciliation, which can re-prefill a long streamed
+    context outside the scheduler's guarded prefill path. Treat active MTP as
+    a temporary full generation batch so late-join requests wait instead.
+    """
+    if gen_batch is None:
+        return False
+    try:
+        if len(gen_batch) == 0:
+            return False
+    except Exception:
+        pass
+    return (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
+    )
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:

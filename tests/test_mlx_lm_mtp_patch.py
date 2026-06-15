@@ -820,6 +820,128 @@ class TestBatchGeneratorDispatch:
             setattr(obj, attr, value)
             assert _batch_generator_allows_mtp_activation(obj) is False
 
+    def _make_bg_next_fake(self, *, size=1, next_size=None, active_state=None):
+        class _FakeGenerationBatch:
+            def __init__(self, size, next_size, active_state):
+                self.size = size
+                self.next_size = next_size
+                self.next_calls = 0
+                self.extended_with = None
+                if active_state == "single":
+                    self._omlx_mtp_state = object()
+                elif active_state == "batch":
+                    self._omlx_mtp_batch_state = object()
+
+            def __len__(self):
+                return self.size
+
+            def next(self):
+                self.next_calls += 1
+                if self.next_size is not None:
+                    self.size = self.next_size
+                return ["generation"]
+
+            def extend(self, gen_batch):
+                self.extended_with = gen_batch
+                self.size += len(gen_batch.uids)
+
+        class _FakePromptBatch:
+            def __init__(self):
+                self.split_indices = None
+                self.last_inputs = None
+                self.prompted = None
+
+            def __len__(self):
+                return 1
+
+            def extend(self, _batch):
+                raise AssertionError("prompt extend is not part of this probe")
+
+            def split(self, split):
+                self.split_indices = list(split)
+                return self
+
+            def generate(self, last_inputs):
+                self.last_inputs = list(last_inputs)
+                return SimpleNamespace(uids=[99])
+
+            def prompt(self, prompts):
+                self.prompted = list(prompts)
+
+        gen_batch = _FakeGenerationBatch(size, next_size, active_state)
+        prompt_batch = _FakePromptBatch()
+        bg = SimpleNamespace(
+            _generation_batch=gen_batch,
+            _prompt_batch=prompt_batch,
+            _currently_processing=[([[123]], 0, 1)],
+            _unprocessed_sequences=[],
+            _gen_tokens_counter=0,
+            _steps_counter=0,
+            _prompt_tokens_counter=0,
+            _prompt_time_counter=0.0,
+            completion_batch_size=4,
+            prefill_batch_size=1,
+        )
+        return bg, gen_batch, prompt_batch
+
+    def test_active_singleton_mtp_defers_late_join_extend(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(active_state="single")
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert prompt_responses == []
+        assert generation_responses == ["generation"]
+        assert gen_batch.next_calls == 1
+        assert gen_batch.extended_with is None
+        assert prompt_batch.split_indices is None
+        assert bg.completion_batch_size == 4
+
+    def test_active_rowwise_mtp_defers_late_join_even_when_batch_shrinks(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(
+            size=2,
+            next_size=1,
+            active_state="batch",
+        )
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert prompt_responses == []
+        assert generation_responses == ["generation"]
+        assert len(gen_batch) == 1
+        assert gen_batch.extended_with is None
+        assert prompt_batch.split_indices is None
+        assert bg.completion_batch_size == 4
+
+    def test_non_mtp_generation_batch_still_accepts_late_join_extend(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(active_state=None)
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert generation_responses == ["generation"]
+        assert len(prompt_responses) == 1
+        assert gen_batch.extended_with is not None
+        assert gen_batch.extended_with.uids == [99]
+        assert prompt_batch.split_indices == [0]
+        assert prompt_batch.last_inputs == [[123]]
+        assert bg.completion_batch_size == 4
+
+    def test_empty_generation_batch_with_stale_mtp_state_does_not_defer(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _EmptyBatch:
+            _omlx_mtp_state = batch_generator._MtpState(uid=1)
+
+            def __len__(self):
+                return 0
+
+        assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
+
     def test_rowwise_batch_eligibility_requires_safe_activation(self):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
