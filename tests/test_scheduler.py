@@ -3181,6 +3181,51 @@ class TestStoreCacheAdmissionBackpressure:
         assert list(scheduler.waiting) == []
         scheduler._ensure_batch_generator.assert_not_called()
 
+    def test_store_cache_stall_timer_clears_when_gate_recovers_before_freshness_wait(
+        self, mock_model, mock_tokenizer
+    ):
+        """A recovered store-cache gate must not accumulate stale stall time."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=2)
+        gate.note_submitted()
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-recovered")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+
+        gate.note_done()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=True)
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id is None
+
+        gate.note_submitted()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=False)
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+        assert scheduler._store_cache_admission_blocked_since == 61.0
+        scheduler._ensure_batch_generator.assert_not_called()
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):

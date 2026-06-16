@@ -7412,6 +7412,8 @@ class Scheduler:
                     break
 
             request = self.waiting[0]
+            self._clear_memory_admission_blocker(request.request_id)
+            self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):
                 break
 
