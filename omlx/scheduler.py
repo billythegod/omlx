@@ -1517,6 +1517,8 @@ class Scheduler:
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
+        self._store_cache_admission_blocked_request_id: str | None = None
+        self._store_cache_admission_blocked_since: float = 0.0
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -3109,6 +3111,7 @@ class Scheduler:
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
+    _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3514,9 +3517,22 @@ class Scheduler:
         self._memory_admission_blocked_request_id = None
         self._memory_admission_blocked_since = 0.0
 
+    def _clear_store_cache_admission_blocker(
+        self, request_id: str | None = None
+    ) -> None:
+        if (
+            request_id is not None
+            and request_id != self._store_cache_admission_blocked_request_id
+        ):
+            return
+        self._store_cache_admission_blocked_request_id = None
+        self._store_cache_admission_blocked_since = 0.0
+
     def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
+        self._clear_memory_admission_blocker(request_id)
+        self._clear_store_cache_admission_blocker(request_id)
 
     def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
         """Fail one head-of-line request after persistent memory admission stall."""
@@ -3564,6 +3580,73 @@ class Scheduler:
                 "request_id": request_id,
                 "reason": reason,
                 "stalled_seconds": int(stalled_for),
+            },
+        )
+
+    def _store_cache_admission_stall_output(
+        self,
+        reason: str,
+        *,
+        gate_in_flight: int,
+        gate_cap: int,
+        pending_cleanups: int,
+    ) -> RequestOutput | None:
+        """Fail one head-of-line request after persistent store-cache stall."""
+        if not self.waiting:
+            self._clear_store_cache_admission_blocker()
+            return None
+
+        request = self.waiting[0]
+        request_id = request.request_id
+        now = time.monotonic()
+        if request_id != self._store_cache_admission_blocked_request_id:
+            self._store_cache_admission_blocked_request_id = request_id
+            self._store_cache_admission_blocked_since = now
+            return None
+
+        timeout = getattr(
+            self,
+            "_STORE_CACHE_ADMISSION_STALL_TIMEOUT_S",
+            Scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S,
+        )
+        if now - self._store_cache_admission_blocked_since < timeout:
+            return None
+
+        stalled_for = now - self._store_cache_admission_blocked_since
+        self.waiting.popleft()
+        self._release_paged_cache_for_request(request_id)
+        self.requests.pop(request_id, None)
+        self._clear_request_admission_bookkeeping(request_id)
+        get_prefill_tracker().remove(request_id)
+
+        message = (
+            "Request could not be admitted because store-cache cleanup stayed "
+            f"full for {stalled_for:.1f}s ({reason}). The previous response "
+            "cache is still being persisted; retry after the cache writer drains "
+            "or reduce cache/write pressure."
+        )
+        logger.warning(
+            "Store-cache admission stalled for %s: %s "
+            "(in_flight=%d pending_cleanups=%d cap=%d)",
+            request_id,
+            message,
+            gate_in_flight,
+            pending_cleanups,
+            gate_cap,
+        )
+        return RequestOutput(
+            request_id=request_id,
+            finished=True,
+            finish_reason="error",
+            error=message,
+            error_code="store_cache_admission_stalled",
+            error_metadata={
+                "request_id": request_id,
+                "reason": reason,
+                "stalled_seconds": int(stalled_for),
+                "store_cache_in_flight": gate_in_flight,
+                "pending_store_cleanups": pending_cleanups,
+                "store_cache_cap": gate_cap,
             },
         )
 
@@ -7283,8 +7366,25 @@ class Scheduler:
                     except Exception:
                         memory_related_gate = False
                 if memory_related_gate:
+                    if self.waiting:
+                        self._clear_store_cache_admission_blocker(
+                            self.waiting[0].request_id
+                        )
                     stalled = self._memory_admission_stall_output(
                         "store_cache_backpressure"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
+                else:
+                    if self.waiting:
+                        self._clear_memory_admission_blocker(
+                            self.waiting[0].request_id
+                        )
+                    stalled = self._store_cache_admission_stall_output(
+                        "store_cache_backpressure",
+                        gate_in_flight=gate.in_flight,
+                        gate_cap=gate.cap,
+                        pending_cleanups=pending_store_cleanups,
                     )
                     if stalled is not None:
                         rejected_outputs.append(stalled)
@@ -7318,6 +7418,7 @@ class Scheduler:
             request = self.waiting.popleft()
             self._cache_freshness_waits.pop(request.request_id, None)
             self._clear_memory_admission_blocker(request.request_id)
+            self._clear_store_cache_admission_blocker(request.request_id)
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)

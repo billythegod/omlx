@@ -3151,6 +3151,36 @@ class TestStoreCacheAdmissionBackpressure:
         assert list(scheduler.waiting) == []
         assert scheduler.running[running.request_id] is running
 
+    def test_store_cache_gate_fails_persistent_non_memory_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store-cache gate must not leave admission waiting forever."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=1)
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-stalled")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._store_cache_admission_blocked_request_id = request.request_id
+        scheduler._store_cache_admission_blocked_since = 0.0
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "store_cache_admission_stalled"
+        assert rejected[0].error_metadata["store_cache_in_flight"] == 1
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        scheduler._ensure_batch_generator.assert_not_called()
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):
