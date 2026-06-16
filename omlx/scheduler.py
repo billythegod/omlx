@@ -5465,6 +5465,12 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids[
                         block_table.num_tokens :
                     ]
+                    if self._align_minimax_m3_partial_cache_to_prefill_step(request):
+                        request.cached_tokens = block_table.num_tokens
+                        request.shared_prefix_blocks = len(block_table.block_ids)
+                        request.remaining_tokens = request.prompt_token_ids[
+                            block_table.num_tokens :
+                        ]
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -6132,20 +6138,31 @@ class Scheduler:
 
     def _trim_prompt_cache_for_generation(self, cache_list: list[Any]) -> bool:
         """Trim each cache layer by one token for exact-hit generation kickoff."""
+        return self._trim_prompt_cache_by_tokens(cache_list, 1)
+
+    def _trim_prompt_cache_by_tokens(self, cache_list: list[Any], n: int) -> bool:
+        """Trim each cache layer by n tokens."""
         if not cache_list:
             return False
+        if n <= 0:
+            return True
 
         for cache_obj in cache_list:
-            if not self._trim_cache_tree_by_one(cache_obj):
+            if not self._trim_cache_tree_by_tokens(cache_obj, n):
                 return False
         return True
 
     def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
         """Trim one token from cache object (recursively for CacheList)."""
+        return self._trim_cache_tree_by_tokens(cache_obj, 1)
+
+    def _trim_cache_tree_by_tokens(self, cache_obj: Any, n: int) -> bool:
+        """Trim n tokens from cache object (recursively for CacheList)."""
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
             return all(
-                self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches
+                self._trim_cache_tree_by_tokens(sub_cache, n)
+                for sub_cache in sub_caches
             )
 
         trim_fn = getattr(cache_obj, "trim", None)
@@ -6153,12 +6170,113 @@ class Scheduler:
             return False
 
         try:
-            trimmed = trim_fn(1)
+            trimmed = trim_fn(n)
             if trimmed is None:
                 return True
-            return int(trimmed) >= 1
+            return int(trimmed) >= n
         except Exception:
             return False
+
+    def _cache_tree_has_class_name(
+        self,
+        cache_obj: Any,
+        class_names: frozenset[str],
+    ) -> bool:
+        """Return True when a cache tree contains one of the named cache classes."""
+        if type(cache_obj).__name__ in class_names:
+            return True
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return any(
+                self._cache_tree_has_class_name(sub_cache, class_names)
+                for sub_cache in sub_caches
+            )
+        return False
+
+    def _align_minimax_m3_partial_cache_to_prefill_step(
+        self,
+        request: "Request",
+    ) -> bool:
+        """Align MiniMax M3 partial hits to external prefill chunk boundaries."""
+        cache_list = request.prompt_cache
+        block_table = request.block_table
+        prompt_tokens = request.prompt_token_ids or []
+        if not cache_list or block_table is None or not block_table.block_ids:
+            return False
+        if (
+            block_table.num_tokens <= 0
+            or block_table.num_tokens >= len(prompt_tokens)
+        ):
+            return False
+
+        minimax_m3_names = frozenset({"MiniMaxM3KVCache"})
+        has_minimax_m3 = any(
+            self._cache_tree_has_class_name(cache_obj, minimax_m3_names)
+            for cache_obj in cache_list
+        )
+        if not has_minimax_m3:
+            return False
+
+        block_size = int(getattr(self.config, "paged_cache_block_size", 0) or 0)
+        prefill_step = int(getattr(self.config, "prefill_step_size", 0) or 0)
+        if block_size <= 0 or prefill_step <= block_size:
+            return False
+
+        aligned_tokens = (block_table.num_tokens // prefill_step) * prefill_step
+        aligned_tokens = (aligned_tokens // block_size) * block_size
+        if aligned_tokens <= 0 or aligned_tokens >= block_table.num_tokens:
+            return False
+
+        target_block_count = 0
+        target_tokens = 0
+        for block_id in block_table.block_ids:
+            block = (
+                self.paged_cache_manager.allocated_blocks.get(block_id)
+                if self.paged_cache_manager is not None
+                else None
+            )
+            token_count = int(getattr(block, "token_count", block_size) or block_size)
+            if target_tokens + token_count > aligned_tokens:
+                break
+            target_tokens += token_count
+            target_block_count += 1
+
+        if target_tokens != aligned_tokens:
+            logger.debug(
+                "MiniMax M3 partial cache alignment skipped for %s: cannot align "
+                "block table from %d to %d tokens",
+                request.request_id,
+                block_table.num_tokens,
+                aligned_tokens,
+            )
+            return False
+
+        trim_tokens = block_table.num_tokens - aligned_tokens
+        if not self._trim_prompt_cache_by_tokens(cache_list, trim_tokens):
+            logger.debug(
+                "MiniMax M3 partial cache alignment skipped for %s: cache trim "
+                "by %d tokens failed",
+                request.request_id,
+                trim_tokens,
+            )
+            return False
+
+        dropped_block_ids = block_table.block_ids[target_block_count:]
+        if self.paged_cache_manager is not None:
+            for block_id in dropped_block_ids:
+                self.paged_cache_manager.free_block(block_id)
+        block_table.block_ids = block_table.block_ids[:target_block_count]
+        block_table.num_tokens = aligned_tokens
+
+        logger.info(
+            "MiniMax M3 partial cache aligned to prefill step for %s: "
+            "%d -> %d tokens, dropped %d block(s)",
+            request.request_id,
+            aligned_tokens + trim_tokens,
+            aligned_tokens,
+            len(dropped_block_ids),
+        )
+        return True
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
         """Remove UID from BatchGenerator safely.
