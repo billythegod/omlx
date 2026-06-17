@@ -14,8 +14,6 @@ struct Popup<Value: Hashable>: View {
     let options: [PopupOption<Value>]
     let width: CGFloat?
 
-    @Environment(\.omlxTheme) private var theme
-
     init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
         self.titleKey = titleKey
         self._selection = selection
@@ -39,10 +37,7 @@ struct Popup<Value: Hashable>: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-    }
-
-    private var currentLabel: String {
-        options.first(where: { $0.value == selection })?.label ?? "—"
+        .frame(maxWidth: width)
     }
 }
 
