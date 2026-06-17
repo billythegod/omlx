@@ -5998,8 +5998,8 @@ class Scheduler:
             )
             return None
 
-        # Handle both LanguageModelOutput (dense models) and 3-tuple
-        # (logits, hidden, gdn_states) returned by the MoE MTP runtime patch.
+        # Handle current LanguageModelOutput and legacy tuple
+        # (logits, hidden, gdn_states) MTP runtime patch returns.
         if isinstance(out, tuple):
             logits = out[0][:, -1, :]
             hidden_raw = out[1]
