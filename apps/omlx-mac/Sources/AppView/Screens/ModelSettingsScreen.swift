@@ -27,7 +27,7 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model, onBack: { services.modelDetailID = nil })
+            Header(model: vm.model)
 
             SectionPicker(selection: $vm.section)
 
@@ -61,7 +61,25 @@ struct ModelSettingsScreen: View {
                     .padding(.top, 8)
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                backButton
+            }
+        }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+    }
+
+    @ViewBuilder
+    private var backButton: some View {
+        Button {
+            services.modelDetailID = nil
+        } label: {
+            Label(String(localized: "settings.header.back_to_models",
+                         defaultValue: "Back to Models",
+                         comment: "Back button label at the top of the per-model settings screen"),
+                  systemImage: "chevron.left")
+                .labelStyle(.iconOnly)
+        }
     }
 }
 
@@ -69,8 +87,6 @@ struct ModelSettingsScreen: View {
 
 private struct Header: View {
     let model: ModelDTO?
-    let onBack: () -> Void
-
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -96,17 +112,7 @@ private struct Header: View {
                 }
             }
             .layoutPriority(1)
-            Spacer(minLength: 8)
-            Button {
-                onBack()
-            } label: {
-                Label(String(localized: "settings.header.back_to_models",
-                             defaultValue: "Back to Models",
-                             comment: "Back button label at the top of the per-model settings screen"),
-                      systemImage: "chevron.left")
-                    .labelStyle(.titleAndIcon)
-            }
-            .buttonStyle(.omlx(.plain, size: .small))
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
@@ -126,7 +132,6 @@ private struct SectionPicker: View {
                     ($0, $0.label)
                 }
             )
-            .frame(width: 320)
             Spacer()
         }
         .padding(.horizontal, 14)
