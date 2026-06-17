@@ -834,6 +834,38 @@ class TestExposedProfileModels:
 
         assert temperature == 0.9
 
+    @pytest.mark.asyncio
+    async def test_get_engine_passes_exposed_profile_runtime_settings(self, manager):
+        import omlx.server as server_module
+
+        class RuntimePool:
+            def __init__(self):
+                self.calls = []
+
+            async def get_engine(self, model_id, **kwargs):
+                self.calls.append((model_id, kwargs))
+                return MagicMock(spec=server_module.BaseEngine)
+
+        pool = RuntimePool()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(temperature=0.1, mtp_enabled=False),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"temperature": 0.9, "mtp_enabled": True},
+        )
+        server_module._server_state.engine_pool = pool
+
+        await server_module.get_engine("qwen-base:thinking")
+
+        assert pool.calls[0][0] == "qwen-base"
+        runtime_settings = pool.calls[0][1]["runtime_settings"]
+        assert runtime_settings.temperature == 0.9
+        assert runtime_settings.mtp_enabled is True
+        assert manager.get_settings("qwen-base").temperature == 0.1
+        assert manager.get_settings("qwen-base").mtp_enabled is False
+
     def test_thinking_budget_uses_exposed_profile_settings(self, manager):
         import omlx.server as server_module
         from omlx.engine_pool import EnginePool

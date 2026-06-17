@@ -879,14 +879,34 @@ async def get_engine(
             status_code=400, detail="No model specified and no default model set"
         )
 
-    # Resolve alias to real model_id
-    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    # Resolve alias/profile request to the physical model. Exposed profiles
+    # may carry engine-construction settings (MTP/DFlash/etc.); pass those
+    # transient settings to the pool so the loaded variant can switch without
+    # mutating the base model's persisted settings.
+    requested_model_id = model_id
+    runtime_settings = None
+    sm = _server_state.settings_manager
+    if (
+        engine_type == EngineType.LLM
+        and sm is not None
+        and hasattr(sm, "get_exposed_profile_runtime_settings_for_request")
+    ):
+        runtime = sm.get_exposed_profile_runtime_settings_for_request(
+            requested_model_id
+        )
+        if runtime is not None:
+            model_id, runtime_settings = runtime
+        else:
+            model_id = pool.resolve_model_id(model_id, sm)
+    else:
+        model_id = pool.resolve_model_id(model_id, sm)
     _wake_process_memory_enforcer(active=True)
 
-    # Only thread the _lease kwarg through when a lease is actually requested,
-    # so the common non-lease path keeps the original pool.get_engine(model_id)
-    # call contract (LLM/STT/TTS/STS handlers, and pool mocks, never lease).
+    # Only thread optional kwargs through when they are needed, so the common
+    # path keeps the original pool.get_engine(model_id) call shape.
     _lease_kwargs = {"_lease": True} if _lease else {}
+    if runtime_settings is not None:
+        _lease_kwargs["runtime_settings"] = runtime_settings
     try:
         engine = await pool.get_engine(model_id, **_lease_kwargs)
         if _lease and _leased_out is not None:
@@ -905,8 +925,9 @@ async def get_engine(
             )
             try:
                 _wake_process_memory_enforcer(active=True)
+                _fallback_kwargs = {"_lease": True} if _lease else {}
                 fb_engine = await pool.get_engine(
-                    _server_state.default_model, **_lease_kwargs
+                    _server_state.default_model, **_fallback_kwargs
                 )
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
@@ -1300,9 +1321,13 @@ def get_model_settings_for_request(model_id: str | None):
     if not model_id or sm is None:
         return None
 
+    resolved_model_id = resolve_model_id(model_id)
+    if not hasattr(sm, "get_settings_for_request"):
+        return sm.get_settings(resolved_model_id or model_id)
+
     return sm.get_settings_for_request(
         model_id,
-        resolved_model_id=resolve_model_id(model_id),
+        resolved_model_id=resolved_model_id,
     )
 
 
@@ -2376,7 +2401,10 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             for profile in settings_manager.list_exposed_profile_models():
                 source_model_id = profile["source_model_id"]
                 profile_model_id = profile["model_id"]
-                if source_model_id not in physical_ids or profile_model_id in existing_ids:
+                if (
+                    source_model_id not in physical_ids
+                    or profile_model_id in existing_ids
+                ):
                     continue
                 models.append(
                     ModelInfo(
