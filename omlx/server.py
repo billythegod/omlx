@@ -2201,6 +2201,48 @@ def _with_markitdown_status(status: dict) -> dict:
     return augmented
 
 
+def _with_exposed_profile_status(status: dict) -> dict:
+    settings_manager = _server_state.settings_manager
+    if settings_manager is None:
+        return status
+
+    list_profiles = getattr(settings_manager, "list_exposed_profile_models", None)
+    if not callable(list_profiles):
+        return status
+
+    augmented = dict(status)
+    models = [dict(m) for m in augmented.get("models", [])]
+    by_id = {m.get("id"): m for m in models}
+    existing_ids = set(by_id)
+    for profile in list_profiles():
+        source_model_id = profile.get("source_model_id")
+        profile_model_id = profile.get("model_id")
+        if (
+            not source_model_id
+            or not profile_model_id
+            or source_model_id not in by_id
+            or profile_model_id in existing_ids
+        ):
+            continue
+        profile_status = dict(by_id[source_model_id])
+        profile_status.update(
+            {
+                "id": profile_model_id,
+                "source_model_id": source_model_id,
+                "profile_name": profile.get("name"),
+                "profile_api_name": profile.get("api_name"),
+                "profile_display_name": profile.get("display_name"),
+            }
+        )
+        models.append(profile_status)
+        existing_ids.add(profile_model_id)
+
+    augmented["models"] = models
+    augmented["model_count"] = len(models)
+    augmented["loaded_count"] = sum(1 for m in models if m.get("loaded"))
+    return augmented
+
+
 async def _preprocess_markitdown_files_for_llm(
     request: ChatCompletionRequest,
 ) -> ChatCompletionRequest:
@@ -2433,7 +2475,9 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    status = _with_markitdown_status(_server_state.engine_pool.get_status())
+    status = _with_exposed_profile_status(
+        _with_markitdown_status(_server_state.engine_pool.get_status())
+    )
     for m in status["models"]:
         model_id = m["id"]
         if is_markitdown_model(model_id):
@@ -2442,13 +2486,22 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
+        source_model_id = m.get("source_model_id") or model_id
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(model_id)
-            if ms and ms.model_alias:
-                m["model_alias"] = ms.model_alias
+            sm = _server_state.settings_manager
+            if hasattr(sm, "get_settings_for_request"):
+                ms = sm.get_settings_for_request(
+                    model_id,
+                    resolved_model_id=source_model_id,
+                )
+            else:
+                ms = sm.get_settings(source_model_id)
+            base_ms = sm.get_settings(source_model_id)
+            if base_ms and base_ms.model_alias and source_model_id == model_id:
+                m["model_alias"] = base_ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         m["max_tokens"] = max_tokens

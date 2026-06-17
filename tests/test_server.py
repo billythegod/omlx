@@ -746,7 +746,18 @@ class TestExposedProfileModels:
 
     class _FakePool:
         def get_status(self):
-            return {"models": [{"id": "qwen-base"}]}
+            return {
+                "models": [
+                    {
+                        "id": "qwen-base",
+                        "loaded": True,
+                        "pinned": False,
+                        "engine_type": "vlm",
+                        "model_type": "vlm",
+                        "config_model_type": "gemma4",
+                    }
+                ]
+            }
 
         def resolve_model_id(self, model_id, settings_manager=None):
             if settings_manager is not None:
@@ -797,6 +808,38 @@ class TestExposedProfileModels:
         assert "qwen-base:thinking" in model_ids
         profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
         assert profile_model.max_model_len == 4096
+
+    @pytest.mark.asyncio
+    async def test_v1_models_status_includes_exposed_profile_capabilities(
+        self, manager
+    ):
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(max_context_window=100000, max_tokens=8192),
+        )
+        self._save_exposed_profile(
+            manager,
+            {
+                "max_context_window": 4096,
+                "max_tokens": 1024,
+                "enable_thinking": True,
+            },
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        status = await server_module.list_models_status(True)
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert profile_model["source_model_id"] == "qwen-base"
+        assert profile_model["model_type"] == "vlm"
+        assert profile_model["engine_type"] == "vlm"
+        assert profile_model["config_model_type"] == "gemma4"
+        assert profile_model["max_context_window"] == 4096
+        assert profile_model["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
