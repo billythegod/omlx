@@ -113,7 +113,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         cache: Any | None = None,
         prev_topk_indices: mx.array | None = None,
     ):
-        batch_size, seq_len, hidden_dim = x.shape
+        batch_size, seq_len, _hidden_dim = x.shape
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
         q = self.q_b_proj(qr)
@@ -195,9 +195,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if seq_len == 1:
             output = self.unembed_out(output)
 
-        output = output.transpose(0, 2, 1, 3).reshape(
-            batch_size, seq_len, hidden_dim
-        )
+        output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         return self.o_proj(output), topk_indices
 
 
