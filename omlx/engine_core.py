@@ -376,7 +376,6 @@ class EngineCore:
                     # thread-safe and per-token streaming intact.
                     collectors = self._output_collectors
                     states = self._stream_states
-                    events = self._finished_events
                     eviction_request = None
                     distributed = False
 
@@ -750,7 +749,8 @@ class EngineCore:
         if stale:
             logger.debug(
                 "Reaped %d orphaned output collector(s) after disconnect: %s",
-                len(stale), stale,
+                len(stale),
+                stale,
             )
         return len(stale)
 

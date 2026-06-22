@@ -355,7 +355,9 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_add_request_cleans_up_if_scheduler_insert_fails(self, mock_model, mock_tokenizer):
+    async def test_add_request_cleans_up_if_scheduler_insert_fails(
+        self, mock_model, mock_tokenizer
+    ):
         """If the scheduler insert fails/cancels after the collector is created,
         add_request must drop the tracking (and abort) so no phantom collector
         leaks that the reaper can't see — it was never stamped finished
@@ -367,7 +369,8 @@ class TestEngineCoreAddRequest:
             try:
                 await engine.start()
                 engine.scheduler.add_request = MagicMock(
-                    side_effect=RuntimeError("insert boom"))
+                    side_effect=RuntimeError("insert boom")
+                )
                 engine.scheduler.abort_request = MagicMock(return_value=True)
 
                 with pytest.raises(RuntimeError):
@@ -1633,10 +1636,14 @@ class TestOrphanedCollectorReaping:
 
                 # orphan: finished long ago, consumer never cleaned up.
                 orphan = RequestOutputCollector()
-                orphan.put(RequestOutput(
-                    request_id="orphan", finished=True,
-                    finish_reason="abort", new_text="partial",
-                ))
+                orphan.put(
+                    RequestOutput(
+                        request_id="orphan",
+                        finished=True,
+                        finish_reason="abort",
+                        new_text="partial",
+                    )
+                )
                 engine._output_collectors["orphan"] = orphan
                 engine._finished_events["orphan"] = asyncio.Event()
                 engine._finished_at["orphan"] = now - 100.0
@@ -1667,7 +1674,9 @@ class TestOrphanedCollectorReaping:
             finally:
                 engine.close()
 
-    def test_mark_request_finished_stamps_once_and_signals(self, mock_model, mock_tokenizer):
+    def test_mark_request_finished_stamps_once_and_signals(
+        self, mock_model, mock_tokenizer
+    ):
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
@@ -1736,10 +1745,14 @@ class TestOrphanedCollectorReaping:
 
                 # Deliver the completed result, then simulate the reaper popping
                 # the dict entry BEFORE generate() resumes to drain it.
-                collector.put(RequestOutput(
-                    request_id=request_id, finished=True,
-                    finish_reason="stop", new_text="done",
-                ))
+                collector.put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="stop",
+                        new_text="done",
+                    )
+                )
                 engine._output_collectors.pop(request_id)
                 engine._finished_events[request_id].set()
 
