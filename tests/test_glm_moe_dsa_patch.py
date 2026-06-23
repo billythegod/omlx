@@ -301,6 +301,79 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert topk_indices.shape == (1, 1, 2, 2048)
 
 
+def test_glm_direct_sparse_mla_defaults_off_without_native(monkeypatch):
+    glm_moe_dsa = _load_patched_glm_module()
+
+    monkeypatch.setattr(
+        glm_moe_dsa,
+        "glm_fast",
+        SimpleNamespace(has=lambda name: False),
+    )
+    monkeypatch.delenv("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", raising=False)
+
+    assert int(glm_moe_dsa._native_sparse_mla_default_min_k()) > 10**12
+    assert glm_moe_dsa._direct_sparse_mla_policy("0") == (False, False)
+    assert glm_moe_dsa._direct_sparse_mla_policy("1") == (True, False)
+
+    monkeypatch.setenv("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", "strict")
+    assert glm_moe_dsa._direct_sparse_mla_policy("0") == (True, True)
+
+
+def test_glm_sparse_topk_mask_fallback_matches_pure_mlx():
+    mx = pytest.importorskip("mlx.core")
+    glm_moe_dsa = _load_patched_glm_module()
+
+    topk_indices = mx.array(
+        [[[[1, 3], [0, 2], [2, 4]]]],
+        dtype=mx.uint32,
+    )
+    mask = glm_moe_dsa._apply_sparse_topk_mask(
+        None,
+        topk_indices,
+        0,
+        key_length=5,
+        query_length=3,
+    )
+    expected = mx.array(
+        [
+            [
+                [
+                    [False, True, False, True, False],
+                    [True, False, True, False, False],
+                    [False, False, True, False, True],
+                ]
+            ]
+        ],
+        dtype=mx.bool_,
+    )
+    mx.eval(mask, expected)
+    assert mx.all(mask == expected).item()
+
+    compact_indices = mx.array([[[[4, 5], [3, 5]]]], dtype=mx.uint32)
+    compact_mask = glm_moe_dsa._apply_sparse_topk_mask(
+        None,
+        compact_indices,
+        2,
+        key_length=6,
+        query_length=4,
+    )
+    compact_expected = mx.array(
+        [
+            [
+                [
+                    [True, True, True, False, False, False],
+                    [True, True, True, True, False, False],
+                    [False, False, False, False, True, True],
+                    [False, False, False, True, False, True],
+                ]
+            ]
+        ],
+        dtype=mx.bool_,
+    )
+    mx.eval(compact_mask, compact_expected)
+    assert mx.all(compact_mask == compact_expected).item()
+
+
 def test_glm_patch_forward_sparse_path_and_cache_state():
     mx = pytest.importorskip("mlx.core")
     glm_moe_dsa = _load_patched_glm_module()

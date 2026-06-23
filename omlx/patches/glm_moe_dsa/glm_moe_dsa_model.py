@@ -1,5 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,8 @@ from .sparse_mla import (
     sparse_mla_attention,
 )
 
+logger = logging.getLogger(__name__)
+
 _SGLANG_GLM5_INDEX_TOPK_PATTERN = (
     "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSS" "FSFFFSFSSSFSFFSFFSSS"
 )
@@ -31,7 +34,14 @@ _SGLANG_GLM5_INDEX_TOPK_PATTERN = (
 
 def _native_sparse_mla_default_min_k() -> str:
     """Use native sparse MLA for all GLM-5.2 prefill chunks when available."""
-    return "0" if glm_fast.has("glm_dsa_sparse_mla_attention") else "11264"
+    return "0" if glm_fast.has("glm_dsa_sparse_mla_attention") else str(2**63 - 1)
+
+
+def _direct_sparse_mla_policy(default: str) -> tuple[bool, bool]:
+    env = os.environ.get("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", default).lower()
+    requested = env in {"1", "true", "on", "yes", "strict", "required", "require"}
+    required = env in {"strict", "required", "require"}
+    return requested, required
 
 
 def _parse_topk_state(topk_state):
@@ -43,6 +53,52 @@ def _parse_topk_state(topk_state):
         else:
             topk_indices, _ = topk_state
     return topk_indices, prefix_rows
+
+
+def _apply_sparse_topk_mask(
+    mask: Optional[mx.array],
+    topk_indices: Optional[mx.array],
+    topk_prefix_rows: int,
+    *,
+    key_length: int,
+    query_length: int,
+) -> Optional[mx.array]:
+    if topk_indices is None or query_length <= 1:
+        return mask
+
+    topk_rows = topk_indices.shape[2]
+    if topk_rows == query_length:
+        shape = list(topk_indices.shape)
+        shape[-1] = key_length
+        sparse_mask = mx.zeros(shape, dtype=mx.bool_)
+        sparse_mask = mx.put_along_axis(
+            sparse_mask, topk_indices, mx.array(True), axis=-1
+        )
+    elif topk_prefix_rows > 0 and topk_rows + topk_prefix_rows == query_length:
+        prefix_shape = list(topk_indices.shape)
+        prefix_shape[2] = topk_prefix_rows
+        prefix_shape[-1] = key_length
+        slots = mx.arange(key_length, dtype=mx.uint32).reshape(
+            1, 1, 1, key_length
+        )
+        lengths = mx.arange(topk_prefix_rows, dtype=mx.uint32).reshape(
+            1, 1, topk_prefix_rows, 1
+        ) + mx.array(key_length - query_length + 1, dtype=mx.uint32)
+        prefix_mask = mx.broadcast_to(slots < lengths, prefix_shape)
+
+        suffix_shape = list(topk_indices.shape)
+        suffix_shape[-1] = key_length
+        suffix_mask = mx.zeros(suffix_shape, dtype=mx.bool_)
+        suffix_mask = mx.put_along_axis(
+            suffix_mask, topk_indices, mx.array(True), axis=-1
+        )
+        sparse_mask = mx.concatenate([prefix_mask, suffix_mask], axis=2)
+    else:
+        return mask
+
+    if mask is not None:
+        sparse_mask = sparse_mask & mask
+    return sparse_mask
 
 
 @dataclass
@@ -314,13 +370,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             and k_pe.shape[-1] == 64
             and topk_indices.shape[-1] == 2048
         )
+        direct_sparse_mla_requested, direct_sparse_mla_required = (
+            _direct_sparse_mla_policy(direct_sparse_mla_default)
+        )
         direct_sparse_mla_requested = (
-            native_sparse_mla_shape
-            and L > 1
-            and os.environ.get(
-                "MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", direct_sparse_mla_default
-            )
-            == "1"
+            native_sparse_mla_shape and L > 1 and direct_sparse_mla_requested
         )
         if direct_sparse_mla_requested:
             fast_topk_indices = os.environ.get(
@@ -352,10 +406,23 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                 output = output_flat
                 return self.o_proj(output), topk_state
-            raise RuntimeError(
-                "GLM direct sparse MLA was requested, but no native kernel "
-                "handled the current shape."
+            if direct_sparse_mla_required:
+                raise RuntimeError(
+                    "GLM direct sparse MLA was required, but no native kernel "
+                    "handled the current shape."
+                )
+            logger.debug(
+                "GLM direct sparse MLA was requested but no native kernel handled "
+                "the current shape; falling back to pure MLX SDPA."
             )
+
+        mask = _apply_sparse_topk_mask(
+            mask,
+            topk_indices,
+            topk_prefix_rows,
+            key_length=kv_latent.shape[2],
+            query_length=L,
+        )
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
