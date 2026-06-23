@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
+from .kernels import fast as glm_fast
 
 
 def _env_flag(name, default="0"):
@@ -241,9 +242,9 @@ class SwitchGLU(nn.Module):
                 and isinstance(self.activation, SwiGLU)
                 and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
                 and isinstance(self.down_proj, QuantizedSwitchLinear)
-                and hasattr(mx.fast, "glm_moe_swiglu_gate_up")
+                and hasattr(glm_fast, "glm_moe_swiglu_gate_up")
             ):
-                x = mx.fast.glm_moe_swiglu_gate_up(
+                x = glm_fast.glm_moe_swiglu_gate_up(
                     x,
                     self.gate_up_proj["weight"],
                     self.gate_up_proj["scales"],
@@ -265,9 +266,9 @@ class SwitchGLU(nn.Module):
                     and do_sort
                     and isinstance(self.activation, SwiGLU)
                     and isinstance(self.down_proj, QuantizedSwitchLinear)
-                    and hasattr(mx.fast, "glm_moe_swiglu_down")
+                    and hasattr(glm_fast, "glm_moe_swiglu_down")
                 ):
-                    x = mx.fast.glm_moe_swiglu_down(
+                    x = glm_fast.glm_moe_swiglu_down(
                         x_gate_up,
                         self.down_proj["weight"],
                         self.down_proj["scales"],
@@ -299,9 +300,9 @@ class SwitchGLU(nn.Module):
             weighted_sum
             and scores is not None
             and do_sort
-            and hasattr(mx.fast, "glm_moe_weighted_sum")
+            and hasattr(glm_fast, "glm_moe_weighted_sum")
         ):
-            return mx.fast.glm_moe_weighted_sum(x, inv_order, scores)
+            return glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

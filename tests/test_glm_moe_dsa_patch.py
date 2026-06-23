@@ -114,10 +114,10 @@ def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     model = SimpleNamespace(model_type="glm_moe_dsa")
     cfg = _glm_dsa_adaptive_prefill_config(model, 2048)
     assert cfg is not None
-    assert cfg.step_size == 6144
+    assert cfg.step_size == 8192
     assert cfg.after == 0
     assert cfg.min_remaining == 0
-    assert _prefill_step_size_for_progress(2048, 0, 8192, cfg) == 6144
+    assert _prefill_step_size_for_progress(2048, 0, 8192, cfg) == 8192
 
     assert _glm_dsa_adaptive_prefill_config(model, 1024) is None
     assert (
@@ -193,6 +193,112 @@ def test_glm_patch_installs_native_indexer_schedule():
         False,
     ]
     assert [len(c.caches) for c in model.make_cache()] == [2, 1, 2, 1, 2, 1]
+
+
+def test_glm_native_fused_kernels_match_reference(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+
+    try:
+        import omlx_glm_kernels.fast as fast
+    except Exception as exc:  # pragma: no cover - depends on local native build
+        pytest.skip(f"omlx_glm_kernels is unavailable: {exc}")
+
+    if not fast.is_native_available():
+        pytest.skip("omlx_glm_kernels native extension is unavailable")
+
+    mx.random.seed(7)
+
+    tokens, topk, dims = 8, 8, 64
+    x_sorted = mx.random.normal((tokens * topk, 1, dims), dtype=mx.float16)
+    inv_order = mx.array(list(range(tokens * topk - 1, -1, -1)), dtype=mx.uint32)
+    scores = mx.softmax(
+        mx.random.normal((tokens, topk), dtype=mx.float32),
+        axis=-1,
+    )
+    y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
+    x_ref = mx.squeeze(x_sorted, -2)
+    x_ref = mx.take(x_ref, inv_order, axis=0)
+    x_ref = mx.reshape(x_ref, scores.shape + (dims,))
+    y_ref = mx.sum(x_ref * mx.expand_dims(scores, -1), axis=-2).astype(mx.float16)
+    mx.eval(y_native, y_ref)
+    assert float(mx.max(mx.abs(y_native - y_ref)).item()) == 0.0
+
+    batch, heads, length, latent, values = 1, 64, 1, 512, 256
+    x = mx.random.normal((batch, heads, length, latent), dtype=mx.float16)
+    w_float = mx.random.normal((heads, values, latent), dtype=mx.float16)
+    weight, scales, biases = mx.quantize(
+        w_float,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    y_native = fast.glm_dsa_q8_vup_flat(x, weight, scales, biases)
+    y_ref = mx.quantized_matmul(
+        x,
+        weight,
+        scales,
+        biases,
+        True,
+        64,
+        8,
+        "affine",
+    )
+    y_ref = mx.transpose(y_ref, (0, 2, 1, 3))
+    y_ref = mx.reshape(y_ref, (batch, length, heads * values))
+    mx.eval(y_native, y_ref)
+    assert float(mx.max(mx.abs(y_native - y_ref)).item()) <= 0.125
+
+    batch, heads, q_len, k_len, latent, pe = 1, 64, 2, 32, 512, 64
+    scale = 0.05
+    q_latent = mx.random.normal((batch, heads, q_len, latent), dtype=mx.float16)
+    q_pe = mx.random.normal((batch, heads, q_len, pe), dtype=mx.float16)
+    kv_latent = mx.random.normal((batch, 1, k_len, latent), dtype=mx.float16)
+    k_pe = mx.random.normal((batch, 1, k_len, pe), dtype=mx.float16)
+    topk_indices = mx.broadcast_to(
+        mx.reshape(mx.arange(0, k_len, dtype=mx.uint32), (1, 1, 1, k_len)),
+        (batch, 1, q_len, k_len),
+    )
+    y_native = fast.glm_dsa_sparse_mla_attention(
+        q_latent,
+        q_pe,
+        kv_latent,
+        k_pe,
+        topk_indices,
+        scale,
+        causal=True,
+    )
+    scores = mx.sum(
+        mx.expand_dims(q_latent, 3) * mx.expand_dims(kv_latent, 1),
+        axis=-1,
+    )
+    scores = scores + mx.sum(
+        mx.expand_dims(q_pe, 3) * mx.expand_dims(k_pe, 1),
+        axis=-1,
+    )
+    scores = scores * scale
+    q_pos = mx.reshape(
+        mx.arange(k_len - q_len, k_len, dtype=mx.uint32),
+        (1, 1, q_len, 1),
+    )
+    k_pos = mx.reshape(mx.arange(0, k_len, dtype=mx.uint32), (1, 1, 1, k_len))
+    scores = mx.where(k_pos <= q_pos, scores, mx.array(-65504.0, scores.dtype))
+    probs = mx.softmax(scores, axis=-1)
+    y_ref = mx.sum(
+        mx.expand_dims(probs, -1) * mx.expand_dims(kv_latent, 1),
+        axis=3,
+    )
+    mx.eval(y_native, y_ref)
+    assert float(mx.max(mx.abs(y_native - y_ref)).item()) <= 0.02
+
+    scores = mx.random.normal((1, 1, 2, 2048), dtype=mx.float16)
+    topk_indices = fast.dsa_topk_indices(
+        scores,
+        2048,
+        bucketed=False,
+        causal_valid_prefix=True,
+    )
+    mx.eval(topk_indices)
+    assert topk_indices.shape == (1, 1, 2, 2048)
 
 
 def test_glm_patch_forward_sparse_path_and_cache_state():

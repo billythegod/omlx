@@ -15,30 +15,26 @@ import importlib
 import logging
 import sys
 
+from .kernels import fast as glm_fast
+
 logger = logging.getLogger(__name__)
 
 PATCH_SOURCE = "mlxlm-glm optimized-final mlx-lm snapshot"
-CUSTOM_MLX_REF = "https://github.com/jundot/mlx@v0.31.2-omlx"
+NATIVE_KERNELS_PACKAGE = "omlx_glm_kernels"
 
 _APPLIED = False
 
 
-def _missing_custom_mlx_symbols() -> list[str]:
-    """Return expected custom MLX symbols missing from the installed runtime."""
-    try:
-        import mlx.core as mx
-    except Exception:
-        return []
-
+def _missing_fast_symbols() -> list[str]:
+    """Return expected fast symbols missing from native or patched MLX runtime."""
     required = (
         "dsa_indexer_scores",
         "dsa_topk_indices",
         "glm_dsa_sparse_mla_attention",
         "glm_dsa_q8_vup_flat",
-        "glm_moe_swiglu_down",
         "glm_moe_weighted_sum",
     )
-    return [name for name in required if not hasattr(mx.fast, name)]
+    return glm_fast.missing(required)
 
 
 def _register_module() -> None:
@@ -81,13 +77,19 @@ def apply_glm_moe_dsa_patch() -> bool:
 
     apply_glm_moe_dsa_generate_patch()
     _APPLIED = True
-    missing = _missing_custom_mlx_symbols()
+    missing = _missing_fast_symbols()
     if missing:
         logger.warning(
-            "GLM MoE DSA optimized patch applied, but custom MLX symbols are "
-            "missing: %s. Install %s for the accelerated path.",
+            "GLM MoE DSA optimized patch applied, but fast kernel symbols are "
+            "missing from %s and mx.fast: %s. Build the native extension for "
+            "the accelerated path.",
+            NATIVE_KERNELS_PACKAGE,
             ", ".join(missing),
-            CUSTOM_MLX_REF,
+        )
+    elif glm_fast.native_available():
+        logger.info(
+            "GLM MoE DSA native kernels available from %s",
+            NATIVE_KERNELS_PACKAGE,
         )
     logger.info("GLM MoE DSA optimized mlx-lm patch applied")
     return True
@@ -101,5 +103,5 @@ __all__ = [
     "apply_glm_moe_dsa_patch",
     "is_applied",
     "PATCH_SOURCE",
-    "CUSTOM_MLX_REF",
+    "NATIVE_KERNELS_PACKAGE",
 ]

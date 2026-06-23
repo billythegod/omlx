@@ -18,12 +18,12 @@ from mlx_lm.models.base import (
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.rope_utils import initialize_rope
+from .kernels import fast as glm_fast
 from .sparse_mla import (
     block_scores_to_indices,
     fused_indexer_topk_indices,
     fused_indexer_scores_high_histogram,
     fused_indexer_scores,
-    fused_topk_block_table_from_scores,
     fused_topk_indices_with_high_histogram,
     fused_index_score_reduce,
     scores_to_block_indices,
@@ -208,7 +208,8 @@ class Indexer(nn.Module):
         is_quantized = wk_scales is not None and wp_scales is not None
         if is_quantized:
             if (
-                getattr(wk, "group_size", None) != getattr(weights_proj, "group_size", None)
+                getattr(wk, "group_size", None)
+                != getattr(weights_proj, "group_size", None)
                 or getattr(wk, "bits", None) != getattr(weights_proj, "bits", None)
                 or getattr(wk, "mode", None) != getattr(weights_proj, "mode", None)
                 or wk_weight.shape[1:] != wp_weight.shape[1:]
@@ -295,13 +296,10 @@ class Indexer(nn.Module):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
-        use_fast_topk = (
-            os.environ.get("MLX_LM_GLM_DSA_FAST_TOPK", "1") == "1"
-            and hasattr(mx.fast, "dsa_topk_indices")
-        )
-        sort_exact_topk = (
-            os.environ.get("MLX_LM_GLM_DSA_SORT_EXACT_TOPK", "1") == "1"
-        )
+        use_fast_topk = os.environ.get(
+            "MLX_LM_GLM_DSA_FAST_TOPK", "1"
+        ) == "1" and hasattr(glm_fast, "dsa_topk_indices")
+        sort_exact_topk = os.environ.get("MLX_LM_GLM_DSA_SORT_EXACT_TOPK", "1") == "1"
         bucketed_topk = (
             use_fast_topk
             and s > 1
@@ -315,12 +313,9 @@ class Indexer(nn.Module):
             slots = mx.arange(self.index_topk, dtype=mx.uint32).reshape(
                 1, 1, 1, self.index_topk
             )
-            lengths = (
-                mx.arange(prefix_rows, dtype=mx.uint32).reshape(
-                    1, 1, prefix_rows, 1
-                )
-                + mx.array(offset + 1, dtype=mx.uint32)
-            )
+            lengths = mx.arange(prefix_rows, dtype=mx.uint32).reshape(
+                1, 1, prefix_rows, 1
+            ) + mx.array(offset + 1, dtype=mx.uint32)
             prefix = mx.where(slots < lengths, slots, mx.array(0, dtype=mx.uint32))
             return mx.broadcast_to(prefix, (b, 1, prefix_rows, self.index_topk))
 
@@ -335,10 +330,7 @@ class Indexer(nn.Module):
                 if (
                     indices is not None
                     and self.default_block_sparse_sdpa
-                    and os.environ.get(
-                        "MLX_LM_GLM_DSA_COMPACT_PREFIX_TOPK", "1"
-                    )
-                    == "1"
+                    and os.environ.get("MLX_LM_GLM_DSA_COMPACT_PREFIX_TOPK", "1") == "1"
                 ):
                     return indices, None, prefix_rows
                 prefix = causal_prefix_topk(prefix_rows)
@@ -353,23 +345,14 @@ class Indexer(nn.Module):
             scores, prefix_rows: int = 0, causal_valid_prefix: Optional[bool] = None
         ):
             indices = None
-            if scores is not None and use_fast_topk:
-                topk_u16_env = os.environ.get("MLX_LM_GLM_DSA_TOPK_U16", "0").lower()
-                use_topk_u16 = (
-                    topk_u16_env in {"1", "true", "on", "yes"}
-                    or (
-                        topk_u16_env == "auto"
-                        and self.default_block_sparse_sdpa
-                    )
-                ) and scores.shape[-1] <= 65536 and hasattr(
-                    mx.fast, "dsa_topk_indices_u16"
-                )
-                topk_fn = (
-                    mx.fast.dsa_topk_indices_u16
-                    if use_topk_u16
-                    else mx.fast.dsa_topk_indices
-                )
-                indices = topk_fn(
+            use_native_topk = (
+                use_fast_topk
+                and self.index_topk == 2048
+                and scores is not None
+                and scores.shape[-1] >= 2048
+            )
+            if use_native_topk:
+                indices = glm_fast.dsa_topk_indices(
                     scores,
                     self.index_topk,
                     bucketed=bucketed_topk,
@@ -402,14 +385,16 @@ class Indexer(nn.Module):
         )
         causal_valid_prefix_topk = (
             fuse_causal_mask
-            and os.environ.get("MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1")
-            == "1"
+            and os.environ.get("MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1") == "1"
         )
         default_block_sdpa = "1" if self.default_block_sparse_sdpa else "0"
-        use_block_sdpa = os.environ.get(
-            "MLX_LM_GLM_DSA_BLOCK_SPARSE_SDPA",
-            os.environ.get("MLX_LM_GLM_DSA_BLOCK_UNION_SDPA", default_block_sdpa),
-        ) == "1"
+        use_block_sdpa = (
+            os.environ.get(
+                "MLX_LM_GLM_DSA_BLOCK_SPARSE_SDPA",
+                os.environ.get("MLX_LM_GLM_DSA_BLOCK_UNION_SDPA", default_block_sdpa),
+            )
+            == "1"
+        )
         prefill_mode = os.environ.get("MLX_LM_GLM_DSA_PREFILL_MODE", "").lower()
         default_exact_prefill = (
             self.default_block_sparse_sdpa
@@ -432,9 +417,7 @@ class Indexer(nn.Module):
         block_budget = int(
             os.environ.get(
                 "MLX_LM_GLM_DSA_BLOCK_SDPA_BUDGET",
-                os.environ.get(
-                    "MLX_LM_GLM_DSA_BLOCK_BUDGET", default_block_budget
-                ),
+                os.environ.get("MLX_LM_GLM_DSA_BLOCK_BUDGET", default_block_budget),
             )
         )
         if block_budget > 0:
@@ -494,7 +477,7 @@ class Indexer(nn.Module):
             and k.shape[2]
             >= int(os.environ.get("MLX_LM_GLM_DSA_FUSED_BLOCK_INDEXER_MIN_K", "8192"))
         ):
-            block_scores = mx.fast.dsa_indexer_block_scores(
+            block_scores = glm_fast.dsa_indexer_block_scores(
                 q,
                 k,
                 weights_lh,
@@ -517,53 +500,32 @@ class Indexer(nn.Module):
 
         scores = None
         score_high_hist = None
-        block_table_mode = os.environ.get(
-            "MLX_LM_GLM_DSA_BLOCK_TABLE_SPARSE_MLA", "0"
-        ).lower()
         if (
             s > 1
             and (mask is None or fuse_causal_mask)
             and os.environ.get("MLX_LM_GLM_DSA_CORE_INDEXER_SCORES", "1") == "1"
         ):
             scores_feed_block_path = (
-                block_budget > 0
-                and use_block_sdpa
-                and not use_exact_block_token_sdpa
+                block_budget > 0 and use_block_sdpa and not use_exact_block_token_sdpa
             )
             scores_feed_exact_topk = (
                 causal_valid_prefix_topk and not scores_feed_block_path
             )
-            want_fused_exact_block_table = (
-                os.environ.get("MLX_LM_GLM_DSA_FUSED_TOPK_BLOCK_TABLE", "0")
-                == "1"
-                and use_fast_topk
-                and not scores_feed_block_path
-                and block_table_mode in {"1", "auto", "force"}
-                and (mask is None or fuse_causal_mask)
-            )
             candidate_prefix_rows = 0
-            if (
-                use_fast_topk
-                and scores_feed_exact_topk
-                and not want_fused_exact_block_table
-            ):
+            if use_fast_topk and scores_feed_exact_topk:
                 candidate_prefix_rows = min(
                     s, max(0, self.index_topk - (k.shape[2] - s))
                 )
             if candidate_prefix_rows == s:
                 return select_topk(None, candidate_prefix_rows)
-            score_q = (
-                q[:, :, candidate_prefix_rows:, :] if candidate_prefix_rows else q
-            )
+            score_q = q[:, :, candidate_prefix_rows:, :] if candidate_prefix_rows else q
             score_weights = (
                 weights_lh[:, candidate_prefix_rows:, :]
                 if candidate_prefix_rows
                 else weights_lh
             )
             default_chunk_mb = (
-                "128"
-                if self.default_block_sparse_sdpa and k.shape[2] <= 65536
-                else "0"
+                "128" if self.default_block_sparse_sdpa and k.shape[2] <= 65536 else "0"
             )
             chunk_mb = int(
                 os.environ.get("MLX_LM_GLM_DSA_INDEXER_CHUNK_MB", default_chunk_mb)
@@ -619,9 +581,7 @@ class Indexer(nn.Module):
                         )
                     if chunk_indices:
                         chunked_topk = mx.concatenate(chunk_indices, axis=2)
-                        return finish_topk_indices(
-                            chunked_topk, candidate_prefix_rows
-                        )
+                        return finish_topk_indices(chunked_topk, candidate_prefix_rows)
             if chunked_topk is None:
                 use_score_high_hist = (
                     os.environ.get("MLX_LM_GLM_DSA_SCORE_HIGH_HIST", "0") == "1"
@@ -698,25 +658,6 @@ class Indexer(nn.Module):
             )
             if high_hist_indices is not None:
                 return finish_topk_indices(high_hist_indices, prefix_topk_rows)
-        if (
-            scores is not None
-            and os.environ.get("MLX_LM_GLM_DSA_FUSED_TOPK_BLOCK_TABLE", "0") == "1"
-            and prefix_topk_rows == 0
-        ):
-            if block_table_mode in {"1", "auto", "force"}:
-                block_k = int(
-                    os.environ.get("MLX_LM_GLM_DSA_BLOCK_TABLE_MLA_K_BLOCK", "8")
-                )
-                exact_block_table = fused_topk_block_table_from_scores(
-                    scores,
-                    self.index_topk,
-                    k.shape[2],
-                    k_block_size=block_k,
-                    bucketed=bucketed_topk,
-                    causal_valid_prefix=causal_valid_prefix_topk,
-                )
-                if exact_block_table is not None:
-                    return None, None, 0, exact_block_table
         return select_topk(scores, prefix_topk_rows)
 
 
@@ -896,9 +837,7 @@ class DeepseekV32MLP(nn.Module):
 
     def __call__(self, x):
         if hasattr(self, "gate_up_proj"):
-            gate, up = mx.split(
-                self.gate_up_proj(x), [self.intermediate_size], axis=-1
-            )
+            gate, up = mx.split(self.gate_up_proj(x), [self.intermediate_size], axis=-1)
         else:
             gate = self.gate_proj(x)
             up = self.up_proj(x)
@@ -1000,7 +939,7 @@ class DeepseekV32MoE(nn.Module):
         use_weighted_sum = (
             _use_glm_moe_weighted_sum(self.config)
             and inds.size >= 64
-            and hasattr(mx.fast, "glm_moe_weighted_sum")
+            and hasattr(glm_fast, "glm_moe_weighted_sum")
         )
         y = self.switch_mlp(
             x,
@@ -1266,7 +1205,14 @@ class Model(nn.Module):
                 weights.update(fused)
 
         dequant_mla_proj = _dequant_mla_proj_mode(self.args)
-        dequant_embed_q = dequant_mla_proj in {"1", "true", "all", "both", "embed", "embed_q"}
+        dequant_embed_q = dequant_mla_proj in {
+            "1",
+            "true",
+            "all",
+            "both",
+            "embed",
+            "embed_q",
+        }
         dequant_unembed_out = dequant_mla_proj in {
             "1",
             "true",
@@ -1279,6 +1225,7 @@ class Model(nn.Module):
         if (dequant_embed_q or dequant_unembed_out) and isinstance(
             getattr(self.args, "quantization", None), dict
         ):
+
             def dequant_mla_weight(path, input_dims):
                 weight_key = f"{path}.weight"
                 scales_key = f"{path}.scales"
@@ -1312,14 +1259,10 @@ class Model(nn.Module):
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.self_attn"
                 if dequant_embed_q:
-                    dequant_mla_weight(
-                        f"{prefix}.embed_q", self.args.qk_nope_head_dim
-                    )
+                    dequant_mla_weight(f"{prefix}.embed_q", self.args.qk_nope_head_dim)
                     self.args.quantization.pop(f"{prefix}.embed_q", None)
                 if dequant_unembed_out:
-                    dequant_mla_weight(
-                        f"{prefix}.unembed_out", self.args.kv_lora_rank
-                    )
+                    dequant_mla_weight(f"{prefix}.unembed_out", self.args.kv_lora_rank)
                     self.args.quantization.pop(f"{prefix}.unembed_out", None)
 
         # Stack experts

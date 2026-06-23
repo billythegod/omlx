@@ -252,15 +252,15 @@ class TestGLMAdaptiveChunkedPrefill:
         )
 
         sched, model = _make_recording_scheduler("glm_moe_dsa")
-        req = _make_request("glm", n_tokens=8193)
-        state = _make_prefill_state(sched, req, n_remaining=8192)
+        req = _make_request("glm", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
 
         with patch("omlx.scheduler._sync_and_clear_cache"):
             done = sched._step_prefill_chunk(state)
 
         assert not done
-        assert model.chunk_lengths == [6144]
-        assert state.tokens_processed == 6144
+        assert model.chunk_lengths == [8192]
+        assert state.tokens_processed == 8192
 
     def test_non_glm_keeps_configured_prefill_chunk_size(self, monkeypatch):
         monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)

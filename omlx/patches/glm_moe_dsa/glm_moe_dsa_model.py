@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -13,6 +12,7 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import CacheList, KVCache
+from .kernels import fast as glm_fast
 from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
@@ -20,83 +20,29 @@ from .deepseek_v32 import (
 )
 from .deepseek_v32 import Model as DSV32Model
 from .sparse_mla import (
-    block_indices_to_block_mask,
     q8_vup_flat,
-    sparse_mla_block_table_attention,
-    sparse_mla_qblock_attention,
     sparse_mla_attention,
-    topk_indices_to_block_masks,
 )
 
 _SGLANG_GLM5_INDEX_TOPK_PATTERN = (
-    "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSS"
-    "FSFFFSFSSSFSFFSFFSSS"
+    "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSS" "FSFFFSFSSSFSFFSFFSSS"
 )
-_BLOCK_STATS_SEEN = set()
+
+
+def _native_sparse_mla_default_min_k() -> str:
+    """Use native sparse MLA for all GLM-5.2 prefill chunks when available."""
+    return "0" if glm_fast.has("glm_dsa_sparse_mla_attention") else "11264"
 
 
 def _parse_topk_state(topk_state):
     topk_indices = topk_state
-    block_indices = None
     prefix_rows = 0
-    exact_block_table = None
     if isinstance(topk_state, tuple):
-        if len(topk_state) == 4:
-            topk_indices, block_indices, prefix_rows, exact_block_table = topk_state
-        elif len(topk_state) == 3:
-            topk_indices, block_indices, prefix_rows = topk_state
+        if len(topk_state) == 3:
+            topk_indices, _, prefix_rows = topk_state
         else:
-            topk_indices, block_indices = topk_state
-    return topk_indices, block_indices, prefix_rows, exact_block_table
-
-
-def _maybe_log_block_index_stats(
-    block_indices: mx.array,
-    *,
-    layer_idx: int,
-    query_length: int,
-    key_length: int,
-    k_block_size: int,
-) -> None:
-    if os.environ.get("MLX_LM_GLM_DSA_BLOCK_STATS", "0") != "1":
-        return
-    if block_indices.ndim != 4 or block_indices.shape[1] != 1:
-        return
-
-    q_blocks = block_indices.shape[2]
-    budget = block_indices.shape[3]
-    k_blocks = (key_length + k_block_size - 1) // k_block_size
-    key = (layer_idx, query_length, key_length, q_blocks, budget)
-    if os.environ.get("MLX_LM_GLM_DSA_BLOCK_STATS_ONCE", "1") == "1":
-        if key in _BLOCK_STATS_SEEN:
-            return
-        _BLOCK_STATS_SEEN.add(key)
-
-    try:
-        rows = block_indices[0, 0].tolist()
-    except Exception as exc:
-        print(f"GLM_DSA_BLOCK_STATS layer={layer_idx} unavailable: {exc}")
-        return
-
-    row_counts = []
-    union = set()
-    total_valid = 0
-    for row in rows:
-        valid = [int(block) for block in row if int(block) < k_blocks]
-        row_counts.append(len(set(valid)))
-        union.update(valid)
-        total_valid += len(valid)
-
-    avg_row = sum(row_counts) / max(len(row_counts), 1)
-    coverage = len(union) / max(k_blocks, 1)
-    duplicate_ratio = 1.0 - (len(union) / max(total_valid, 1))
-    print(
-        "GLM_DSA_BLOCK_STATS "
-        f"layer={layer_idx} L={query_length} K={key_length} "
-        f"q_blocks={q_blocks} k_blocks={k_blocks} budget={budget} "
-        f"union={len(union)} coverage={coverage:.4f} "
-        f"avg_row_unique={avg_row:.2f} duplicate_ratio={duplicate_ratio:.4f}"
-    )
+            topk_indices, _ = topk_state
+    return topk_indices, prefix_rows
 
 
 @dataclass
@@ -157,15 +103,16 @@ class ModelArgs(BaseModelArgs):
             "disable",
             "disabled",
         }
-        indexcache_requested = (
-            prefill_mode in {"sglang", "indexcache"}
-            or indexcache_mode in {"1", "true", "sglang", "glm5", "glm-5"}
-        )
-        pattern_is_sglang = (
-            env_pattern is not None
-            and env_pattern.strip().lower()
-            in {"sglang", "glm5", "glm-5", "recommended"}
-        )
+        indexcache_requested = prefill_mode in {
+            "sglang",
+            "indexcache",
+        } or indexcache_mode in {"1", "true", "sglang", "glm5", "glm-5"}
+        pattern_is_sglang = env_pattern is not None and env_pattern.strip().lower() in {
+            "sglang",
+            "glm5",
+            "glm-5",
+            "recommended",
+        }
         indexcache_recall_risk_allowed = os.environ.get(
             "MLX_LM_GLM_DSA_ALLOW_INDEXCACHE_RECALL_RISK", "0"
         ).lower() in {"1", "true", "yes", "on"}
@@ -191,9 +138,10 @@ class ModelArgs(BaseModelArgs):
         if "MLX_LM_GLM_DSA_INDEX_TOPK_FREQ" in os.environ:
             self.index_topk_freq = int(os.environ["MLX_LM_GLM_DSA_INDEX_TOPK_FREQ"])
             self.index_topk_pattern = None
-            if config_indexer_types is not None and os.environ.get(
-                "MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0"
-            ) != "1":
+            if (
+                config_indexer_types is not None
+                and os.environ.get("MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0") != "1"
+            ):
                 freq = max(self.index_topk_freq, 1)
                 full_count = 0
                 indexer_types = []
@@ -225,14 +173,13 @@ class ModelArgs(BaseModelArgs):
                             f"num_hidden_layers ({len(pattern)} != "
                             f"{self.num_hidden_layers})."
                         )
-                    pattern_types = [
-                        {"F": "full", "S": "shared"}[c] for c in pattern
-                    ]
+                    pattern_types = [{"F": "full", "S": "shared"}[c] for c in pattern]
                 else:
                     pattern_types = list(pattern)
-                if config_indexer_types is not None and os.environ.get(
-                    "MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0"
-                ) != "1":
+                if (
+                    config_indexer_types is not None
+                    and os.environ.get("MLX_LM_GLM_DSA_ALLOW_NEW_INDEXERS", "0") != "1"
+                ):
                     self.indexer_types = [
                         "full" if base == "full" and selected == "full" else "shared"
                         for base, selected in zip(config_indexer_types, pattern_types)
@@ -292,7 +239,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             topk_state = prev_topk_indices
 
         if L == 1:
-            topk_indices, _, _, _ = _parse_topk_state(topk_state)
+            topk_indices, _ = _parse_topk_state(topk_state)
             if topk_indices is not None:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
@@ -335,144 +282,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
             return self.o_proj(output), topk_state
 
-        topk_indices, block_indices, topk_prefix_rows, exact_block_table = (
-            _parse_topk_state(topk_state)
-        )
+        topk_indices, topk_prefix_rows = _parse_topk_state(topk_state)
 
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if self.indexer is not None and cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
-
-        if exact_block_table is not None and L > 1:
-            block_k = int(
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_TABLE_MLA_K_BLOCK", "8")
-            )
-            q_latent = self.embed_q(q_nope)
-            block_table = (
-                exact_block_table
-                if exact_block_table.dtype == mx.uint32
-                else exact_block_table.astype(mx.uint32)
-            )
-            output = sparse_mla_block_table_attention(
-                q_latent,
-                q_pe,
-                kv_latent,
-                k_pe,
-                block_table,
-                self.scale,
-                k_block_size=block_k,
-            )
-            if output is not None:
-                output_flat = q8_vup_flat(
-                    output, self.unembed_out, key_length=kv_latent.shape[2]
-                )
-                if output_flat is None:
-                    output = self.unembed_out(output)
-                    output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                output = output_flat
-                return self.o_proj(output), topk_state
-
-        if block_indices is not None and L > 1:
-            use_block_sdpa = os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_SPARSE_SDPA",
-                os.environ.get("MLX_LM_GLM_DSA_BLOCK_UNION_SDPA", "1"),
-            ) == "1" and L > 8
-            if use_block_sdpa:
-                use_block_index_sdpa = (
-                    os.environ.get("MLX_LM_GLM_DSA_BLOCK_INDEX_SDPA", "1") == "1"
-                )
-                if use_block_index_sdpa:
-                    block_indices_u32 = (
-                        block_indices
-                        if block_indices.dtype == mx.uint32
-                        else block_indices.astype(mx.uint32)
-                    )
-                    stats_k_block_size = int(
-                        os.environ.get(
-                            "MLX_LM_GLM_DSA_BLOCK_SDPA_K_BLOCK",
-                            os.environ.get(
-                                "MLX_LM_GLM_DSA_BLOCK_BUDGET_K_BLOCK", "16"
-                            ),
-                        )
-                    )
-                    _maybe_log_block_index_stats(
-                        block_indices_u32,
-                        layer_idx=self.layer_idx,
-                        query_length=L,
-                        key_length=kv_latent.shape[2],
-                        k_block_size=stats_k_block_size,
-                    )
-                    k = self.embed_q(kv_latent, transpose=False)
-                    v = self.unembed_out(kv_latent)
-                    split_qk_max_k = int(
-                        os.environ.get("MLX_LM_GLM_DSA_SPLIT_QK_MAX_K", "65536")
-                    )
-                    if (
-                        os.environ.get("MLX_LM_GLM_DSA_SPLIT_QK_SDPA", "0") == "1"
-                        and kv_latent.shape[2] <= split_qk_max_k
-                        and hasattr(mx.fast, "glm_dsa_attention")
-                    ):
-                        output = mx.fast.glm_dsa_attention(
-                            q_nope,
-                            q_pe,
-                            k,
-                            k_pe,
-                            v,
-                            block_indices_u32,
-                            self.scale,
-                        )
-                    else:
-                        k_pe_heads = mx.broadcast_to(
-                            k_pe, k.shape[:-1] + k_pe.shape[-1:]
-                        )
-                        q = mx.concatenate([q_nope, q_pe], axis=-1)
-                        k = mx.concatenate([k, k_pe_heads], axis=-1)
-                        output = mx.fast.scaled_dot_product_attention(
-                            q,
-                            k,
-                            v,
-                            scale=self.scale,
-                            mask="causal",
-                            block_indices=block_indices_u32,
-                        )
-                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    return self.o_proj(output), topk_state
-                q_block_size = int(
-                    os.environ.get(
-                        "MLX_LM_GLM_DSA_BLOCK_SDPA_Q_BLOCK",
-                        os.environ.get("MLX_LM_GLM_DSA_BLOCK_BUDGET_Q_BLOCK", "32"),
-                    )
-                )
-                k_block_size = int(
-                    os.environ.get(
-                        "MLX_LM_GLM_DSA_BLOCK_SDPA_K_BLOCK",
-                        os.environ.get("MLX_LM_GLM_DSA_BLOCK_BUDGET_K_BLOCK", "16"),
-                    )
-                )
-                k = self.embed_q(kv_latent, transpose=False)
-                v = self.unembed_out(kv_latent)
-                k_pe_heads = mx.broadcast_to(k_pe, k.shape[:-1] + k_pe.shape[-1:])
-                q = mx.concatenate([q_nope, q_pe], axis=-1)
-                k = mx.concatenate([k, k_pe_heads], axis=-1)
-                block_mask = block_indices_to_block_mask(
-                    block_indices,
-                    L=L,
-                    K=kv_latent.shape[2],
-                    q_block_size=q_block_size,
-                    k_block_size=k_block_size,
-                )
-                if block_mask is not None:
-                    output = mx.fast.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        scale=self.scale,
-                        mask="causal",
-                        block_mask=block_mask,
-                    )
-                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    return self.o_proj(output), topk_state
 
         prefill_mode = os.environ.get("MLX_LM_GLM_DSA_PREFILL_MODE", "").lower()
         default_exact_prefill = (
@@ -480,18 +295,27 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             and os.environ.get("MLX_LM_GLM_DSA_EXACT_PREFILL_DEFAULT", "1") != "0"
         )
         exact_prefill = prefill_mode in {"exact", "strict"} or default_exact_prefill
-        # Exact block-token SDPA is still slightly faster around 10K, while
-        # direct sparse MLA wins from 12K+ on the retained GLM-5.2 path.
         direct_sparse_mla_min_k = int(
-            os.environ.get("MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA_MIN_K", "11264")
+            os.environ.get(
+                "MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA_MIN_K",
+                _native_sparse_mla_default_min_k(),
+            )
         )
         direct_sparse_mla_default = (
             "1"
             if exact_prefill and kv_latent.shape[2] >= direct_sparse_mla_min_k
             else "0"
         )
-        direct_sparse_mla_requested = (
+        native_sparse_mla_shape = (
             topk_indices is not None
+            and self.num_heads == 64
+            and q_pe.shape[-1] == 64
+            and kv_latent.shape[-1] == 512
+            and k_pe.shape[-1] == 64
+            and topk_indices.shape[-1] == 2048
+        )
+        direct_sparse_mla_requested = (
+            native_sparse_mla_shape
             and L > 1
             and os.environ.get(
                 "MLX_LM_GLM_DSA_DIRECT_SPARSE_MLA", direct_sparse_mla_default
@@ -499,109 +323,15 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             == "1"
         )
         if direct_sparse_mla_requested:
-            fast_topk_indices = (
-                os.environ.get("MLX_LM_GLM_DSA_FAST_TOPK", "1") == "1"
-                and hasattr(mx.fast, "dsa_topk_indices")
-            )
+            fast_topk_indices = os.environ.get(
+                "MLX_LM_GLM_DSA_FAST_TOPK", "1"
+            ) == "1" and hasattr(glm_fast, "dsa_topk_indices")
             causal_prefix_indices = (
                 fast_topk_indices
                 and os.environ.get("MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1")
                 == "1"
             )
             q_latent = self.embed_q(q_nope)
-            if (
-                os.environ.get("MLX_LM_GLM_DSA_QBLOCK_UNION_MLA", "0") == "1"
-                and hasattr(mx.fast, "dsa_topk_qblock_union")
-                and hasattr(mx.fast, "glm_dsa_sparse_mla_qblock_attention")
-            ):
-                qblock_size = int(
-                    os.environ.get("MLX_LM_GLM_DSA_QBLOCK_UNION_MLA_Q_BLOCK", "4")
-                )
-                qblock_capacity = int(
-                    os.environ.get("MLX_LM_GLM_DSA_QBLOCK_UNION_MLA_CAPACITY", "4096")
-                )
-                output = sparse_mla_qblock_attention(
-                    q_latent,
-                    q_pe,
-                    kv_latent,
-                    k_pe,
-                    topk_indices,
-                    self.scale,
-                    topk_valid_prefix=fast_topk_indices,
-                    causal_prefix_indices=causal_prefix_indices,
-                    causal_prefix_rows=topk_prefix_rows,
-                    q_block_size=qblock_size,
-                    capacity=qblock_capacity,
-                )
-                if output is not None:
-                    output_flat = q8_vup_flat(
-                        output, self.unembed_out, key_length=kv_latent.shape[2]
-                    )
-                    if output_flat is None:
-                        output = self.unembed_out(output)
-                        output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    output = output_flat
-                    return self.o_proj(output), topk_state
-            block_table_mode = os.environ.get(
-                "MLX_LM_GLM_DSA_BLOCK_TABLE_SPARSE_MLA", "0"
-            ).lower()
-            use_block_table_mla = (
-                topk_prefix_rows == 0
-                and block_table_mode in {"1", "auto", "force"}
-                and hasattr(mx.fast, "dsa_topk_to_block_table")
-            )
-            if use_block_table_mla:
-                block_k = int(
-                    os.environ.get("MLX_LM_GLM_DSA_BLOCK_TABLE_MLA_K_BLOCK", "8")
-                )
-                if block_table_mode != "force":
-                    k_blocks = max(1, (kv_latent.shape[2] + block_k - 1) // block_k)
-                    topk_size = max(1, topk_indices.shape[-1])
-                    expected_blocks = k_blocks * (
-                        1.0 - math.exp(topk_size * math.log1p(-1.0 / k_blocks))
-                    )
-                    expected_expansion = expected_blocks * block_k / topk_size
-                    max_expansion = float(
-                        os.environ.get(
-                            "MLX_LM_GLM_DSA_BLOCK_TABLE_MLA_MAX_EXPANSION",
-                            "1.5",
-                        )
-                    )
-                    use_block_table_mla = expected_expansion <= max_expansion
-
-            if use_block_table_mla:
-                packed_block_table = (
-                    block_k <= 16
-                    and os.environ.get(
-                        "MLX_LM_GLM_DSA_BLOCK_TABLE_MLA_PACKED", "1"
-                    )
-                    == "1"
-                )
-                block_table = mx.fast.dsa_topk_to_block_table(
-                    topk_indices,
-                    kv_latent.shape[2],
-                    k_block_size=block_k,
-                    causal=True,
-                    packed=packed_block_table,
-                )
-                output = sparse_mla_block_table_attention(
-                    q_latent,
-                    q_pe,
-                    kv_latent,
-                    k_pe,
-                    block_table,
-                    self.scale,
-                    k_block_size=block_k,
-                )
-                if output is not None:
-                    output_flat = q8_vup_flat(
-                        output, self.unembed_out, key_length=kv_latent.shape[2]
-                    )
-                    if output_flat is None:
-                        output = self.unembed_out(output)
-                        output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                    output = output_flat
-                    return self.o_proj(output), topk_state
             output = sparse_mla_attention(
                 q_latent,
                 q_pe,
@@ -622,75 +352,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                     output_flat = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                 output = output_flat
                 return self.o_proj(output), topk_state
-
-        if (
-            topk_indices is not None
-            and L > 8
-            and os.environ.get(
-                "MLX_LM_GLM_DSA_EXACT_BLOCK_TOKEN_SDPA",
-                "1" if exact_prefill else "0",
+            raise RuntimeError(
+                "GLM direct sparse MLA was requested, but no native kernel "
+                "handled the current shape."
             )
-            == "1"
-        ):
-            k = self.embed_q(kv_latent, transpose=False)
-            k_pe_heads = mx.broadcast_to(k_pe, k.shape[:-1] + k_pe.shape[-1:])
-            q = mx.concatenate([q_nope, q_pe], axis=-1)
-            k = mx.concatenate([k, k_pe_heads], axis=-1)
-            v = self.unembed_out(kv_latent)
-            q_block_size = int(
-                os.environ.get(
-                    "MLX_LM_GLM_DSA_EXACT_BLOCK_SDPA_Q_BLOCK",
-                    os.environ.get("MLX_LM_GLM_DSA_BLOCK_SDPA_Q_BLOCK", "32"),
-                )
-            )
-            k_block_size = int(
-                os.environ.get(
-                    "MLX_LM_GLM_DSA_EXACT_BLOCK_SDPA_K_BLOCK",
-                    os.environ.get(
-                        "MLX_LM_GLM_DSA_BLOCK_SDPA_K_BLOCK",
-                        os.environ.get("MLX_LM_GLM_DSA_BLOCK_BUDGET_K_BLOCK", "8"),
-                    ),
-                )
-            )
-            block_masks = topk_indices_to_block_masks(
-                topk_indices,
-                L=L,
-                K=kv_latent.shape[2],
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                causal_prefix_indices=(
-                    os.environ.get("MLX_LM_GLM_DSA_FAST_TOPK", "1") == "1"
-                    and os.environ.get(
-                        "MLX_LM_GLM_DSA_TOPK_CAUSAL_PREFIX_FASTPATH", "1"
-                    )
-                    == "1"
-                ),
-                causal_prefix_rows=topk_prefix_rows,
-            )
-            if block_masks is not None:
-                block_mask, block_token_mask = block_masks
-                output = mx.fast.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    scale=self.scale,
-                    mask="causal",
-                    block_mask=block_mask,
-                    block_token_mask=block_token_mask,
-                )
-                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                return self.o_proj(output), topk_state
-
-        if direct_sparse_mla_requested:
-            shape = list(topk_indices.shape)
-            shape[-1] = kv_latent.shape[2]
-            sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-            sparse_mask = mx.put_along_axis(
-                sparse_mask, topk_indices, mx.array(True), axis=-1
-            )
-            if mask is not None:
-                sparse_mask = sparse_mask & mask
-            mask = sparse_mask
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:

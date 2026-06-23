@@ -44,7 +44,7 @@ def _glm_dsa_adaptive_prefill_config(
 
     return _AdaptivePrefillConfig(
         step_size=int(
-            os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", "6144")
+            os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", "8192")
         ),
         after=int(os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER", "0")),
         min_remaining=int(
@@ -83,7 +83,10 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
     PromptProcessingBatch = gen.PromptProcessingBatch
     BatchGenerator = gen.BatchGenerator
 
-    if getattr(PromptProcessingBatch, "_omlx_glm_dsa_adaptive_patched", False):
+    if (
+        getattr(PromptProcessingBatch, "_omlx_glm_dsa_adaptive_patched", False)
+        and getattr(gen.generate_step, "_omlx_glm_dsa_adaptive_patched", False)
+    ):
         _APPLIED = True
         return False
 
@@ -93,6 +96,7 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
     original_ppb_prompt = PromptProcessingBatch.prompt
     original_bg_init = BatchGenerator.__init__
     original_bg_next = BatchGenerator._next
+    original_generate_step = gen.generate_step
 
     def patched_ppb_init(self, *args, **kwargs):
         original_ppb_init(self, *args, **kwargs)
@@ -258,12 +262,27 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
 
         return prompt_responses, generation_responses
 
+    def patched_generate_step(prompt, model, *args, **kwargs):
+        prefill_step_size = kwargs.get("prefill_step_size", 2048)
+        adaptive_prefill = _glm_dsa_adaptive_prefill_config(
+            model, prefill_step_size
+        )
+        if (
+            adaptive_prefill is not None
+            and adaptive_prefill.after == 0
+            and adaptive_prefill.min_remaining == 0
+        ):
+            kwargs["prefill_step_size"] = adaptive_prefill.step_size
+        return original_generate_step(prompt, model, *args, **kwargs)
+
     PromptProcessingBatch.__init__ = patched_ppb_init
     PromptProcessingBatch._copy = patched_ppb_copy
     PromptProcessingBatch.split = patched_ppb_split
     PromptProcessingBatch.prompt = patched_ppb_prompt
     BatchGenerator.__init__ = patched_bg_init
     BatchGenerator._next = patched_bg_next
+    patched_generate_step._omlx_glm_dsa_adaptive_patched = True
+    gen.generate_step = patched_generate_step
 
     PromptProcessingBatch._omlx_glm_dsa_adaptive_patched = True
     BatchGenerator._omlx_glm_dsa_adaptive_patched = True
