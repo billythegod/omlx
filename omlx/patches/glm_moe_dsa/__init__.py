@@ -20,7 +20,7 @@ from .kernels import fast as glm_fast
 logger = logging.getLogger(__name__)
 
 PATCH_SOURCE = "mlxlm-glm optimized-final mlx-lm snapshot"
-NATIVE_KERNELS_PACKAGE = "omlx_glm_kernels"
+NATIVE_KERNELS_PACKAGE = "omlx.custom_kernels.glm_moe_dsa"
 
 _APPLIED = False
 

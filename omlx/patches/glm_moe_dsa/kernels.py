@@ -11,7 +11,7 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 try:
-    import omlx_glm_kernels.fast as _native_fast
+    from omlx.custom_kernels.glm_moe_dsa import fast as _native_fast
 except Exception as exc:  # pragma: no cover - depends on native extension build
     _native_fast = None
     _native_import_error = exc

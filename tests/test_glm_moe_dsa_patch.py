@@ -199,12 +199,12 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     mx = pytest.importorskip("mlx.core")
 
     try:
-        import omlx_glm_kernels.fast as fast
+        from omlx.custom_kernels.glm_moe_dsa import fast
     except Exception as exc:  # pragma: no cover - depends on local native build
-        pytest.skip(f"omlx_glm_kernels is unavailable: {exc}")
+        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
 
     if not fast.is_native_available():
-        pytest.skip("omlx_glm_kernels native extension is unavailable")
+        pytest.skip("GLM MoE DSA native extension is unavailable")
 
     mx.random.seed(7)
 

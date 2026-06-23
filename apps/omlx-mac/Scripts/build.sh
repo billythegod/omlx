@@ -37,6 +37,9 @@
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
+#                                                     # build and bundle optional
+#                                                     # native custom kernels
 #   apps/omlx-mac/Scripts/build.sh --rebuild-donor    # force venvstacks rebuild
 #   apps/omlx-mac/Scripts/build.sh --no-rebuild-donor # never rebuild; use
 #                                                       existing donor even if stale
@@ -48,6 +51,7 @@
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
 #   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
 #                                       (default: PATH lookup of python3)
+#   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
 
 set -euo pipefail
 
@@ -79,15 +83,21 @@ if [ $# -gt 0 ]; then
 fi
 
 BARE=0
+WITH_CUSTOM_KERNEL="${OMLX_WITH_CUSTOM_KERNEL:-0}"
 REBUILD_DONOR=auto    # auto | force | never
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --with-custom-kernel) WITH_CUSTOM_KERNEL=1 ;;
         --rebuild-donor) REBUILD_DONOR=force ;;
         --no-rebuild-donor) REBUILD_DONOR=never ;;
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
+case "$(echo "$WITH_CUSTOM_KERNEL" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) WITH_CUSTOM_KERNEL=1 ;;
+    *) WITH_CUSTOM_KERNEL=0 ;;
+esac
 if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$REBUILD_DONOR" = "force" ]; then
     echo "error: swift cannot be combined with --rebuild-donor; use release --rebuild-donor." >&2
     exit 2
@@ -193,6 +203,18 @@ _rebuild_venvstacks_export() {
         || die "venvstacks rebuild failed; see output above."
     [ -d "$LOCAL_EXPORT" ] || die "venvstacks rebuild reported success but $LOCAL_EXPORT is missing."
     ok "Venvstacks export ready at $LOCAL_EXPORT"
+}
+
+_build_custom_kernels() {
+    [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
+    log "Building optional native custom kernels…"
+    (
+        cd "$REPO_ROOT"
+        "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
+    ) || die "custom kernel build failed; see output above."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
+        || die "custom kernel build finished but GLM metallib is missing."
+    ok "  + custom kernels"
 }
 
 resolve_donor_layers() {
@@ -350,15 +372,30 @@ fi
 
 # --- Embed omlx package ---------------------------------------------------
 
+if [ "$WITH_CUSTOM_KERNEL" = "1" ]; then
+    _build_custom_kernels
+fi
+
 log "Copying omlx package from source tree…"
 rm -rf "$RESOURCES_DIR/omlx"
 mkdir -p "$RESOURCES_DIR/omlx"
 # rsync gives us per-tree exclude semantics that ditto lacks.
+RSYNC_EXCLUDES=(
+    --exclude='__pycache__'
+    --exclude='*.pyc'
+    --exclude='tests'
+    --exclude='.git'
+    --exclude='custom_kernels/*/csrc'
+)
+if [ "$WITH_CUSTOM_KERNEL" != "1" ]; then
+    RSYNC_EXCLUDES+=(
+        --exclude='custom_kernels/*/*.so'
+        --exclude='custom_kernels/*/*.dylib'
+        --exclude='custom_kernels/*/*.metallib'
+    )
+fi
 rsync -a \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='tests' \
-    --exclude='.git' \
+    "${RSYNC_EXCLUDES[@]}" \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
 
