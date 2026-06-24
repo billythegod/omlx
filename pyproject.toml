@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "cmake>=3.27",
+    "nanobind",
+    "mlx==0.31.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,7 +34,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
+    # Vanilla MLX v0.31.2; optional GLM-5.2 kernels live under
+    # omlx.custom_kernels.glm_moe_dsa when built for release.
+    "mlx==0.31.2",
     # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
     # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
@@ -195,11 +203,13 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
+    "mlx==0.31.2",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
 ]
 
