@@ -1344,10 +1344,8 @@
             },
 
             isSpecPrefillDraftModel(model) {
-                const text = this.draftModelSearchText(model);
                 return !this.isDflashDraftModel(model)
-                    && !this.isVlmMtpDraftModel(model)
-                    && !/(^|[-_/\s])mtp($|[-_/\s])/i.test(text);
+                    && !this.isVlmMtpDraftModel(model);
             },
 
             draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
