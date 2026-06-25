@@ -1904,6 +1904,7 @@ class TestSmartResizeTokens:
             (510, 680, 336),     # non-multiple, rounded to nearest factor
             (100, 100, 64),      # below min_pixels -> upscaled to min
             (4000, 3000, 11750),  # above max_pixels -> downscaled to cap
+            (2791, 16, 106),     # thin image: branch on raw rounded dims
         ],
     )
     def test_matches_known_grid(self, w, h, expected):
@@ -1957,6 +1958,14 @@ class TestCountImageTokensReal:
 
         total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
         assert total == 20 * 256  # 5120, not 20 * 16384 = 327680
+
+    def test_counts_thin_image_without_undercounting(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": [_image_part(2791, 16)]}]
+
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 106  # Qwen grid_thw=[1, 2, 212]
 
     def test_falls_back_to_upper_bound_for_unreadable(self):
         from omlx.engine.vlm import _count_image_tokens_real

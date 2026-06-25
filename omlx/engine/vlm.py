@@ -882,8 +882,8 @@ def _smart_resize_tokens(
     factor = patch_size * merge_size
     if h <= 0 or w <= 0:
         return 0
-    h_bar = max(factor, round(h / factor) * factor)
-    w_bar = max(factor, round(w / factor) * factor)
+    h_bar = round(h / factor) * factor
+    w_bar = round(w / factor) * factor
     if h_bar * w_bar > max_pixels:
         beta = math.sqrt((h * w) / max_pixels)
         h_bar = max(factor, math.floor(h / beta / factor) * factor)
