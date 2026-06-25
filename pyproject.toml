@@ -91,9 +91,9 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e3906673d54df42cf573b837a76e65d58a2b865c",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
-    # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@5d70faebe3d0af0a3dae76fcc15cc731f7ba46da",
+    # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
+    # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@9ca002898b48e14c9727dec17299f497e8467870",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
