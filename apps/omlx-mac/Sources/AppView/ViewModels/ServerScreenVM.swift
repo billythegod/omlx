@@ -391,6 +391,7 @@ final class ServerScreenVM {
         if !hasLoaded {
             self.host = config.bindAddress
             self.portText = String(config.port)
+            self.autoStartOnLaunch = config.autoStartOnLaunch
             self.appliedBindAddress = config.bindAddress
             self.effectiveHost = config.host
             self.effectivePort = config.port
