@@ -571,6 +571,128 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         _vu.load_config = original
 
 
+def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
+    """Return True when the first safetensors shard declares ``format=mlx``."""
+    import safetensors
+
+    try:
+        weight_files = sorted(
+            sf
+            for sf in model_dir.glob("*.safetensors")
+            if not sf.name.endswith("consolidated.safetensors")
+        )
+    except Exception:
+        return False
+    if not weight_files:
+        return False
+
+    try:
+        with safetensors.safe_open(str(weight_files[0]), framework="np") as f:
+            metadata = f.metadata()
+    except Exception:
+        return False
+    return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+
+@contextlib.contextmanager
+def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
+    """Drop Gemma4 shared-KV extra weights for MLX-format VLM checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata is ``format=mlx``.
+    Gemma4 E2B/E4B MLX checkpoints still ship K/V tensors for shared-KV layers,
+    but the mlx-vlm model tree intentionally omits those modules.  If the
+    extras reach strict ``load_weights``, VLM loading fails and oMLX falls back
+    to text-only LLM.  Scope the fix to Gemma4 MLX-format models whose config
+    declares shared-KV layers; 26B/31B Gemma4 models have zero shared-KV layers
+    and remain no-op.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        yield
+        return
+
+    if config.get("model_type") != "gemma4":
+        yield
+        return
+    if text_config.get("model_type") != "gemma4_text":
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    try:
+        num_layers = int(text_config.get("num_hidden_layers") or 0)
+        num_shared = int(text_config.get("num_kv_shared_layers") or 0)
+    except (TypeError, ValueError):
+        yield
+        return
+    if num_layers <= 0 or num_shared <= 0 or num_shared >= num_layers:
+        yield
+        return
+
+    first_shared = num_layers - num_shared
+    drop_modules = {"k_proj", "v_proj", "k_norm", "v_norm"}
+    layer_prefix = "language_model.model.layers."
+
+    def _is_shared_kv_extra(key: str) -> bool:
+        if not key.startswith(layer_prefix):
+            return False
+        parts = key[len(layer_prefix) :].split(".")
+        if len(parts) < 4 or parts[1] != "self_attn":
+            return False
+        try:
+            layer_idx = int(parts[0])
+        except ValueError:
+            return False
+        return first_shared <= layer_idx < num_layers and parts[2] in drop_modules
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    dropped = 0
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal dropped
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        filtered = []
+        local_dropped = 0
+        for item in weights_items:
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) >= 2
+                and isinstance(item[0], str)
+                and _is_shared_kv_extra(item[0])
+            ):
+                local_dropped += 1
+                continue
+            filtered.append(item)
+        dropped += local_dropped
+        return original_load_weights(self, filtered, *args, **kwargs)
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
+        if dropped:
+            logger.info(
+                "Dropped %d Gemma4 shared-KV extra weights for MLX-format "
+                "checkpoint %s",
+                dropped,
+                model_dir.name,
+            )
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
@@ -1234,6 +1356,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
