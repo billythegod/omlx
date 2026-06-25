@@ -1897,21 +1897,62 @@ class _DiscoveredPlan:
         )
 
 
+def _is_qat_unquantized_config(qc) -> bool:
+    """Return True if qc is a QAT training config with full-precision weights.
+
+    Gemma 4 QAT configs carry quant_type (e.g. "q4_0") recording the training
+    regime but store weights in bfloat16 — no quant_method means no actual
+    weight quantization has been applied.
+    """
+    return (
+        isinstance(qc, dict)
+        and qc.get("quant_type") == "q4_0"
+        and "quant_method" not in qc
+    )
+
+
 def validate_quantizable(config: dict) -> bool:
     """Check if a model config indicates it can be quantized.
 
     Models with 'quantization' key (mlx-lm quantized) are excluded.
     Models with 'quantization_config' are excluded UNLESS they are native FP8
-    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format.
+    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format,
+    or QAT-trained models (e.g. Google Gemma 4 QAT variants) whose
+    quantization_config records training-time settings but whose weights are
+    stored in full precision (bfloat16/float16).
     """
     if "quantization" in config:
         return False
     if "quantization_config" in config:
         qc = config["quantization_config"]
-        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
-            return True
+        if isinstance(qc, dict):
+            quant_method = qc.get("quant_method", "")
+            # FP8 models are full-precision weights stored in FP8 format
+            if quant_method == "fp8":
+                return True
+            # QAT models record training-time quant_type but weights are fp16/bf16
+            if _is_qat_unquantized_config(qc):
+                return True
         return False
     return True
+
+
+def _sensitivity_lm_config_override(config: dict) -> dict | None:
+    """Return a model_config override for mlx_lm.load when the model has a
+    QAT quantization_config that mlx-lm cannot process (missing quant_method).
+
+    mlx-lm does ``quantization_config["quant_method"]`` without a fallback, so
+    QAT configs (e.g. Google Gemma 4 QAT) raise KeyError and abort the load.
+    Passing ``{"quantization_config": None}`` via model_config causes
+    config.update() to replace the offending key before that branch runs.
+    """
+    for qc in (
+        config.get("quantization_config"),
+        config.get("text_config", {}).get("quantization_config"),
+    ):
+        if _is_qat_unquantized_config(qc):
+            return {"quantization_config": None}
+    return None
 
 
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
@@ -2540,6 +2581,7 @@ def _gs_for_mode(bits: int, default_gs: int) -> int:
 
 # --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
 import struct as _struct
+
 import numpy as _np
 
 
@@ -3237,9 +3279,9 @@ def quantize_oq_streaming(
             )
         elif _model_exceeds_ram and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
-                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
-                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
+                f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                f"({_system_ram / 1e9:.1f} GB). Auto-building a uniform "
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
@@ -3247,6 +3289,7 @@ def quantize_oq_streaming(
             try:
                 _proxy_dir = _build_proxy_for_sensitivity(
                     model_path,
+                    config=config,
                     dtype=dtype,
                     working_dir=str(output.parent),
                     trust_remote_code=trust_remote_code,
@@ -3275,7 +3318,7 @@ def quantize_oq_streaming(
                     logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
         elif _model_exceeds_ram:
             raise RuntimeError(
-                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
+                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
                 "of system RAM and auto_proxy_sensitivity is disabled. "
                 "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
                 "with a pre-quantized version of this model, or run on a "
@@ -3683,8 +3726,7 @@ def quantize_oq_streaming(
 
     cb("saving", 100.0)
     logger.info(
-        f"oQ{oq_level:g} streaming: completed -> {output_path} "
-        f"({total_shards} shards)"
+        f"oQ{oq_level:g} streaming: completed -> {output_path} ({total_shards} shards)"
     )
 
 
@@ -3730,7 +3772,7 @@ def _load_calibration_data(
             )
         except Exception as e:
             logger.warning(
-                f"Built-in calibration failed: {e}, " "falling back to mlx-lm default"
+                f"Built-in calibration failed: {e}, falling back to mlx-lm default"
             )
 
     if dataset == "default":
@@ -3789,9 +3831,7 @@ def _load_builtin_calibration(
         raise ValueError("No calibration text available")
 
     total_kb = sum(len(t) for t in texts) // 1024
-    logger.info(
-        f"Built-in calibration: {len(texts)} texts, " f"{total_kb} KB ({dataset})"
-    )
+    logger.info(f"Built-in calibration: {len(texts)} texts, {total_kb} KB ({dataset})")
 
     all_ids = []
     for text in texts:
@@ -3910,8 +3950,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         tokens = tokens[indices]
 
     logger.info(
-        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens "
-        f"from {dataset}"
+        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens from {dataset}"
     )
     return tokens
 
@@ -4252,13 +4291,31 @@ def _measure_sensitivity(
 
     try:
         if is_vlm:
+            import mlx.nn as _nn
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            model = vlm_load_model(
-                Path(model_path),
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-            )
+            # mlx_vlm.load_model calls model.load_weights(weights) without strict=False.
+            # Shared-KV models (e.g. Gemma 4 2B/4B) omit k/v weights for shared layers,
+            # so strict=True raises ValueError. Relax temporarily — sensitivity only needs
+            # approximate weights; shared layers receive pre-computed KV at inference time.
+            _orig_lw = _nn.Module.load_weights
+
+            def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
+                kwargs.pop("strict", None)
+                return _orig_lw(self, file_or_weights, *args, strict=False, **kwargs)
+
+            _nn.Module.load_weights = _lenient_load_weights
+            try:
+                # No QAT config override needed here: mlx_vlm.utils.load_model
+                # uses quantization_config.get("quant_method") rather than direct
+                # key access, so a missing quant_method falls through silently.
+                model = vlm_load_model(
+                    Path(model_path),
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                )
+            finally:
+                _nn.Module.load_weights = _orig_lw
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
@@ -4269,6 +4326,7 @@ def _measure_sensitivity(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                model_config=_sensitivity_lm_config_override(config),
             )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
@@ -4306,6 +4364,7 @@ def _perturb_bits_for(bits: int):
 def _build_proxy_for_sensitivity(
     model_path: str,
     *,
+    config: dict | None = None,
     dtype: str,
     working_dir: str | None = None,
     trust_remote_code: bool = False,
