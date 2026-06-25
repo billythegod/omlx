@@ -712,6 +712,12 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
         yield
         return
 
+    from ..patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
     import safetensors
     from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
 
