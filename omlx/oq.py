@@ -857,6 +857,7 @@ class _TrackedTensor:
         "transform",
         "axis",
         "recipe",
+        "expr",
     )
 
     def __init__(
@@ -867,6 +868,7 @@ class _TrackedTensor:
         transform="passthrough",
         axis=None,
         recipe=None,
+        expr=None,
     ):
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
@@ -875,14 +877,19 @@ class _TrackedTensor:
         self.transform = transform
         self.axis = axis
         self.recipe = list(recipe or [])
+        if expr is None and transform == "passthrough" and len(self.sources) == 1:
+            expr = ("source", self.sources[0])
+        self.expr = expr
 
     def _clone(self, shape=None, dtype=None, transform=None):
+        new_transform = transform if transform is not None else self.transform
         return _TrackedTensor(
             shape if shape is not None else self.shape,
             dtype if dtype is not None else self.dtype,
             list(self.sources),
-            transform if transform is not None else self.transform,
+            new_transform,
             recipe=list(self.recipe),
+            expr=self.expr if new_transform == self.transform else None,
         )
 
     # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
@@ -944,6 +951,9 @@ class _TrackedTensor:
         return tuple(expanded)
 
     def _with_recipe(self, shape, transform, op, axis=None):
+        expr = self.as_expr()
+        if expr is not None:
+            expr = self._wrap_expr_op(expr, op)
         return _TrackedTensor(
             shape,
             self.dtype,
@@ -951,6 +961,77 @@ class _TrackedTensor:
             transform,
             axis=axis,
             recipe=list(self.recipe) + [op],
+            expr=expr,
+        )
+
+    @staticmethod
+    def _wrap_expr_op(expr, op):
+        kind = op[0]
+        if kind == "reshape":
+            return ("reshape", op[1], expr)
+        if kind == "slice":
+            return ("slice", op[1], expr)
+        if kind == "transpose":
+            return ("transpose", op[1], expr)
+        if kind == "moveaxis":
+            return ("moveaxis", op[1], op[2], expr)
+        if kind == "astype":
+            return ("astype", op[1], expr)
+        if kind == "expand_dims":
+            return ("expand_dims", op[1], expr)
+        return None
+
+    def as_expr(self):
+        if self.expr is not None:
+            return self.expr
+        if self.recipe and len(self.sources) == 1:
+            expr = ("source", self.sources[0])
+            for op in self.recipe:
+                expr = self._wrap_expr_op(expr, op)
+                if expr is None:
+                    return None
+            return expr
+        if self.transform == "passthrough" and len(self.sources) == 1:
+            return ("source", self.sources[0])
+        if self.transform == "stack":
+            axis = self.axis if self.axis is not None else 0
+            return ("stack", axis, [("source", src) for src in self.sources])
+        if self.transform == "concatenate":
+            axis = self.axis if self.axis is not None else 0
+            return ("concatenate", axis, [("source", src) for src in self.sources])
+        return None
+
+    @staticmethod
+    def _normalize_expand_axes(axis, ndim):
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        out_ndim = ndim + len(axes)
+        normalized = []
+        for ax in axes:
+            ax = ax + out_ndim if ax < 0 else ax
+            if ax < 0 or ax >= out_ndim:
+                raise ValueError(f"axis {ax} is out of bounds for expand_dims")
+            normalized.append(ax)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("repeated axis in expand_dims")
+        return tuple(sorted(normalized))
+
+    def expand_dims(self, axis):
+        axes = self._normalize_expand_axes(axis, self.ndim)
+        axis_set = set(axes)
+        src_i = 0
+        new_shape = []
+        for i in range(self.ndim + len(axes)):
+            if i in axis_set:
+                new_shape.append(1)
+            else:
+                new_shape.append(self.shape[src_i])
+                src_i += 1
+        stored_axis = axes[0] if len(axes) == 1 else axes
+        return self._with_recipe(
+            tuple(new_shape),
+            "expand_dims",
+            ("expand_dims", axes),
+            axis=stored_axis,
         )
 
     def __getitem__(self, idx):
@@ -1200,19 +1281,46 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "moveaxis": mx.moveaxis,
         "transpose": mx.transpose,
         "swapaxes": getattr(mx, "swapaxes", None),
+        "expand_dims": mx.expand_dims,
         "contiguous": getattr(mx, "contiguous", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
     }
 
+    def _is_plain_source(tensor):
+        return (
+            isinstance(tensor, _TrackedTensor)
+            and tensor.transform == "passthrough"
+            and not tensor.recipe
+            and len(tensor.sources) == 1
+        )
+
     def _fake_stack(tensors, axis=0):
         if tensors and isinstance(tensors[0], _TrackedTensor):
             n = len(tensors)
             base = list(tensors[0].shape)
+            axis = axis + len(base) + 1 if axis < 0 else axis
             new_shape = base[:axis] + [n] + base[axis:]
             all_src = []
             for t in tensors:
                 all_src.extend(t.sources)
+            if not all(_is_plain_source(t) for t in tensors):
+                exprs = [t.as_expr() for t in tensors]
+                if any(expr is None for expr in exprs):
+                    return _TrackedTensor(
+                        new_shape,
+                        tensors[0].dtype,
+                        all_src,
+                        "nested_unreplayable",
+                    )
+                return _TrackedTensor(
+                    new_shape,
+                    tensors[0].dtype,
+                    all_src,
+                    "expr",
+                    axis=axis,
+                    expr=("stack", axis, exprs),
+                )
             return _TrackedTensor(
                 new_shape, tensors[0].dtype, all_src, "stack", axis=axis
             )
@@ -1224,7 +1332,25 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for t in tensors:
                 all_src.extend(t.sources)
             base = list(tensors[0].shape)
+            axis = axis + len(base) if axis < 0 else axis
             base[axis] = sum(t.shape[axis] for t in tensors)
+            if not all(_is_plain_source(t) for t in tensors):
+                exprs = [t.as_expr() for t in tensors]
+                if any(expr is None for expr in exprs):
+                    return _TrackedTensor(
+                        base,
+                        tensors[0].dtype,
+                        all_src,
+                        "nested_unreplayable",
+                    )
+                return _TrackedTensor(
+                    base,
+                    tensors[0].dtype,
+                    all_src,
+                    "expr",
+                    axis=axis,
+                    expr=("concatenate", axis, exprs),
+                )
             return _TrackedTensor(
                 base, tensors[0].dtype, all_src, "concatenate", axis=axis
             )
@@ -1267,37 +1393,25 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
-            src_ax = src_ax % tensor.ndim if src_ax < 0 else src_ax
-            dst_ax = dst_ax % tensor.ndim if dst_ax < 0 else dst_ax
-            dims = list(range(tensor.ndim))
-            dims.insert(dst_ax, dims.pop(src_ax))
-            new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(
-                new_shape,
-                tensor.dtype,
-                list(tensor.sources),
-                f"moveaxis_{src_ax}_{dst_ax}",
-            )
+            return tensor.moveaxis(src_ax, dst_ax)
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
         if isinstance(tensor, _TrackedTensor):
             if axes is None:
                 axes = list(reversed(range(tensor.ndim)))
-            axes = [a % tensor.ndim if a < 0 else a for a in axes]
-            new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(
-                new_shape,
-                tensor.dtype,
-                list(tensor.sources),
-                "transpose_" + "_".join(str(a) for a in axes),
-            )
+            return tensor.transpose(tuple(axes))
         return _orig["transpose"](tensor, axes=axes)
 
     def _fake_swapaxes(tensor, axis1, axis2):
         if isinstance(tensor, _TrackedTensor):
             return tensor.swapaxes(axis1, axis2)
         return _orig["swapaxes"](tensor, axis1, axis2)
+
+    def _fake_expand_dims(tensor, axis, **kwargs):
+        if isinstance(tensor, _TrackedTensor):
+            return tensor.expand_dims(axis)
+        return _orig["expand_dims"](tensor, axis=axis, **kwargs)
 
     def _fake_contiguous(tensor, *args, **kwargs):
         if isinstance(tensor, _TrackedTensor):
@@ -1315,6 +1429,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
+    mx.expand_dims = _fake_expand_dims
     if _orig["swapaxes"] is not None:
         mx.swapaxes = _fake_swapaxes
     if _orig["contiguous"] is not None:
@@ -1369,6 +1484,8 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "slice",
         "reshape",
         "astype",
+        "expand_dims",
+        "expr",
     )
     plan = {}
     for k, v in result.items():
@@ -1386,6 +1503,13 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "axis": v.axis,
                 "recipe": list(v.recipe),
             }
+            if v.transform == "expr":
+                if v.expr is None:
+                    raise ValueError(
+                        f"missing replay expression for {k!r} — "
+                        "falling back to eager sanitize"
+                    )
+                plan[k]["expr"] = v.expr
             if v.recipe:
                 if len(v.sources) != 1:
                     raise ValueError(
@@ -1489,9 +1613,7 @@ class _DiscoveredPlan:
         if not sources:
             return None
         if recipe and not (
-            transform == "reshape"
-            and len(recipe) == 1
-            and recipe[0][0] == "reshape"
+            transform == "reshape" and len(recipe) == 1 and recipe[0][0] == "reshape"
         ):
             return None
         if transform not in ("passthrough", "stack") and not (
@@ -1590,10 +1712,73 @@ class _DiscoveredPlan:
                 arr = mx.moveaxis(arr, op[1], op[2])
             elif kind == "astype":
                 arr = arr.astype(op[1])
+            elif kind == "expand_dims":
+                arr = mx.expand_dims(arr, axis=op[1])
             else:
                 raise ValueError(f"unsupported replay recipe op: {kind}")
             mx.eval(arr)
         return arr
+
+    def _materialize_expr(self, expr):
+        kind = expr[0]
+
+        if kind == "source":
+            return self._materialize_source(expr[1])
+
+        if kind == "stack":
+            axis = expr[1]
+            children = expr[2]
+            chunk = self._STACK_CHUNK
+            partials = []
+            for base in range(0, len(children), chunk):
+                piece = [
+                    self._materialize_expr(c) for c in children[base : base + chunk]
+                ]
+                stk = mx.stack(piece, axis=axis)
+                mx.eval(stk)
+                del piece
+                mx.clear_cache()
+                partials.append(stk)
+            if len(partials) == 1:
+                return partials[0]
+            result = mx.concatenate(partials, axis=axis)
+            mx.eval(result)
+            del partials
+            mx.clear_cache()
+            return result
+
+        child_kinds = {"reshape", "slice", "transpose", "expand_dims", "astype"}
+        if kind in child_kinds:
+            arr = self._materialize_expr(expr[2])
+            if kind == "reshape":
+                result = mx.reshape(arr, expr[1])
+            elif kind == "slice":
+                result = arr[expr[1]]
+            elif kind == "transpose":
+                result = mx.transpose(arr, axes=expr[1])
+            elif kind == "expand_dims":
+                result = mx.expand_dims(arr, axis=expr[1])
+            else:
+                result = arr.astype(expr[1])
+            mx.eval(result)
+            return result
+
+        if kind == "moveaxis":
+            arr = self._materialize_expr(expr[3])
+            result = mx.moveaxis(arr, expr[1], expr[2])
+            mx.eval(result)
+            return result
+
+        if kind == "concatenate":
+            axis = expr[1]
+            parts = [self._materialize_expr(c) for c in expr[2]]
+            result = mx.concatenate(parts, axis=axis)
+            mx.eval(result)
+            del parts
+            mx.clear_cache()
+            return result
+
+        raise ValueError(f"unsupported replay expression op: {kind}")
 
     def pop(self, key, *default):
         if key not in self._plan:
@@ -1608,6 +1793,9 @@ class _DiscoveredPlan:
 
         if transform == "literal":
             return info["value"]
+
+        if transform == "expr":
+            return self._materialize_expr(info["expr"])
 
         if recipe and len(sources) == 1:
             arr = self._materialize_source(sources[0])
@@ -3980,10 +4168,7 @@ def _measure_sensitivity_from_model(
         saved = _temporary_quantize_block(
             block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
         )
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
         out_quant, _ = _forward_layer_result(block, inputs, layer_mask, position_ids)
         if out_quant is not None:
@@ -3995,10 +4180,7 @@ def _measure_sensitivity_from_model(
 
         _restore_saved_weights(block, saved)
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
         inputs = out_float
         mx.synchronize()
@@ -4240,10 +4422,7 @@ def _build_streaming_proxy_for_sensitivity(
 
     for tensor_name in tensor_names:
         handled_packed = False
-        if (
-            hasattr(all_weights, "pop_packed")
-            and not _is_mtp_tensor(tensor_name)
-        ):
+        if hasattr(all_weights, "pop_packed") and not _is_mtp_tensor(tensor_name):
             src_info = all_weights.source_quant_info(tensor_name)
             if src_info is not None and _should_quantize_tensor(
                 tensor_name, all_weights.plan_shape(tensor_name)
@@ -4278,11 +4457,7 @@ def _build_streaming_proxy_for_sensitivity(
                 pred = universal_quant_predicate(
                     tensor_name, None, config, _PROXY_QUANT_BITS
                 )
-                if (
-                    pred is not False
-                    and len(shape) >= 2
-                    and shape[-1] % base_gs == 0
-                ):
+                if pred is not False and len(shape) >= 2 and shape[-1] % base_gs == 0:
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != target_dtype
@@ -4303,9 +4478,7 @@ def _build_streaming_proxy_for_sensitivity(
                     del qw, scales, biases
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(
-                            tensor_name, w_mx, target_dtype
-                        )
+                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
@@ -4385,50 +4558,90 @@ def _measure_sensitivity_from_quantized_model(
     bits. The relative MSE ranking matches fp16 qdq-MSE with ~90% top-10
     overlap.
     """
-    from mlx_lm import load as lm_load
-
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+    from omlx.utils.model_loading import (
+        _checkpoint_has_mtp_weights,
+        _has_mtp_heads,
+        maybe_apply_pre_load_patches,
+    )
 
     # Reuse the centralised pre-load dispatch (DeepSeek V4 base patch,
     # load_model replacement for F8_E8M0 checkpoints, MTP sanitize, ...)
     # so the quantized source/proxy loads exactly as in production.
     # Idempotent; harmless for plain mlx-lm proxies.
-    maybe_apply_pre_load_patches(model_path, for_vlm=False)
+    is_vlm = _has_vision_subconfig(config)
+    has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
+    maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
-    # Mirror the main quantize path's MTP patch sequence so an
-    # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
-    # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
-    # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
-    # ``mtp.*`` weights present in the proxy.
+    restore_mtp_active = None
     try:
-        from omlx.patches.mlx_lm_mtp import (
-            apply_mlx_lm_mtp_patch,
-            is_mtp_active,
-            set_mtp_active,
-        )
+        if is_vlm:
+            if _has_mtp_heads(config) and has_mtp_weights:
+                try:
+                    from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+                    from omlx.patches.mlx_vlm_mtp import (
+                        apply_mlx_vlm_mtp_patch,
+                        apply_mlx_vlm_mtp_runtime_patch,
+                    )
 
-        _have_lm_patch = apply_mlx_lm_mtp_patch()
-    except Exception:
-        _have_lm_patch = False
-        is_mtp_active = None
-        set_mtp_active = None
+                    apply_mlx_vlm_mtp_patch()
+                    apply_mlx_vlm_mtp_runtime_patch()
+                    prev_active = is_mtp_active()
+                    set_mtp_active(True)
+                    restore_mtp_active = lambda: set_mtp_active(
+                        prev_active
+                    )  # noqa: E731
+                except Exception as e:
+                    logger.debug(
+                        "mlx-vlm MTP runtime patch skipped for proxy sensitivity: "
+                        f"{e}"
+                    )
 
-    prev_active = is_mtp_active() if _have_lm_patch else False
-    try:
-        if _have_lm_patch:
-            set_mtp_active(True)
-        try:
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+            )
+            tokenizer = load_tokenizer(Path(model_path))
+        else:
+            from mlx_lm import load as lm_load
+
+            # Mirror the main quantize path's MTP patch sequence so an
+            # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
+            # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
+            # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
+            # ``mtp.*`` weights present in the proxy.
+            try:
+                from omlx.patches.mlx_lm_mtp import (
+                    apply_mlx_lm_mtp_patch,
+                    is_mtp_active,
+                    set_mtp_active,
+                )
+
+                have_lm_patch = apply_mlx_lm_mtp_patch()
+            except Exception:
+                have_lm_patch = False
+                is_mtp_active = None
+                set_mtp_active = None
+
+            if have_lm_patch:
+                prev_active = is_mtp_active()
+                set_mtp_active(True)
+                restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
+
             model, tokenizer = lm_load(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
             )
-        except Exception as e:
-            logger.error(f"Sensitivity proxy load failed ({e})")
-            return {}
+    except Exception as e:
+        logger.error(f"Sensitivity proxy load failed ({e})")
+        return {}
     finally:
-        if _have_lm_patch:
-            set_mtp_active(prev_active)
+        if restore_mtp_active is not None:
+            restore_mtp_active()
 
     if config.get("model_type") == "glm_moe_dsa":
         capped_samples = min(num_samples, 16)
@@ -4522,12 +4735,11 @@ def _measure_sensitivity_from_quantized_model(
             else:
                 mx.eval(m.weight, m.scales)
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
-        out_perturbed, _ = _forward_layer_result(block, inputs, layer_mask, position_ids)
+        out_perturbed, _ = _forward_layer_result(
+            block, inputs, layer_mask, position_ids
+        )
 
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
@@ -4555,10 +4767,7 @@ def _measure_sensitivity_from_quantized_model(
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
         inputs = out_baseline
         mx.eval(inputs)

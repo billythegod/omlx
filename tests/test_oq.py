@@ -40,6 +40,7 @@ from omlx.oq import (
     _is_vision_tensor,
     _LazyTensorIndex,
     _measure_sensitivity,
+    _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
     _perturb_bits_for,
     _progress_total_bytes,
@@ -1491,6 +1492,19 @@ class TestTrackedTensor:
         assert r.sources == ["a"]
         assert r.recipe == [("transpose", (0, 2, 1))]
 
+    def test_expand_dims_method(self):
+        t = _TrackedTensor((2, 3), "F16", sources=["a"])
+        r = t.expand_dims(axis=0)
+        assert r.shape == (1, 2, 3)
+        assert r.transform == "expand_dims"
+        assert r.recipe == [("expand_dims", (0,))]
+
+    def test_expand_dims_multiple_axes(self):
+        t = _TrackedTensor((2, 3), "F16", sources=["a"])
+        r = t.expand_dims(axis=(0, -2))
+        assert r.shape == (1, 2, 1, 3)
+        assert r.recipe == [("expand_dims", (0, 2))]
+
     def test_getitem_ellipsis_half_split(self):
         # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
         # the tracked-tensor dry run so streaming discovery covers low-RAM
@@ -1656,6 +1670,115 @@ class TestDiscoverSanitizePlan:
             atol=1e-3,
         )
 
+    def test_expand_dims_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensor = np.arange(6, dtype=np.float16).reshape(2, 3)
+        _write_safetensors(str(path), {"shared_down.weight": tensor})
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            return {
+                "shared_down.weight": mx.expand_dims(
+                    weights["shared_down.weight"], axis=0
+                )
+            }
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["shared_down.weight"]["shape"] == (1, 2, 3)
+        assert plan["shared_down.weight"]["recipe"] == [("expand_dims", (0,))]
+
+        result = _DiscoveredPlan(plan, idx).pop("shared_down.weight")
+        np.testing.assert_array_equal(np.array(result), tensor[None, :, :])
+
+    def test_minimax_shared_expert_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {}
+        for name, start in (
+            ("experts.0.w1.weight", 0),
+            ("experts.1.w1.weight", 10),
+            ("experts.0.w3.weight", 20),
+            ("experts.1.w3.weight", 30),
+            ("shared.gate.weight", 40),
+            ("shared.up.weight", 50),
+            ("experts.0.w2.weight", 60),
+            ("experts.1.w2.weight", 70),
+            ("shared.down.weight", 80),
+        ):
+            tensors[name] = (np.arange(6, dtype=np.float16) + start).reshape(2, 3)
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            weights = dict(weights)
+            gate = mx.stack(
+                [weights.pop("experts.0.w1.weight"), weights.pop("experts.1.w1.weight")]
+            )
+            up = mx.stack(
+                [weights.pop("experts.0.w3.weight"), weights.pop("experts.1.w3.weight")]
+            )
+            routed_gate_up = mx.concatenate([gate, up], axis=1)
+            shared_gate_up = mx.expand_dims(
+                mx.concatenate(
+                    [
+                        weights.pop("shared.gate.weight"),
+                        weights.pop("shared.up.weight"),
+                    ],
+                    axis=0,
+                ),
+                axis=0,
+            )
+            down = mx.stack(
+                [weights.pop("experts.0.w2.weight"), weights.pop("experts.1.w2.weight")]
+            )
+            shared_down = mx.expand_dims(weights.pop("shared.down.weight"), axis=0)
+            return {
+                "switch.gate_up.weight": mx.concatenate(
+                    [routed_gate_up, shared_gate_up], axis=0
+                ),
+                "switch.down.weight": mx.concatenate([down, shared_down], axis=0),
+            }
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["switch.gate_up.weight"]["transform"] == "expr"
+        assert plan["switch.gate_up.weight"]["shape"] == (3, 4, 3)
+        assert plan["switch.down.weight"]["transform"] == "expr"
+        assert plan["switch.down.weight"]["shape"] == (3, 2, 3)
+
+        discovered = _DiscoveredPlan(plan, idx)
+        gate = np.stack(
+            [tensors["experts.0.w1.weight"], tensors["experts.1.w1.weight"]]
+        )
+        up = np.stack([tensors["experts.0.w3.weight"], tensors["experts.1.w3.weight"]])
+        expected_gate_up = np.concatenate(
+            [
+                np.concatenate([gate, up], axis=1),
+                np.concatenate(
+                    [tensors["shared.gate.weight"], tensors["shared.up.weight"]],
+                    axis=0,
+                )[None, :, :],
+            ],
+            axis=0,
+        )
+        expected_down = np.concatenate(
+            [
+                np.stack(
+                    [
+                        tensors["experts.0.w2.weight"],
+                        tensors["experts.1.w2.weight"],
+                    ]
+                ),
+                tensors["shared.down.weight"][None, :, :],
+            ],
+            axis=0,
+        )
+
+        np.testing.assert_array_equal(
+            np.array(discovered.pop("switch.gate_up.weight")), expected_gate_up
+        )
+        np.testing.assert_array_equal(
+            np.array(discovered.pop("switch.down.weight")), expected_down
+        )
+
     def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
         path = tmp_path / "mtp_norms.safetensors"
         tensors = {
@@ -1772,9 +1895,7 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [
-            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)
-        ]
+        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
@@ -1887,12 +2008,11 @@ class TestBuildProxyForSensitivity:
             str(src / "model.safetensors"),
         )
 
-        with patch("omlx.oq._build_model_sanitizer", return_value=None), patch(
-            "omlx.oq._build_non_quantizable_set", return_value=set()
+        with (
+            patch("omlx.oq._build_model_sanitizer", return_value=None),
+            patch("omlx.oq._build_non_quantizable_set", return_value=set()),
         ):
-            _build_streaming_proxy_for_sensitivity(
-                str(src), out, dtype="bfloat16"
-            )
+            _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
 
         config = json.loads((out / "config.json").read_text(encoding="utf-8"))
         assert config["quantization"]["bits"] == _PROXY_QUANT_BITS
@@ -3316,6 +3436,60 @@ class TestMeasureSensitivityVlmMtp:
         )
 
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
+
+
+class TestMeasureSensitivityQuantizedVlm:
+    def test_quantized_vlm_proxy_uses_vlm_loader(self, monkeypatch):
+        from omlx import oq as oq_mod
+
+        maybe_apply = MagicMock()
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=maybe_apply,
+                _has_mtp_heads=MagicMock(return_value=False),
+                _checkpoint_has_mtp_weights=MagicMock(return_value=False),
+            ),
+        )
+
+        vlm_load = MagicMock(return_value=MagicMock())
+        tokenizer_load = MagicMock(return_value=MagicMock())
+        lm_load = MagicMock(side_effect=AssertionError("mlx-lm loader used for VLM"))
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_vlm.utils",
+            MagicMock(load_model=vlm_load),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=lm_load))
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_lm.tokenizer_utils",
+            MagicMock(load=tokenizer_load),
+        )
+        monkeypatch.setattr(
+            oq_mod,
+            "_load_calibration_data",
+            MagicMock(return_value=None),
+        )
+
+        result = _measure_sensitivity_from_quantized_model(
+            "/fake/minimax-proxy",
+            {"vision_config": {}, "model_type": "minimax_m3_vl"},
+            3.5,
+            trust_remote_code=True,
+        )
+
+        assert result == {}
+        maybe_apply.assert_called_once_with("/fake/minimax-proxy", for_vlm=True)
+        vlm_load.assert_called_once()
+        assert vlm_load.call_args.args[0] == Path("/fake/minimax-proxy")
+        assert vlm_load.call_args.kwargs["lazy"] is True
+        assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+        tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
+        lm_load.assert_not_called()
 
 
 # =============================================================================
