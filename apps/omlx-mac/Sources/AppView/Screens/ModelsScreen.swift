@@ -112,7 +112,7 @@ private struct ActiveModelsSection: View {
                                     .font(.system(size: 11))
                                     .foregroundStyle(theme.textSecondary)
                             }
-                            Text(m.id)
+                            Text(m.displayTitle)
                                 .font(.omlxText(13, weight: .medium))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
@@ -216,7 +216,7 @@ private struct LibrarySection: View {
                                      gradient: gradient(for: m))
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 4) {
-                                    Text(m.settings?.displayName ?? m.id)
+                                    Text(m.displayTitle)
                                         .font(.omlxText(13, weight: .medium))
                                         .foregroundStyle(theme.text)
                                         .lineLimit(1)
@@ -301,7 +301,9 @@ private struct LibrarySection: View {
 
 func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
     models.enumerated().sorted { lhs, rhs in
-        switch lhs.element.id.localizedCaseInsensitiveCompare(rhs.element.id) {
+        switch lhs.element.displayTitle.localizedCaseInsensitiveCompare(
+            rhs.element.displayTitle
+        ) {
         case .orderedAscending:
             return true
         case .orderedDescending:
@@ -310,6 +312,12 @@ func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
             return lhs.offset < rhs.offset
         }
     }.map(\.element)
+}
+
+extension ModelDTO {
+    var displayTitle: String {
+        displayName ?? settings?.displayName ?? id
+    }
 }
 
 func formatBytes(_ bytes: Int64) -> String {

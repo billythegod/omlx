@@ -3951,8 +3951,8 @@
 
                     switch (this.sortBy) {
                         case 'id':
-                            aVal = (a.id || '').toLowerCase();
-                            bVal = (b.id || '').toLowerCase();
+                            aVal = (a.display_name || a.id || '').toLowerCase();
+                            bVal = (b.display_name || b.id || '').toLowerCase();
                             break;
                         case 'type':
                             aVal = (a.model_type || 'llm').toLowerCase();

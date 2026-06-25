@@ -94,7 +94,7 @@ private struct Header: View {
             Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    Text(model?.settings?.displayName ?? model?.id ?? "—")
+                    Text(model?.displayTitle ?? "—")
                         .font(.omlxText(17, weight: .semibold))
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
