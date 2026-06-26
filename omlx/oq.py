@@ -2285,6 +2285,25 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
 
     if is_vlm:
         try:
+            try:
+                model_type = config.get("model_type")
+                text_config = config.get("text_config")
+                text_model_type = (
+                    text_config.get("model_type")
+                    if isinstance(text_config, dict)
+                    else None
+                )
+                if model_type in ("minimax_m3", "minimax_m3_vl") or (
+                    text_model_type in ("minimax_m3", "minimax_m3_vl")
+                ):
+                    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+                        apply_mlx_vlm_minimax_m3_compat_patch,
+                    )
+
+                    apply_mlx_vlm_minimax_m3_compat_patch()
+            except Exception as patch_err:
+                logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
+
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
             # Apply mlx-vlm MTP sanitize patch so qwen3_5/qwen3_5_moe Model

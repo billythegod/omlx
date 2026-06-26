@@ -3209,6 +3209,75 @@ class TestBuildModelSanitizerTextOnly:
             assert "mlx-vlm full sanitize" not in all_messages
 
 
+class TestBuildModelSanitizerMiniMaxCompat:
+    def test_minimax_vlm_applies_compat_before_model_lookup(self, monkeypatch):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.oq import _build_model_sanitizer
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _FakeModel:
+            @staticmethod
+            def sanitize(proxy, weights):
+                assert proxy.config.text_config.num_hidden_layers == 1
+                return weights
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+            VisionModel=object,
+            LanguageModel=object,
+        )
+
+        def unsupported_get_model_and_args(_config):
+            raise ValueError("Model type minimax_m3_vl not supported")
+
+        def apply_compat_patch():
+            vlm_utils.get_model_and_args = lambda _config: (
+                fake_module,
+                "minimax_m3_vl",
+            )
+            return True
+
+        monkeypatch.setattr(
+            vlm_utils,
+            "get_model_and_args",
+            unsupported_get_model_and_args,
+        )
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_minimax_m3_compat."
+            "apply_mlx_vlm_minimax_m3_compat_patch",
+            apply_compat_patch,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.sanitize_weights",
+            lambda _model, weights, _config: weights,
+        )
+
+        config = {
+            "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+            "model_type": "minimax_m3_vl",
+            "text_config": {"num_hidden_layers": 1, "hidden_size": 16},
+            "vision_config": {"hidden_size": 8},
+        }
+        sanitize = _build_model_sanitizer(config, text_only=False)
+
+        assert sanitize is not None
+        assert sanitize({"weight": 1}) == {"weight": 1}
+
+
 # =============================================================================
 # Test _vlm_sanitize proxy exposes the gemma-4 audio-guard attributes
 # =============================================================================
