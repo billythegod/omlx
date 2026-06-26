@@ -8139,6 +8139,7 @@ class Scheduler:
         finished_ids = set()
 
         step_now = time.monotonic()
+        generated_at = time.perf_counter()
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
@@ -8149,6 +8150,7 @@ class Scheduler:
                 continue
 
             request.last_activity_at = step_now
+            completion_tokens_before = request.num_output_tokens
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -8253,6 +8255,11 @@ class Scheduler:
                 response.logprobs = None
 
             # Create output
+            output_generated_at = (
+                generated_at
+                if request.num_output_tokens > completion_tokens_before
+                else None
+            )
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
@@ -8260,6 +8267,8 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                generated_at=output_generated_at,
+                generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
             )
 
