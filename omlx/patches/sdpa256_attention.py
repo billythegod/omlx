@@ -19,7 +19,6 @@ everything else passes through to the original SDPA unchanged.
 """
 
 import logging
-from typing import Optional
 
 import mlx.core as mx
 
@@ -42,8 +41,10 @@ _NEG_INF = -1e30  # fp32 sentinel for masked logits (exp -> 0)
 def _flash_sdpa256(queries, keys, values, scale, mask):
     """Flash-style online-softmax attention for head_dim=256 prefill.
 
-    queries: [B, n_q, Lq, D]   keys/values: [B, n_kv, Lk, D]   (n_q % n_kv == 0)
-    mask: "causal" or None. Returns [B, n_q, Lq, D] in queries.dtype.
+    queries: [batch, n_q, q_len, head_dim]
+    keys/values: [batch, n_kv, k_len, head_dim]   (n_q % n_kv == 0)
+    mask: "causal" or None. Returns [batch, n_q, q_len, head_dim] in
+    queries.dtype.
 
     Tiles over Q and KV, keeping a running (max m, sum denom, accumulator acc) per
     query row so the [q x full_kv] score matrix is never materialized. fp32
@@ -54,32 +55,32 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
     so the running carry is eval'd per KV step / per finished Q tile to bound the
     live graph to ~one tile -> true O(L) peak.
     """
-    B, n_q, Lq, D = queries.shape
-    _, n_kv, Lk, _ = keys.shape
-    G = n_q // n_kv
+    batch, n_q, q_len, head_dim = queries.shape
+    _, n_kv, k_len, _ = keys.shape
+    group_size = n_q // n_kv
     causal = mask == "causal"
 
-    qr = queries.reshape(B, n_kv, G, Lq, D)
-    kr = keys.reshape(B, n_kv, 1, Lk, D)
-    vr = values.reshape(B, n_kv, 1, Lk, D)
+    qr = queries.reshape(batch, n_kv, group_size, q_len, head_dim)
+    kr = keys.reshape(batch, n_kv, 1, k_len, head_dim)
+    vr = values.reshape(batch, n_kv, 1, k_len, head_dim)
 
     # MLX 'causal' aligns queries to the END of the key axis: with a cached
-    # prefix (Lk > Lq, chunked prefill) local query i is global position
+    # prefix (k_len > q_len, chunked prefill) local query i is global position
     # i + offset and attends keys 0..(i + offset). offset == 0 for square.
-    offset = Lk - Lq
+    offset = k_len - q_len
 
     out_q_tiles = []
-    for qi0 in range(0, Lq, _Q_TILE):
-        qi1 = min(qi0 + _Q_TILE, Lq)
+    for qi0 in range(0, q_len, _Q_TILE):
+        qi1 = min(qi0 + _Q_TILE, q_len)
         qb = qr[:, :, :, qi0:qi1, :].astype(mx.float32)
         qt = qi1 - qi0
         q_pos = mx.arange(qi0 + offset, qi1 + offset).reshape(1, 1, 1, qt, 1)
 
-        m = mx.full((B, n_kv, G, qt, 1), _NEG_INF, dtype=mx.float32)
-        denom = mx.zeros((B, n_kv, G, qt, 1), dtype=mx.float32)
-        acc = mx.zeros((B, n_kv, G, qt, D), dtype=mx.float32)
+        m = mx.full((batch, n_kv, group_size, qt, 1), _NEG_INF, dtype=mx.float32)
+        denom = mx.zeros((batch, n_kv, group_size, qt, 1), dtype=mx.float32)
+        acc = mx.zeros((batch, n_kv, group_size, qt, head_dim), dtype=mx.float32)
 
-        kv_end = min(qi1 + offset, Lk) if causal else Lk
+        kv_end = min(qi1 + offset, k_len) if causal else k_len
         for kj0 in range(0, kv_end, _KV_TILE):
             kj1 = min(kj0 + _KV_TILE, kv_end)
             kb = kr[:, :, :, kj0:kj1, :].astype(mx.float32)
@@ -105,7 +106,7 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
         out_q_tiles.append(out_tile)
 
     out = mx.concatenate(out_q_tiles, axis=3)
-    return out.reshape(B, n_q, Lq, D)
+    return out.reshape(batch, n_q, q_len, head_dim)
 
 
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
@@ -129,9 +130,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
             return False
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]
-        if n_kv <= 0 or n_q % n_kv != 0:
-            return False
-        return True
+        return not (n_kv <= 0 or n_q % n_kv != 0)
     except Exception:
         return False
 
@@ -157,8 +156,8 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         values,
         cache,
         scale: float,
-        mask: Optional[mx.array],
-        sinks: Optional[mx.array] = None,
+        mask: mx.array | None,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         if _should_route(queries, keys, cache, mask, sinks):
             try:
@@ -188,7 +187,7 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         ):
             continue
         if getattr(mod, "scaled_dot_product_attention", None) is original_sdpa:
-            setattr(mod, "scaled_dot_product_attention", patched_sdpa)
+            mod.scaled_dot_product_attention = patched_sdpa
 
     try:
         from mlx_vlm.models import base as vlm_base

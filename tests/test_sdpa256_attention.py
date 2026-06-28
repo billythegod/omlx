@@ -18,11 +18,11 @@ import pytest
 SCALE_256 = 1.0 / math.sqrt(256)
 
 
-def _qkv(Lq, Lk, n_q=24, n_kv=4, D=256, dtype=mx.float16):
+def _qkv(q_len, k_len, n_q=24, n_kv=4, head_dim=256, dtype=mx.float16):
     mx.random.seed(0)
-    q = mx.random.normal((1, n_q, Lq, D)).astype(dtype)
-    k = mx.random.normal((1, n_kv, Lk, D)).astype(dtype)
-    v = mx.random.normal((1, n_kv, Lk, D)).astype(dtype)
+    q = mx.random.normal((1, n_q, q_len, head_dim)).astype(dtype)
+    k = mx.random.normal((1, n_kv, k_len, head_dim)).astype(dtype)
+    v = mx.random.normal((1, n_kv, k_len, head_dim)).astype(dtype)
     mx.eval(q, k, v)
     return q, k, v
 
@@ -33,25 +33,26 @@ def _max_abs(a, b):
 
 # --- kernel correctness --------------------------------------------------
 
-@pytest.mark.parametrize("L", [256, 1024, 4096])
-def test_flash_sdpa256_square_causal_matches_reference(L):
+
+@pytest.mark.parametrize("seq_len", [256, 1024, 4096])
+def test_flash_sdpa256_square_causal_matches_reference(seq_len):
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
-    q, k, v = _qkv(L, L)
+    q, k, v = _qkv(seq_len, seq_len)
     out = _flash_sdpa256(q, k, v, SCALE_256, "causal")
     ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
     mx.eval(out, ref)
     assert _max_abs(out, ref) < 2e-2
 
 
-@pytest.mark.parametrize("Lq,Lk", [(1, 4096), (128, 4096), (2048, 8192)])
-def test_flash_sdpa256_chunked_prefill_offset_causal(Lq, Lk):
-    """Chunked prefill: Lq queries over a longer cached context (Lk). MLX
+@pytest.mark.parametrize("q_len,k_len", [(1, 4096), (128, 4096), (2048, 8192)])
+def test_flash_sdpa256_chunked_prefill_offset_causal(q_len, k_len):
+    """Chunked prefill: q_len queries over a longer cached context (k_len). MLX
     'causal' aligns queries to the END of the key axis — the kernel must match."""
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
-    q, _, _ = _qkv(Lq, Lq)
-    _, k, v = _qkv(Lk, Lk)
+    q, _, _ = _qkv(q_len, q_len)
+    _, k, v = _qkv(k_len, k_len)
     out = _flash_sdpa256(q, k, v, SCALE_256, "causal")
     ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
     mx.eval(out, ref)
@@ -66,8 +67,8 @@ def test_flash_sdpa256_memory_is_sub_quadratic():
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
     peaks = []
-    for L in (8192, 32768):
-        q, k, v = _qkv(L, L)
+    for seq_len in (8192, 32768):
+        q, k, v = _qkv(seq_len, seq_len)
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
         mx.reset_peak_memory()
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
@@ -76,6 +77,7 @@ def test_flash_sdpa256_memory_is_sub_quadratic():
 
 
 # --- route gate ----------------------------------------------------------
+
 
 def test_should_route_gate():
     from omlx.patches import sdpa256_attention as sdpa256
@@ -90,7 +92,7 @@ def test_should_route_gate():
     qs, ks, _ = _qkv(2048, 4096)
     assert sdpa256._should_route(qs, ks, None, "causal", None) is False
     # wrong head_dim
-    qh, kh, _ = _qkv(2048, 16384, D=128)
+    qh, kh, _ = _qkv(2048, 16384, head_dim=128)
     assert sdpa256._should_route(qh, kh, None, "causal", None) is False
     # array mask / sinks -> passthrough
     assert sdpa256._should_route(q, k, None, mx.zeros((2048, 16384)), None) is False
@@ -99,10 +101,12 @@ def test_should_route_gate():
     # quantized KV cache (has .bits) -> passthrough to the quant-aware SDPA
     class _QuantCache:
         bits = 4
+
     assert sdpa256._should_route(q, k, _QuantCache(), "causal", None) is False
 
 
 # --- patched dispatcher passthrough vs route -----------------------------
+
 
 def test_patch_routes_256_and_passes_through_others(monkeypatch):
     from mlx_lm.models import base as mlx_base
@@ -134,7 +138,9 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
         # head_dim 256, long prefill -> flash kernel, and output matches MLX.
         q, k, v = _qkv(2048, 16384)
         out = patched(q, k, v, None, SCALE_256, "causal")
-        ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
+        ref = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=SCALE_256, mask="causal"
+        )
         mx.eval(out, ref)
         assert calls["flash"] == 1
         assert _max_abs(out, ref) < 2e-2
@@ -145,7 +151,7 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
         assert calls["orig"] >= 1
 
         # head_dim 128 -> passthrough.
-        q2, k2, v2 = _qkv(2048, 16384, D=128)
+        q2, k2, v2 = _qkv(2048, 16384, head_dim=128)
         before = calls["orig"]
         mx.eval(patched(q2, k2, v2, None, 1.0 / math.sqrt(128), "causal"))
         assert calls["orig"] == before + 1
@@ -154,6 +160,7 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
 
 
 # --- estimator lockstep --------------------------------------------------
+
 
 def test_estimator_switches_to_ol_when_registered():
     from omlx import memory_monitor as mm
