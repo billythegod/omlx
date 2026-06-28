@@ -34,8 +34,8 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.31.2; optional GLM-5.2 kernels live under
-    # omlx.custom_kernels.glm_moe_dsa when built for release.
+    # Vanilla MLX v0.31.2; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release.
     "mlx==0.31.2",
     # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
     # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
@@ -204,6 +204,7 @@ include = ["omlx*"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins

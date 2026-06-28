@@ -1470,6 +1470,29 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        self._minimax_m3_adaptive_prefill = None
+        try:
+            from .patches.minimax_m3.generate_patch import (
+                _minimax_m3_adaptive_prefill_config,
+            )
+
+            self._minimax_m3_adaptive_prefill = _minimax_m3_adaptive_prefill_config(
+                model,
+                self.config.prefill_step_size,
+                getattr(self.config, "model_name", None),
+            )
+        except Exception:
+            logger.debug(
+                "MiniMax M3 adaptive prefill config unavailable", exc_info=True
+            )
+        if self._minimax_m3_adaptive_prefill is not None:
+            logger.info(
+                "MiniMax M3 adaptive scheduler prefill enabled: step=%d after=%d "
+                "min_remaining=%d",
+                self._minimax_m3_adaptive_prefill.step_size,
+                self._minimax_m3_adaptive_prefill.after,
+                self._minimax_m3_adaptive_prefill.min_remaining,
+            )
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -3774,13 +3797,26 @@ class Scheduler:
     ) -> int:
         """Return the scheduler prefill chunk size for the current progress."""
         adaptive_prefill = self._glm_dsa_adaptive_prefill
+        if adaptive_prefill is not None:
+            from .patches.glm_moe_dsa.generate_patch import (
+                _prefill_step_size_for_progress,
+            )
+
+            return _prefill_step_size_for_progress(
+                self.config.prefill_step_size,
+                processed_tokens,
+                remaining_tokens,
+                adaptive_prefill,
+            )
+
+        adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
             return self.config.prefill_step_size
-        from .patches.glm_moe_dsa.generate_patch import (
-            _prefill_step_size_for_progress,
+        from .patches.minimax_m3.generate_patch import (
+            _prefill_step_size_for_progress as _minimax_prefill_step_size,
         )
 
-        return _prefill_step_size_for_progress(
+        return _minimax_prefill_step_size(
             self.config.prefill_step_size,
             processed_tokens,
             remaining_tokens,
