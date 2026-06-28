@@ -115,6 +115,12 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
 
     # Force a fresh install regardless of prior test state.
     monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(
+        sdpa256,
+        "_SDPA256_MIN_KV_LEN",
+        sdpa256._SDPA256_MIN_KV_LEN,
+        raising=False,
+    )
     original = mlx_base.scaled_dot_product_attention
     calls = {"orig": 0, "flash": 0}
 
@@ -132,31 +138,35 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
 
     monkeypatch.setattr(sdpa256, "_flash_sdpa256", counting_flash)
 
-    assert sdpa256.apply_sdpa256_attention_patch() is True
+    assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=512) is True
     patched = mlx_base.scaled_dot_product_attention
     try:
-        # head_dim 256, long prefill -> flash kernel, and output matches MLX.
-        q, k, v = _qkv(2048, 16384)
+        # head_dim 256 routed prefill -> flash kernel. Kernel numerical
+        # correctness is covered above; keep this dispatcher test small so it
+        # does not re-run the O(L^2) MLX reference path under full-suite memory
+        # pressure.
+        q, k, v = _qkv(128, 512)
         out = patched(q, k, v, None, SCALE_256, "causal")
-        ref = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=SCALE_256, mask="causal"
-        )
-        mx.eval(out, ref)
+        mx.eval(out)
         assert calls["flash"] == 1
-        assert _max_abs(out, ref) < 2e-2
+        assert out.shape == q.shape
+        assert out.dtype == q.dtype
 
         # decode (qL=1) -> passthrough to original.
-        qd, kd, vd = _qkv(1, 16384)
+        qd, kd, vd = _qkv(1, 512)
         mx.eval(patched(qd, kd, vd, None, SCALE_256, "causal"))
         assert calls["orig"] >= 1
 
         # head_dim 128 -> passthrough.
-        q2, k2, v2 = _qkv(2048, 16384, head_dim=128)
+        q2, k2, v2 = _qkv(128, 512, head_dim=128)
         before = calls["orig"]
         mx.eval(patched(q2, k2, v2, None, 1.0 / math.sqrt(128), "causal"))
         assert calls["orig"] == before + 1
     finally:
         monkeypatch.setattr(mlx_base, "scaled_dot_product_attention", original)
+        from omlx import memory_monitor as mm
+
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
 # --- estimator lockstep --------------------------------------------------
