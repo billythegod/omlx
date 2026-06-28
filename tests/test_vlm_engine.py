@@ -143,6 +143,39 @@ class TestVLMStreamingCleanup:
 
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_preserves_generation_timestamps(self):
+        """VLM benchmark timing needs producer-side token timestamps."""
+
+        class TimestampCore(FakeStreamingCore):
+            async def stream_outputs(self, request_id):
+                yield SimpleNamespace(
+                    output_text="done",
+                    new_text="done",
+                    prompt_tokens=8,
+                    completion_tokens=4,
+                    finished=True,
+                    finish_reason="length",
+                    tool_calls=None,
+                    cached_tokens=0,
+                    generated_at=10.0,
+                    generated_until=12.0,
+                )
+
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = TimestampCore()
+
+        outputs = []
+        async for output in engine.stream_generate("hello"):
+            outputs.append(output)
+
+        assert len(outputs) == 1
+        assert outputs[0].generated_at == 10.0
+        assert outputs[0].generated_until == 12.0
+
 
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""

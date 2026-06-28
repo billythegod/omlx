@@ -106,9 +106,6 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    - mlx-vlm diffusion mxfp4 embedding patch when ``for_vlm`` is True and
-      the checkpoint declares ``model_type == "diffusion_gemma"``.
-
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
 
@@ -162,12 +159,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
-    if for_vlm and model_type == "diffusion_gemma":
-        from ..patches.mlx_vlm_diffusion import apply_mlx_vlm_diffusion_patch
-
-        if apply_mlx_vlm_diffusion_patch():
-            logger.info("mlx-vlm diffusion patch applied for %s", model_name)
 
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if for_vlm and (
