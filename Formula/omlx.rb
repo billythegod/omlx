@@ -23,6 +23,15 @@ class Omlx < Formula
       revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
   end
 
+  # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
+  # language model so the first TTS request does not download into the
+  # Homebrew venv at runtime.
+  resource "en-core-web-sm" do
+    url "https://github.com/explosion/spacy-models/releases/download/" \
+        "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+  end
+
   service do
     run [opt_bin/"omlx", "serve"]
     keep_alive true
@@ -74,6 +83,12 @@ class Omlx < Formula
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system libexec/"bin/pip", "install", ".[all]"
     end
+
+    # Install the spaCy English model required by misaki for Kokoro TTS.
+    system libexec/"bin/pip", "install", "--no-deps",
+           resource("en-core-web-sm").cached_download
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
@@ -147,5 +162,7 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
   end
 end
