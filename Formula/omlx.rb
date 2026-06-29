@@ -85,8 +85,12 @@ class Omlx < Formula
     end
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
+    # Homebrew's cached resource path is hash-prefixed, which pip rejects
+    # as an invalid wheel filename. Copy it back to the canonical basename.
+    spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
+    cp resource("en-core-web-sm").cached_download, spacy_model_wheel
     system libexec/"bin/pip", "install", "--no-deps",
-           resource("en-core-web-sm").cached_download
+           spacy_model_wheel
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
 
