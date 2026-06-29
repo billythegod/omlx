@@ -7,6 +7,8 @@ class Omlx < Formula
 
   head "https://github.com/jundot/omlx.git", branch: "main"
 
+  option "with-custom-kernel",
+         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -40,12 +42,32 @@ class Omlx < Formula
     # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+    if build.with?("custom-kernel")
+      kernel_sources = [
+        buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
+        buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+      ]
+      unless kernel_sources.all?(&:directory?)
+        odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
+      end
+
+      ENV["OMLX_WITH_CUSTOM_KERNEL"] = "1"
+    end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
     system libexec/"bin/pip", "install",
            "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
            install_spec
+
+    if build.with?("custom-kernel")
+      system libexec/"bin/python", "-c", <<~PYTHON
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+        assert glm_fast.is_native_available(), glm_fast.import_error()
+        assert minimax_fast.is_native_available(), minimax_fast.import_error()
+      PYTHON
+    end
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
