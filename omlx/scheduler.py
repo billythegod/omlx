@@ -1595,6 +1595,7 @@ class Scheduler:
         self._admission_paused: bool = False
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
+        self._prefill_headroom_safety: float = self._PREFILL_HEADROOM_SAFETY
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
@@ -3470,7 +3471,10 @@ class Scheduler:
         # Keep each chunk's predicted peak under the LOWER of the dynamic
         # throttle target and the prefill safety cap, so the peak can never
         # reach the Metal wall (the uncatchable async OOM).
-        safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
+        headroom_safety = getattr(
+            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
+        )
+        safe_target = int(hard_cap * headroom_safety)
         abort_cap = self._prefill_abort_cap()
         target = min(safe_target, abort_cap) if abort_cap > 0 else safe_target
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
