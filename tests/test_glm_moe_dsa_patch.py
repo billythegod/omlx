@@ -96,6 +96,105 @@ def test_pre_load_dispatch_applies_glm_patch(tmp_path, monkeypatch):
     apply_mock.assert_called_once_with()
 
 
+def test_glm_fused_gate_up_quant_spec_expanded_for_mxfp4_config():
+    quant = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "model.layers.1.mlp.switch_mlp.gate_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.up_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.down_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+    }
+    cfg = {"model_type": "glm_moe_dsa", "quantization": dict(quant)}
+
+    model_loading.expand_glm_moe_dsa_fused_quant_keys(cfg)
+
+    assert cfg["quantization"]["model.layers.1.mlp.switch_mlp.gate_up_proj"] == {
+        "bits": 4,
+        "group_size": 32,
+        "mode": "mxfp4",
+    }
+    assert "model.layers.1.mlp.switch_mlp.gate_proj" in cfg["quantization"]
+    assert "model.layers.1.mlp.switch_mlp.up_proj" in cfg["quantization"]
+
+
+def test_glm_mxfp4_fused_gate_up_quant_spec_avoids_bias_parameter():
+    pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from mlx.utils import tree_flatten
+
+    glm_moe_dsa = _load_patched_glm_module()
+    args = _small_glm_args(glm_moe_dsa)
+    gate_path = "model.layers.1.mlp.switch_mlp.gate_up_proj"
+    base_quant = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "model.layers.1.mlp.switch_mlp.gate_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.up_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+        "model.layers.1.mlp.switch_mlp.down_proj": {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        },
+    }
+    weights = {f"{gate_path}.scales": object()}
+
+    def gate_up_params(quantization):
+        args.quantization = quantization
+        model = glm_moe_dsa.Model(args)
+
+        def class_predicate(path, module):
+            if path in quantization:
+                return quantization[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            return f"{path}.scales" in weights
+
+        nn.quantize(
+            model,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
+            class_predicate=class_predicate,
+        )
+        return {
+            name
+            for name, _ in tree_flatten(model.parameters())
+            if name.startswith(gate_path)
+        }
+
+    before = gate_up_params(dict(base_quant))
+    fixed_cfg = {"model_type": "glm_moe_dsa", "quantization": dict(base_quant)}
+    model_loading.expand_glm_moe_dsa_fused_quant_keys(fixed_cfg)
+    after = gate_up_params(fixed_cfg["quantization"])
+
+    assert f"{gate_path}.biases" in before
+    assert f"{gate_path}.weight" in after
+    assert f"{gate_path}.scales" in after
+    assert f"{gate_path}.biases" not in after
+
+
 def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     from omlx.patches.glm_moe_dsa.generate_patch import (
         _glm_dsa_adaptive_prefill_config,
