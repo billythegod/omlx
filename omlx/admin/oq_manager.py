@@ -264,7 +264,7 @@ class OQManager:
 
         Args:
             model_path: Path to source model directory.
-            oq_level: oQ level (2, 3, 4, 6, or 8).
+            oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
 

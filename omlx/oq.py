@@ -160,8 +160,8 @@ def universal_quant_predicate(
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
         oQ2.8: base 2-bit + routed layer boosts selected by layer
             sensitivity; routed w2/down_proj first, then w1/w3 as paired
-            layer modules
-        oQ3: base 2-bit + full protection → ~3.3 bpw
+            layer-wide boosts while staying under the bpw cap
+        oQ3: base 3-bit + full protection → ~3.5 bpw
         oQ4-oQ6: base N-bit + full protection
         oQ7: base 8-bit + full protection
         oQ8: near-uniform 8-bit (router fp16 only) → ~8.0 bpw
@@ -3818,7 +3818,7 @@ def quantize_oq_streaming(
     Args:
         model_path: Path to source model directory.
         output_path: Path for output (must not exist).
-        oq_level: Quantization level (2, 3, 4, 6, or 8).
+        oq_level: Quantization level from OQ_LEVELS.
         group_size: Default quantization group size.
         progress_callback: Optional fn(phase_name, progress_pct) for updates.
         text_only: Skip vision encoder weights for VLM models.
