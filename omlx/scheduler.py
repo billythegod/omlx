@@ -1300,7 +1300,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
-    prefill_step_size: int = 512
+    prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
     # reduces TTFT for concurrent requests but adds per-step overhead.
