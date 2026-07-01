@@ -787,6 +787,36 @@ class TestCacheMaterialization:
 class TestDeepseekV4SwitchGLU:
     """DeepSeek-V4 SwitchGLU execution guards."""
 
+    def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        config = dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=0,
+            qk_rope_head_dim=4,
+            head_dim=4,
+            o_lora_rank=0,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=2,
+            swiglu_limit=10.0,
+        )
+
+        moe = dsv4.DeepseekV4MoE(config, layer_idx=0)
+
+        assert moe.switch_mlp.activation.limit == config.swiglu_limit
+        assert moe.shared_experts.swiglu_limit == config.swiglu_limit
+
     def test_skips_fused_weighted_sum_for_cache_stability(
         self, applied_patch, monkeypatch
     ):
