@@ -107,20 +107,7 @@ def apply() -> bool:
             prefix = f"mtp.layers.{layer_idx}.mlp"
             if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
                 continue  # already in switch_mlp form
-            gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                _unfuse_layer_experts(prefix)
-            elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
-                # Per-expert form — stack into switch_mlp tensors so the
-                # oQ pipeline emits one quantized tensor per projection
-                # (rather than 256 tiny tensors each with its own scales).
-                for n in ("gate_proj", "up_proj", "down_proj"):
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                            for e in range(num_experts)
-                        ]
-                    )
+            _unfuse_layer_experts(prefix)
 
         norm_keys = (
             ".input_layernorm.weight",

@@ -507,6 +507,37 @@ def test_moe_vlm_sanitize_stacks_per_expert_backbone_quantized(monkeypatch):
     assert not any(f"{pfx}.experts." in k for k in result)
 
 
+def test_moe_vlm_sanitize_stacks_per_expert_mtp_quantized(monkeypatch):
+    """A per-expert *quantized* MTP head also carries .scales/.biases.
+    The model-level VLM sanitize path must keep parity with the runtime
+    sanitize path and stack all three suffixes."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_model
+    from mlx_vlm.models.qwen3_5_moe import qwen3_5_moe
+
+    monkeypatch.setattr(qwen35_moe_vlm_model, "_APPLIED", False)
+    if hasattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched"):
+        monkeypatch.delattr(qwen3_5_moe.Model, "_omlx_mtp_vlm_patched")
+    assert qwen35_moe_vlm_model.apply() is True
+
+    pfx_in = "mtp.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{pfx_in}.experts.{e}.{proj}.weight"] = mx.zeros((8, 4))
+            weights[f"{pfx_in}.experts.{e}.{proj}.scales"] = mx.zeros((8, 1))
+            weights[f"{pfx_in}.experts.{e}.{proj}.biases"] = mx.zeros((8, 1))
+
+    result = qwen3_5_moe.Model.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.mtp.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+            assert key in result, key
+            assert result[key].shape[0] == 2
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
 def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
     """The runtime sanitize wrapper must also stack per-expert backbone
     layers (parity with the model-level patch and the LLM patch)."""
