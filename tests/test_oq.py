@@ -1006,7 +1006,7 @@ class TestLevelBudgetPlan:
 
     def test_bpw_targets_for_level_returns_correct_values(self):
         assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
-        assert _bpw_targets_for_level(2.7) == (3.35, 3.45)
+        assert _bpw_targets_for_level(2.8) == (3.35, 3.45)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
@@ -1015,9 +1015,9 @@ class TestLevelBudgetPlan:
 
     def test_oq25_base_bits_is_2(self):
         assert _LEVEL_BITS[2.5] == 2
-        assert _LEVEL_BITS[2.7] == 2
+        assert _LEVEL_BITS[2.8] == 2
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
     def test_half_level_mandatory_expert_down_proj_boost(self, oq_level, expected_bits):
         """Fractional levels protect routed expert down_proj above base bits
         even with negligible sensitivity scores."""
@@ -1040,7 +1040,7 @@ class TestLevelBudgetPlan:
         assert boost is not None
         assert boost["bits"] == expected_bits
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
     def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
         """The non-budget predicate floor mirrors the mandatory boost."""
         config = {
@@ -1053,6 +1053,18 @@ class TestLevelBudgetPlan:
         )
         assert isinstance(result, dict)
         assert result["bits"] == expected_bits
+
+    def test_oq28_predicate_keeps_routed_down_proj_at_base_without_plan(self):
+        """oQ2.8 uses budget-planned routed boosts, not a blanket predicate floor."""
+        config = {
+            "num_hidden_layers": 32,
+            "num_experts": 8,
+            "hidden_size": 1024,
+        }
+        result = universal_quant_predicate(
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, 2.8
+        )
+        assert result is True
 
     def test_bpw_targets_for_level_returns_none_for_minimal(self):
         assert _bpw_targets_for_level(8) is None
@@ -1168,6 +1180,43 @@ class TestLevelBudgetPlan:
         )
         for k in plan.boost_map:
             assert "switch_mlp" not in k
+
+    def test_oq28_boosts_routed_down_proj_by_layer_sensitivity(self):
+        """oQ2.8 can boost routed projections, but only by whole layer modules."""
+        named_shapes = {}
+        for i in range(2):
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.gate_proj"] = (8, 64, 64)
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.up_proj"] = (8, 64, 64)
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.down_proj"] = (8, 64, 64)
+        config = {
+            "num_hidden_layers": 2,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0, "1": 0.1},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.8, target_bpw=2.65, hard_cap_bpw=2.7
+        )
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
+        assert "model.layers.1.ffn.switch_mlp.down_proj" not in plan.boost_map
+
+    def test_oq28_boosts_gate_up_pair_after_routed_down_proj(self):
+        """After routed w2/down_proj, oQ2.8 boosts gate+up as a layer pair."""
+        named_shapes = {
+            "model.layers.0.ffn.switch_mlp.gate_proj": (8, 64, 64),
+            "model.layers.0.ffn.switch_mlp.up_proj": (8, 64, 64),
+            "model.layers.0.ffn.switch_mlp.down_proj": (8, 64, 64),
+        }
+        config = {
+            "num_hidden_layers": 1,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.8, target_bpw=3.4, hard_cap_bpw=3.6
+        )
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.gate_proj"]["bits"] == 3
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.up_proj"]["bits"] == 3
 
     def test_oq2_budget_plan_respects_cap(self):
         """oQ2 with budget plan should stay within hard cap."""

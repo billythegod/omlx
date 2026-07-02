@@ -4,10 +4,9 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8 (base
-bits differ, same predicate). Fractional levels keep the lower level's base
-bits and add a mandatory boost for routed expert down_proj (Super Weights
-protection; see _LEVEL_EXPERT_DOWN_BOOST) plus a higher bpw budget.
+Supported levels: oQ2, oQ2.5, oQ2.8, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
+(base bits differ, same predicate). Fractional levels keep the lower level's
+base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import hashlib
@@ -37,7 +36,7 @@ from omlx.model_discovery import _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
-OQ_LEVELS = {2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8}
+OQ_LEVELS = {2, 2.5, 2.8, 3, 3.5, 4, 5, 6, 8}
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -54,7 +53,7 @@ _PROXY_QUANT_GROUP_SIZE = 64
 _LEVEL_BITS: dict[float, int] = {
     2: 2,
     2.5: 2,
-    2.7: 2,
+    2.8: 2,
     3: 3,
     3.5: 3,
     4: 4,
@@ -66,7 +65,7 @@ _LEVEL_BITS: dict[float, int] = {
 _LEVEL_PROTECTION: dict[float, str] = {
     2: "full",
     2.5: "full",
-    2.7: "full",
+    2.8: "full",
     3: "full",
     3.5: "full",
     4: "full",
@@ -77,19 +76,22 @@ _LEVEL_PROTECTION: dict[float, str] = {
 
 # Fractional levels: mandatory protection for routed expert down_proj
 # (Super Weights), expressed as bits above the level's base bits.
-# 2.5 -> 3-bit, 2.7 -> 4-bit, 3.5 -> 4-bit.
-_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 2.7: 2, 3.5: 1}
+# 2.5 -> 3-bit, 3.5 -> 4-bit.
+_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 3.5: 1}
 
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
-    2.7: (3.35, 3.45),
+    2.8: (3.35, 3.45),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
     4: (4.6, 4.7),
     5: (5.5, 5.7),
     6: (6.5, 6.7),
 }
+
+_ROUTED_LAYER_BOOST_LEVELS = {2.8}
+_VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
@@ -153,9 +155,12 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ2.5/oQ2.7/oQ3.5: fractional levels — lower level's base bits,
+        oQ2.5/oQ3.5: fractional levels — lower level's base bits,
             routed expert down_proj protected above base per
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
+        oQ2.8: base 2-bit + routed layer boosts selected by layer
+            sensitivity; routed w2/down_proj first, then w1/w3 as paired
+            layer modules
         oQ3: base 2-bit + full protection → ~3.3 bpw
         oQ4-oQ6: base N-bit + full protection
         oQ7: base 8-bit + full protection
@@ -519,6 +524,19 @@ def _is_routed_expert(path: str) -> bool:
     return False
 
 
+def _routed_expert_projection(path: str) -> str | None:
+    """Return the routed expert projection family for a module/tensor path."""
+    if not _is_routed_expert(path):
+        return None
+    if any(p in path for p in ("down_proj", ".w2", "mlp.fc2", ".fc2")):
+        return "down"
+    if any(p in path for p in ("gate_proj", ".w1", "mlp.fc1", ".fc1")):
+        return "gate"
+    if any(p in path for p in ("up_proj", ".w3")):
+        return "up"
+    return None
+
+
 _MANDATORY_BOOST_PATTERNS = {
     "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
     "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
@@ -541,6 +559,102 @@ def _sensitivity_tier(layer_score: float, max_score: float) -> int:
     if ratio >= 0.2:
         return 2
     return 1
+
+
+def _apply_routed_layer_boosts(
+    named_shapes: dict[str, tuple],
+    config: dict,
+    oq_level: float,
+    boost_map: dict[str, dict],
+    fixed_overrides: dict[str, dict],
+    base_bits: int,
+    base_group_size: int,
+    base_mode: str,
+    total_bits_f: float,
+    total_params: int,
+    current_bpw: float,
+    target_bpw: float,
+    hard_cap_bpw: float,
+) -> tuple[float, float]:
+    """Boost routed expert modules by layer while staying MLX-loader portable.
+
+    MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
+    not per expert. For oQ2.8 we therefore rank layers by sensitivity and boost
+    whole routed projection modules: down/w2 first, then gate+up as a pair.
+    """
+    if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
+        return total_bits_f, current_bpw
+
+    from collections import defaultdict
+
+    layer_scores = config.get("_oq_sensitivity_map") or {}
+    grouped: dict[tuple[int, str], list[tuple[str, tuple]]] = defaultdict(list)
+    for path, shape in named_shapes.items():
+        if path in fixed_overrides:
+            continue
+        projection = _routed_expert_projection(path)
+        if projection is None:
+            continue
+        layer_idx = _extract_layer_index(path)
+        if layer_idx < 0:
+            continue
+        phase = "down" if projection == "down" else "gate_up"
+        grouped[(layer_idx, phase)].append((path, shape))
+
+    def group_score(layer_idx: int) -> float:
+        return float(layer_scores.get(str(layer_idx), 0.0))
+
+    def try_boost_group(items: list[tuple[str, tuple]]) -> bool:
+        nonlocal total_bits_f, current_bpw
+        delta = 0
+        updates = []
+        cand_bits = 3
+        cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cand_mode = _mode_for_bits(cand_bits)
+        for path, shape in items:
+            cur = boost_map.get(path)
+            cur_bits = int(cur["bits"]) if cur else base_bits
+            if cur_bits >= cand_bits:
+                continue
+            cur_gs = (
+                int(cur.get("group_size", base_group_size)) if cur else base_group_size
+            )
+            cur_mode = cur.get("mode", base_mode) if cur else base_mode
+            old_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+            new_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
+            item_delta = 8 * (new_cost - old_cost)
+            if item_delta <= 0:
+                continue
+            delta += item_delta
+            updates.append(path)
+        if not updates:
+            return False
+        next_bpw = (total_bits_f + delta) / total_params
+        if next_bpw > hard_cap_bpw:
+            return False
+        for path in updates:
+            boost_map[path] = {
+                "bits": cand_bits,
+                "group_size": cand_gs,
+                "mode": cand_mode,
+            }
+        total_bits_f += delta
+        current_bpw = next_bpw
+        return True
+
+    for phase in ("down", "gate_up"):
+        candidates = [
+            (layer_idx, items)
+            for (layer_idx, group_phase), items in grouped.items()
+            if group_phase == phase
+        ]
+        candidates.sort(key=lambda item: (-group_score(item[0]), item[0]))
+        for _layer_idx, items in candidates:
+            if current_bpw >= target_bpw:
+                break
+            try_boost_group(items)
+
+    return total_bits_f, current_bpw
 
 
 def _build_quant_plan(
@@ -622,7 +736,7 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
-    # Fractional levels (oQ2.5 / oQ2.7 / oQ3.5): mandatory expert down_proj
+    # Fractional levels (oQ2.5 / oQ3.5): mandatory expert down_proj
     # boost above base bits (Super Weights protection).
     _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
     if _down_boost:
@@ -634,7 +748,7 @@ def _build_quant_plan(
             if not any(p in path for p in ("down_proj", "w2")):
                 continue
             cand_bits = base_bits + _down_boost
-            if cand_bits not in (2, 3, 4, 5, 6, 8):
+            if cand_bits not in _VALID_QUANT_BITS:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
@@ -723,12 +837,11 @@ def _build_quant_plan(
             continue
         candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
 
-    _VALID_BITS = (2, 3, 4, 5, 6, 8)
     for _score, path, shape, cur_bits, cur_cost, max_target in sorted(
         candidates, key=lambda x: x[0], reverse=True
     ):
         for cand_bits in range(max_target, cur_bits, -1):
-            if cand_bits not in _VALID_BITS or cand_bits <= cur_bits:
+            if cand_bits not in _VALID_QUANT_BITS or cand_bits <= cur_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
@@ -796,6 +909,23 @@ def _build_quant_plan(
                 break
             if current_bpw >= target_bpw:
                 break
+
+    if current_bpw < target_bpw:
+        total_bits_f, current_bpw = _apply_routed_layer_boosts(
+            named_shapes,
+            config,
+            oq_level,
+            boost_map,
+            fixed_overrides,
+            base_bits,
+            base_group_size,
+            base_mode,
+            total_bits_f,
+            total_params,
+            current_bpw,
+            target_bpw,
+            hard_cap_bpw,
+        )
 
     if boost_map:
         from collections import Counter
