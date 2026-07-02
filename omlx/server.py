@@ -185,6 +185,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
@@ -954,6 +955,8 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelBusyError as e:
@@ -2611,8 +2614,22 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 
     try:
         await _server_state.engine_pool.get_engine(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ModelTooLargeError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(status_code=507, detail=str(e)) from e
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelLoadingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except EnginePoolError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
