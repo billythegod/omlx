@@ -4650,8 +4650,22 @@ async def stream_anthropic_messages(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
 
-    # Track content blocks with thinking separation
-    thinking_parser = ThinkingParser()
+    # Track content blocks with thinking separation. Some templates open the
+    # thinking block in the prompt itself, so the generated text starts with
+    # reasoning body and only later emits </think>.
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     thinking_block_started = False
     text_block_started = False
     block_index = 0
