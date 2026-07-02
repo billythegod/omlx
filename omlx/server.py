@@ -4163,6 +4163,71 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
+def _copy_chat_template_messages(messages: list) -> list:
+    return [
+        dict(message) if isinstance(message, dict) else message for message in messages
+    ]
+
+
+def _render_chat_prompt_for_thinking_detection(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+) -> tuple[str, list[int] | None]:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return "", None
+
+    template_messages = _copy_chat_template_messages(messages)
+    tools = kwargs.get("tools")
+    chat_template_kwargs = kwargs.get("chat_template_kwargs")
+    is_partial = kwargs.get("is_partial")
+    engine_renderer = getattr(engine, "_apply_chat_template", None)
+
+    if is_partial is not None:
+        for message in template_messages:
+            if isinstance(message, dict):
+                message.pop("partial", None)
+
+    if callable(engine_renderer):
+        prompt = engine_renderer(
+            template_messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+    else:
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not bool(is_partial),
+        }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+
+        try:
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = tokenizer.apply_chat_template(template_messages, **template_kwargs)
+
+    if isinstance(prompt, str):
+        return prompt, None
+    if isinstance(prompt, list):
+        try:
+            return "", [int(token_id) for token_id in prompt]
+        except (TypeError, ValueError):
+            return str(prompt), None
+    return str(prompt), None
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4187,13 +4252,12 @@ async def stream_chat_completion(
     try:
         tokenizer = getattr(engine, "tokenizer", None)
         if tokenizer is not None:
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-            if kwargs.get("tools"):
-                template_kwargs["tools"] = kwargs["tools"]
-            if kwargs.get("chat_template_kwargs"):
-                template_kwargs.update(kwargs["chat_template_kwargs"])
-            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
-            start_in_thinking, _ = prompt_opens_thinking(tokenizer, prompt)
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
