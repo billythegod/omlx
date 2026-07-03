@@ -3883,6 +3883,16 @@ class TestOutputParserSmoke:
         def decode(self, token_ids, skip_special_tokens: bool = True):
             return "".join(self._token_map.get(token_id, "") for token_id in token_ids)
 
+    class _DeepSeekV4Tokenizer(_GemmaTokenizer):
+        has_tool_calling = True
+        tool_call_start = "<｜DSML｜tool_calls>"
+        tool_call_end = "</｜DSML｜tool_calls>"
+
+        def tool_parser(self, text: str, tools=None):
+            from omlx.patches.deepseek_v4.tool_parser_v4 import parse_tool_call
+
+            return parse_tool_call(text, tools)
+
     def test_gemma4_session_selected_and_markers_hidden(self, mock_model):
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
@@ -4012,6 +4022,62 @@ class TestOutputParserSmoke:
         assert finished_ids == {"parser-stop-req"}
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "stop"
+
+    def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
+        mock_model.config.model_type = "deepseek_v4"
+        tokenizer = self._DeepSeekV4Tokenizer(
+            {
+                11: "Working\n",
+                12: '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n',
+                13: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n"
+                "</｜DSML｜tool_calls>\n"
+                '<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>',
+            }
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="DeepSeek-V4-Flash-oQ4e"),
+        )
+
+        assert scheduler._output_parser_kind == "deepseek_v4"
+
+        request = Request(
+            request_id="deepseek-v4-tool-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 12, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {"deepseek-v4-tool-req"}
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "tool_calls"
+        assert outputs[-1].output_text == "Working\n"
+        assert outputs[-1].new_token_ids == []
+        assert outputs[-1].tool_calls
+        assert outputs[-1].tool_calls[0]["name"] == "Bash"
+        assert json.loads(outputs[-1].tool_calls[0]["arguments"]) == {"command": "ls"}
+
+        full_stream = "".join(output.new_text for output in outputs)
+        assert full_stream == "Working\n"
+        assert "pwd" not in full_stream
+        assert "<｜DSML｜parameter" not in full_stream
 
 
 class TestVLMPositionStateClearing:
