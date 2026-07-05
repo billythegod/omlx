@@ -4,9 +4,10 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ2.5, oQ2.7, oQ2.8, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
+Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 (base bits differ, same predicate). Fractional levels keep the lower level's
-base bits and add targeted routed-expert protection plus a higher bpw budget.
+base bits and add targeted code-preserving routed-expert protection plus a
+higher bpw budget.
 """
 
 import hashlib
@@ -36,7 +37,7 @@ from omlx.model_discovery import _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
-OQ_LEVELS = {2, 2.5, 2.7, 2.8, 3, 3.5, 4, 5, 6, 8}
+OQ_LEVELS = {2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8}
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -54,7 +55,6 @@ _LEVEL_BITS: dict[float, int] = {
     2: 2,
     2.5: 2,
     2.7: 2,
-    2.8: 2,
     3: 3,
     3.5: 3,
     4: 4,
@@ -67,7 +67,6 @@ _LEVEL_PROTECTION: dict[float, str] = {
     2: "full",
     2.5: "full",
     2.7: "full",
-    2.8: "full",
     3: "full",
     3.5: "full",
     4: "full",
@@ -85,7 +84,6 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
     2.7: (3.25, 3.35),
-    2.8: (3.35, 3.45),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
     4: (4.6, 4.7),
@@ -93,7 +91,8 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     6: (6.5, 6.7),
 }
 
-_ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7, 2.8}
+_ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7}
+_CODE_PRESERVE_FRACTIONAL_LEVELS = {2.5, 2.7}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 
@@ -158,9 +157,10 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ2.5/oQ2.7/oQ2.8: base 2-bit + routed layer boosts selected by layer
-            sensitivity; routed w2/down_proj first, then w1/w3 as paired
-            layer-wide boosts while staying under the bpw cap
+        oQ2.5/oQ2.7: base 2-bit + code-preserving routed layer boosts
+            selected by layer sensitivity and late-layer position; routed
+            w2/down_proj first, then w1/w3 as paired layer-wide boosts while
+            staying under the bpw cap
         oQ3.5: base 3-bit with routed expert down_proj protected above base per
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
         oQ3: base 3-bit + full protection → ~3.5 bpw
@@ -539,6 +539,40 @@ def _routed_expert_projection(path: str) -> str | None:
     return None
 
 
+def _num_layers_from_config(config: dict, default: int = 32) -> int:
+    tc = config.get("text_config", {})
+    return int(
+        config.get("num_hidden_layers")
+        or (tc.get("num_hidden_layers") if isinstance(tc, dict) else None)
+        or default
+    )
+
+
+def _code_preserve_layer_score(
+    *,
+    layer_idx: int,
+    layer_score: float,
+    max_layer_score: float,
+    num_layers: int,
+    oq_level: float,
+) -> float:
+    """Raise generation-critical edge/late layers for aggressive 2-bit levels."""
+    if oq_level not in _CODE_PRESERVE_FRACTIONAL_LEVELS:
+        return layer_score
+    if layer_idx < 0 or num_layers <= 1:
+        return layer_score
+
+    anchor = max(max_layer_score, 1e-12)
+    pos = layer_idx / max(num_layers - 1, 1)
+    if pos >= 0.80:
+        return layer_score + 0.50 * anchor
+    if pos >= 0.65:
+        return layer_score + 0.25 * anchor
+    if pos < 0.125:
+        return layer_score + 0.20 * anchor
+    return layer_score
+
+
 _MANDATORY_BOOST_PATTERNS = {
     "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
     "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
@@ -581,9 +615,9 @@ def _apply_routed_layer_boosts(
     """Boost routed expert modules by layer while staying MLX-loader portable.
 
     MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
-    not per expert. For oQ2.5/oQ2.7/oQ2.8 we therefore rank layers by
-    sensitivity and boost whole routed projection modules: down/w2 first,
-    then gate+up as a pair.
+    not per expert. For oQ2.5/oQ2.7 we therefore rank layers by sensitivity
+    plus a small late-layer generation prior, then boost whole routed projection
+    modules: down/w2 first, then gate+up as a pair.
     """
     if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
         return total_bits_f, current_bpw
@@ -591,6 +625,8 @@ def _apply_routed_layer_boosts(
     from collections import defaultdict
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
+    max_layer_score = max(layer_scores.values(), default=0.0)
+    num_layers = _num_layers_from_config(config)
     grouped: dict[tuple[int, str], list[tuple[str, tuple]]] = defaultdict(list)
     for path, shape in named_shapes.items():
         if path in fixed_overrides:
@@ -605,7 +641,14 @@ def _apply_routed_layer_boosts(
         grouped[(layer_idx, phase)].append((path, shape))
 
     def group_score(layer_idx: int) -> float:
-        return float(layer_scores.get(str(layer_idx), 0.0))
+        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+        return _code_preserve_layer_score(
+            layer_idx=layer_idx,
+            layer_score=layer_score,
+            max_layer_score=max_layer_score,
+            num_layers=num_layers,
+            oq_level=oq_level,
+        )
 
     def try_boost_group(items: list[tuple[str, tuple]]) -> bool:
         nonlocal total_bits_f, current_bpw
@@ -672,9 +715,10 @@ def _build_quant_plan(
 
     Strategy:
     1. Mandatory pre-allocation: consensus-critical tensors (lm_head → 8-bit)
-    2. Data-driven: all non-expert tensors compete equally, ranked by
-       layer sensitivity score. Higher sensitivity → more bits.
-    3. Routed experts always stay at base bits (93-98% of params).
+    2. For oQ2.5/oQ2.7, routed expert down/gate/up boosts get the remaining
+       target budget before opportunistic non-expert boosts.
+    3. Data-driven: remaining non-expert tensors compete by sensitivity and
+       layer-position score. Higher score → more bits.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
@@ -689,6 +733,8 @@ def _build_quant_plan(
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
+    num_layers = _num_layers_from_config(config)
+    routed_first = oq_level in _CODE_PRESERVE_FRACTIONAL_LEVELS
 
     total_params = 0
     expert_params = 0
@@ -807,38 +853,69 @@ def _build_quant_plan(
         total_bits_f += delta
         current_bpw = next_bpw
 
+    # Aggressive 2-bit fractional levels are most prone to code-generation
+    # regressions when routed expert output paths stay at the base width.
+    # Reserve the remaining target budget for routed down_proj first, then
+    # paired gate/up, before opportunistic non-expert sensitivity boosts.
+    if routed_first and current_bpw < target_bpw:
+        total_bits_f, current_bpw = _apply_routed_layer_boosts(
+            named_shapes,
+            config,
+            oq_level,
+            boost_map,
+            fixed_overrides,
+            base_bits,
+            base_group_size,
+            base_mode,
+            total_bits_f,
+            total_params,
+            current_bpw,
+            target_bpw,
+            hard_cap_bpw,
+        )
+
     # Sensitivity-based greedy boost: boost tensors from their current bits
     # (which may already be elevated by the protection floor) using remaining
     # budget up to hard_cap_bpw.
     candidates = []
-    for path, shape in named_shapes.items():
-        if _is_routed_expert(path) or path in fixed_overrides:
-            continue
-        pred = universal_quant_predicate(
-            path, module, {**config, "_oq_boost_map": {}}, oq_level
-        )
-        if pred is False:
-            continue
-        layer_idx = _extract_layer_index(path)
-        if layer_idx < 0:
-            continue
-        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-        # Current bits (floor or base)
-        cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
-        cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
-        cur_mode = _mode_for_bits(cur_bits)
-        cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
-        # Max target based on sensitivity
-        ratio = layer_score / max_layer_score if max_layer_score > 0 else 0
-        if ratio >= 0.5:
-            max_target = 8
-        elif ratio >= 0.2:
-            max_target = min(cur_bits + 2, 8)
-        else:
-            max_target = min(cur_bits + 1, 8)
-        if max_target <= cur_bits:
-            continue
-        candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
+    if not (routed_first and current_bpw >= target_bpw):
+        for path, shape in named_shapes.items():
+            if _is_routed_expert(path) or path in fixed_overrides:
+                continue
+            pred = universal_quant_predicate(
+                path, module, {**config, "_oq_boost_map": {}}, oq_level
+            )
+            if pred is False:
+                continue
+            layer_idx = _extract_layer_index(path)
+            if layer_idx < 0:
+                continue
+            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            priority_score = _code_preserve_layer_score(
+                layer_idx=layer_idx,
+                layer_score=layer_score,
+                max_layer_score=max_layer_score,
+                num_layers=num_layers,
+                oq_level=oq_level,
+            )
+            # Current bits (floor or base)
+            cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
+            cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cur_mode = _mode_for_bits(cur_bits)
+            cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+            # Max target based on sensitivity
+            ratio = layer_score / max_layer_score if max_layer_score > 0 else 0
+            if ratio >= 0.5:
+                max_target = 8
+            elif ratio >= 0.2:
+                max_target = min(cur_bits + 2, 8)
+            else:
+                max_target = min(cur_bits + 1, 8)
+            if max_target <= cur_bits:
+                continue
+            candidates.append(
+                (priority_score, path, shape, cur_bits, cur_cost, max_target)
+            )
 
     for _score, path, shape, cur_bits, cur_cost, max_target in sorted(
         candidates, key=lambda x: x[0], reverse=True
@@ -883,7 +960,16 @@ def _build_quant_plan(
             cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
             layer_idx = _extract_layer_index(path)
             layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-            fallback_candidates.append((layer_score, path, shape, cur_bits, cur_cost))
+            priority_score = _code_preserve_layer_score(
+                layer_idx=layer_idx,
+                layer_score=layer_score,
+                max_layer_score=max_layer_score,
+                num_layers=num_layers,
+                oq_level=oq_level,
+            )
+            fallback_candidates.append(
+                (priority_score, path, shape, cur_bits, cur_cost)
+            )
 
         for _score, path, shape, cur_bits, cur_cost in sorted(
             fallback_candidates, key=lambda x: x[0], reverse=True
@@ -913,7 +999,7 @@ def _build_quant_plan(
             if current_bpw >= target_bpw:
                 break
 
-    if current_bpw < target_bpw:
+    if not routed_first and current_bpw < target_bpw:
         total_bits_f, current_bpw = _apply_routed_layer_boosts(
             named_shapes,
             config,
@@ -934,8 +1020,16 @@ def _build_quant_plan(
         from collections import Counter
 
         bits_dist = Counter(v["bits"] for v in boost_map.values())
+        route_dist = Counter()
         layer_bits = {}
         for k, v in boost_map.items():
+            projection = _routed_expert_projection(k)
+            if projection is not None:
+                route_dist[f"{projection}:{v['bits']}bit"] += 1
+            elif _is_routed_expert(k):
+                route_dist[f"routed_other:{v['bits']}bit"] += 1
+            else:
+                route_dist[f"non_expert:{v['bits']}bit"] += 1
             idx = _extract_layer_index(k)
             label = f"L{idx}" if idx >= 0 else k.split(".")[-1]
             if label not in layer_bits:
@@ -947,7 +1041,13 @@ def _build_quant_plan(
         )
         top_layers = sorted(layer_bits.items(), key=lambda x: -x[1])[:8]
         top_str = ", ".join(f"{l}={b}b" for l, b in top_layers)
-        logger.info(f"  plan detail: {bits_summary} | top: {top_str}")
+        route_summary = ", ".join(
+            f"{name}×{count}" for name, count in sorted(route_dist.items())
+        )
+        logger.info(
+            f"  plan detail: {bits_summary} | routes: {route_summary} | "
+            f"top: {top_str}"
+        )
 
     return QuantPlan(
         boost_map=boost_map,
@@ -3392,7 +3492,7 @@ def _source_imatrix_signature(
                 ch.update(block)
         calib_hash = ch.hexdigest()
     return {
-        "format": "omlx-oqe-imatrix-v1",
+        "format": _OQE_IMATRIX_FORMAT,
         "model_name": source.name,
         "source_hash": h.hexdigest(),
         "calib_dataset": calib_dataset,
@@ -3442,6 +3542,24 @@ def _load_oqe_imatrix(path: Path) -> OQImatrixData:
 
 def _oqe_cache_matches(cache: OQImatrixData, expected: dict[str, Any]) -> bool:
     return all(cache.metadata.get(k) == v for k, v in expected.items())
+
+
+def _oqe_cache_has_required_expert_coverage(
+    cache: OQImatrixData,
+) -> bool:
+    collection = cache.metadata.get("collection")
+    require_expert_counts = bool(cache.metadata.get("requires_expert_counts", False))
+    if isinstance(collection, dict):
+        require_expert_counts = bool(
+            collection.get("requires_expert_counts", require_expert_counts)
+        )
+    if not require_expert_counts:
+        return True
+    coverage = cache.metadata.get("expert_coverage")
+    if not isinstance(coverage, dict):
+        if isinstance(collection, dict):
+            coverage = collection.get("coverage")
+    return isinstance(coverage, dict) and bool(coverage.get("has_expert_counts", False))
 
 
 def _normalised_imatrix_values(entry: OQImatrixEntry) -> np.ndarray:
@@ -3514,9 +3632,42 @@ def _imatrix_expert_coverage_stats(
     }
 
 
-def _imatrix_expert_coverage_sufficient(stats: dict[str, Any]) -> bool:
+def _config_expects_moe_expert_counts(config: dict) -> bool:
+    """Return True when the model config describes routed MoE experts."""
+    configs = [config]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        configs.append(text_config)
+    ffn_config = config.get("ffn_config")
+    if isinstance(ffn_config, dict):
+        configs.append(ffn_config)
+
+    for cfg in configs:
+        for key in (
+            "n_routed_experts",
+            "num_experts",
+            "num_local_experts",
+            "moe_num_experts",
+        ):
+            try:
+                if int(cfg.get(key) or 0) > 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _imatrix_requires_expert_counts(config: dict, switch_capture_modules: int) -> bool:
+    return switch_capture_modules > 0 and _config_expects_moe_expert_counts(config)
+
+
+def _imatrix_expert_coverage_sufficient(
+    stats: dict[str, Any],
+    *,
+    require_expert_counts: bool = False,
+) -> bool:
     if not stats.get("has_expert_counts", False):
-        return True
+        return not require_expert_counts
     required_key = f"p{_OQE_MIN_EXPERT_COUNT_PERCENTILE:02d}_count"
     return (
         int(stats.get("zero_count_experts", 0)) == 0
@@ -4352,7 +4503,7 @@ def quantize_oq_streaming(
         processed_bytes += tensor_bytes
         elapsed = _time.monotonic() - start_time
         frac = min(max(processed_bytes / max(total_bytes, 1), 0.0), 1.0)
-        pct = 15.0 + frac * 75.0
+        pct = 20.0 + frac * 70.0
         display_pct = min(100, max(0, int(frac * 100)))
         if (
             display_pct != last_quant_display_pct
@@ -4527,10 +4678,12 @@ def quantize_oq_streaming(
 _SENS_NUM_SAMPLES = 128
 _SENS_SEQ_LENGTH = 256
 _OQE_CALIB_DATASET = "oqe_code_multilingual"
+_OQE_IMATRIX_FORMAT = "omlx-oqe-imatrix-cache"
 _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
     "code",
     "en",
@@ -5005,7 +5158,10 @@ class _ImatrixCaptureWrapper(nn.Module):
 
     def __call__(self, *args, **kwargs):
         if args:
-            if type(self._module).__name__ == "SwitchLinear" and len(args) >= 2:
+            if (
+                type(self._module).__name__ in _OQE_SWITCH_LINEAR_CLASSES
+                and len(args) >= 2
+            ):
                 self._collector.collect_switch(
                     self._name, self._module, args[0], args[1]
                 )
@@ -5020,11 +5176,13 @@ class OQImatrixCollector:
     def __init__(self):
         self.entries: dict[str, OQImatrixEntry] = {}
         self._original_modules: dict[str, Any] = {}
+        self.capture_module_classes: dict[str, int] = {}
+        self.switch_capture_modules = 0
 
     @staticmethod
     def _is_capture_module(module) -> bool:
         cls = type(module).__name__
-        if cls == "SwitchLinear":
+        if cls in _OQE_SWITCH_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
         return (
             cls == "Linear"
@@ -5037,6 +5195,12 @@ class OQImatrixCollector:
         for name, module in model.named_modules():
             if not name or not self._is_capture_module(module):
                 continue
+            cls = type(module).__name__
+            self.capture_module_classes[cls] = (
+                self.capture_module_classes.get(cls, 0) + 1
+            )
+            if cls in _OQE_SWITCH_LINEAR_CLASSES:
+                self.switch_capture_modules += 1
             self._original_modules[name] = module
             replacements.append((name, _ImatrixCaptureWrapper(module, name, self)))
         if replacements:
@@ -5106,7 +5270,9 @@ class OQImatrixCollector:
 
     def collect_switch(self, name: str, module, x, indices) -> None:
         try:
-            n_experts, _, in_dim = (int(v) for v in module.weight.shape)
+            weight_shape = getattr(module.weight, "shape", ())
+            n_experts = int(getattr(module, "num_experts", weight_shape[0]))
+            in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
             if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
                 return
             mx.eval(x, indices)
@@ -5202,6 +5368,9 @@ def _collect_imatrix_from_model(
     processed_samples = 0
     micro_batches = 0
     rounds: list[dict[str, Any]] = []
+    require_expert_counts = _imatrix_requires_expert_counts(
+        config, collector.switch_capture_modules
+    )
     coverage = _imatrix_expert_coverage_stats(collector.entries)
     logger.info(
         "oQe imatrix: adaptive max=%d, step=%d, micro-batch=%d "
@@ -5254,7 +5423,12 @@ def _collect_imatrix_from_model(
                 processed_samples = micro_next
                 micro_batches += 1
                 coverage = _imatrix_expert_coverage_stats(collector.entries)
-                sufficient = _imatrix_expert_coverage_sufficient(coverage)
+                coverage_sufficient = _imatrix_expert_coverage_sufficient(
+                    coverage, require_expert_counts=require_expert_counts
+                )
+                collection_sufficient = (
+                    processed_samples >= int(num_samples) and coverage_sufficient
+                )
                 frac = min(max(processed_samples / max(max_samples, 1), 0.0), 1.0)
                 pct = progress_start + frac * (progress_end - progress_start)
                 detail = (
@@ -5273,20 +5447,23 @@ def _collect_imatrix_from_model(
                         "requested_samples": int(num_samples),
                         "micro_batch_size": micro_batch_size,
                         "micro_batches": micro_batches,
-                        "coverage_sufficient": sufficient,
+                        "coverage_sufficient": coverage_sufficient,
+                        "collection_sufficient": collection_sufficient,
+                        "requires_expert_counts": require_expert_counts,
                         "coverage": coverage,
                     },
                 )
                 logger.info(
                     "oQe imatrix: %d/%d samples, zero experts=%d, "
-                    "p05=%.1f, sufficient=%s",
+                    "p05=%.1f, expert_coverage=%s, sufficient=%s",
                     processed_samples,
                     max_samples,
                     int(coverage.get("zero_count_experts", 0)),
                     float(coverage.get("p05_count", 0.0)),
-                    sufficient,
+                    coverage_sufficient,
+                    collection_sufficient,
                 )
-                if processed_samples >= int(num_samples) and sufficient:
+                if collection_sufficient:
                     break
                 mx.synchronize()
                 mx.clear_cache()
@@ -5294,20 +5471,38 @@ def _collect_imatrix_from_model(
             if int(processed_samples) == 0:
                 break
             coverage = _imatrix_expert_coverage_stats(collector.entries)
-            sufficient = _imatrix_expert_coverage_sufficient(coverage)
+            coverage_sufficient = _imatrix_expert_coverage_sufficient(
+                coverage, require_expert_counts=require_expert_counts
+            )
+            collection_sufficient = (
+                processed_samples >= int(num_samples) and coverage_sufficient
+            )
             rounds.append(
                 {
                     "processed_samples": processed_samples,
-                    "coverage_sufficient": sufficient,
+                    "coverage_sufficient": coverage_sufficient,
+                    "collection_sufficient": collection_sufficient,
                     "coverage": coverage,
                 }
             )
-            if processed_samples >= int(num_samples) and sufficient:
+            if collection_sufficient:
                 break
             mx.synchronize()
             mx.clear_cache()
     finally:
         collector.restore(model)
+
+    coverage_sufficient = _imatrix_expert_coverage_sufficient(
+        coverage, require_expert_counts=require_expert_counts
+    )
+    collection_sufficient = (
+        processed_samples >= int(num_samples) and coverage_sufficient
+    )
+    if require_expert_counts and not coverage.get("has_expert_counts", False):
+        logger.warning(
+            "oQe imatrix: model config expects routed experts, but no expert "
+            "activation counts were captured"
+        )
 
     metadata = {
         "dataset": calib_dataset,
@@ -5322,7 +5517,13 @@ def _collect_imatrix_from_model(
         "batch_plan": batch_plan,
         "processed_samples": processed_samples,
         "installed_modules": installed,
-        "coverage_sufficient": _imatrix_expert_coverage_sufficient(coverage),
+        "capture_module_classes": dict(
+            sorted(collector.capture_module_classes.items())
+        ),
+        "switch_capture_modules": int(collector.switch_capture_modules),
+        "requires_expert_counts": require_expert_counts,
+        "coverage_sufficient": coverage_sufficient,
+        "collection_sufficient": collection_sufficient,
         "coverage": coverage,
         "rounds": rounds,
     }
@@ -5456,17 +5657,24 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            cache.reused = True
-            logger.info("oQe imatrix: using cache %s", path)
-            _emit_progress(
-                progress_callback,
-                "imatrix",
-                progress_end,
-                f"Using oQe imatrix cache ({len(cache.entries)} entries)",
-                {"cache_path": str(path), "entry_count": len(cache.entries)},
+            if _oqe_cache_has_required_expert_coverage(cache):
+                cache.reused = True
+                logger.info("oQe imatrix: using cache %s", path)
+                _emit_progress(
+                    progress_callback,
+                    "imatrix",
+                    progress_end,
+                    f"Using oQe imatrix cache ({len(cache.entries)} entries)",
+                    {"cache_path": str(path), "entry_count": len(cache.entries)},
+                )
+                return cache
+            logger.info(
+                "oQe imatrix: cache missing required expert coverage, "
+                "recollecting %s",
+                path,
             )
-            return cache
-        logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
+        else:
+            logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
 
     logger.info(
         "oQe imatrix: collecting %d samples x %d tokens from %s",
@@ -5492,6 +5700,9 @@ def _load_or_collect_imatrix(
         "entry_count": len(entries),
         "collection": collection_metadata,
         "expert_coverage": collection_metadata.get("coverage", {}),
+        "requires_expert_counts": bool(
+            collection_metadata.get("requires_expert_counts", False)
+        ),
         "processed_samples": int(collection_metadata.get("processed_samples", 0)),
     }
     _save_oqe_imatrix(path, entries, metadata)

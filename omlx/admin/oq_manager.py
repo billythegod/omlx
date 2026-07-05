@@ -625,8 +625,10 @@ class OQManager:
                 if time.time() - getattr(task, "_last_progress_callback_at", 0.0) < 5:
                     continue
                 if task.status == QuantStatus.QUANTIZING:
+                    if self._has_explicit_quant_progress(task):
+                        continue
                     fraction = min(elapsed / estimated_total, 0.95)
-                    task.progress = 30.0 + fraction * 60.0
+                    task.progress = max(task.progress, 30.0 + fraction * 60.0)
                 elif task.status == QuantStatus.SAVING:
                     # During save, poll output dir size
                     output = Path(task.output_path)
@@ -636,9 +638,20 @@ class OQManager:
                         expected = task.source_size * task.oq_level / 16
                         if expected > 0:
                             save_frac = min(current / expected, 0.99)
-                            task.progress = 90.0 + save_frac * 10.0
+                            task.progress = max(task.progress, 90.0 + save_frac * 10.0)
         except asyncio.CancelledError:
             pass
+
+    @staticmethod
+    def _has_explicit_quant_progress(task: QuantTask) -> bool:
+        """Return True once the quantizer emits byte-level progress."""
+        meta = task.progress_meta if isinstance(task.progress_meta, dict) else {}
+        try:
+            total_bytes = int(meta.get("total_bytes") or 0)
+            processed_bytes = int(meta.get("processed_bytes") or 0)
+        except (TypeError, ValueError):
+            return False
+        return total_bytes > 0 and processed_bytes >= 0
 
     @staticmethod
     def _phase_label(phase: str, oq_level: float, enhanced: bool = False) -> str:
