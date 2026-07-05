@@ -253,6 +253,7 @@ private struct SourceModelSection: View {
     static let levelOptions: [PopupOption<Double>] = [
         PopupOption(value: 2,   label: "oQ2"),
         PopupOption(value: 2.5, label: "oQ2.5"),
+        PopupOption(value: 2.7, label: "oQ2.7"),
         PopupOption(value: 2.8, label: "oQ2.8"),
         PopupOption(value: 3,   label: "oQ3"),
         PopupOption(value: 3.5, label: "oQ3.5"),

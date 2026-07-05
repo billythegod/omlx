@@ -4,7 +4,7 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ2.5, oQ2.8, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
+Supported levels: oQ2, oQ2.5, oQ2.7, oQ2.8, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 (base bits differ, same predicate). Fractional levels keep the lower level's
 base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
@@ -36,7 +36,7 @@ from omlx.model_discovery import _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
-OQ_LEVELS = {2, 2.5, 2.8, 3, 3.5, 4, 5, 6, 8}
+OQ_LEVELS = {2, 2.5, 2.7, 2.8, 3, 3.5, 4, 5, 6, 8}
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -53,6 +53,7 @@ _PROXY_QUANT_GROUP_SIZE = 64
 _LEVEL_BITS: dict[float, int] = {
     2: 2,
     2.5: 2,
+    2.7: 2,
     2.8: 2,
     3: 3,
     3.5: 3,
@@ -65,6 +66,7 @@ _LEVEL_BITS: dict[float, int] = {
 _LEVEL_PROTECTION: dict[float, str] = {
     2: "full",
     2.5: "full",
+    2.7: "full",
     2.8: "full",
     3: "full",
     3.5: "full",
@@ -82,6 +84,7 @@ _LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 3.5: 1}
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
+    2.7: (3.25, 3.35),
     2.8: (3.35, 3.45),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
@@ -90,7 +93,7 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     6: (6.5, 6.7),
 }
 
-_ROUTED_LAYER_BOOST_LEVELS = {2.8}
+_ROUTED_LAYER_BOOST_LEVELS = {2.7, 2.8}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 
@@ -158,7 +161,7 @@ def universal_quant_predicate(
         oQ2.5/oQ3.5: fractional levels — lower level's base bits,
             routed expert down_proj protected above base per
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
-        oQ2.8: base 2-bit + routed layer boosts selected by layer
+        oQ2.7/oQ2.8: base 2-bit + routed layer boosts selected by layer
             sensitivity; routed w2/down_proj first, then w1/w3 as paired
             layer-wide boosts while staying under the bpw cap
         oQ3: base 3-bit + full protection → ~3.5 bpw
@@ -579,7 +582,7 @@ def _apply_routed_layer_boosts(
     """Boost routed expert modules by layer while staying MLX-loader portable.
 
     MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
-    not per expert. For oQ2.8 we therefore rank layers by sensitivity and boost
+    not per expert. For oQ2.7/oQ2.8 we therefore rank layers by sensitivity and boost
     whole routed projection modules: down/w2 first, then gate+up as a pair.
     """
     if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
