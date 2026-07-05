@@ -1021,10 +1021,10 @@ class TestLevelBudgetPlan:
         assert _LEVEL_BITS[2.7] == 2
         assert _LEVEL_BITS[2.8] == 2
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
-    def test_half_level_mandatory_expert_down_proj_boost(self, oq_level, expected_bits):
-        """Fractional levels protect routed expert down_proj above base bits
+    def test_oq35_mandatory_expert_down_proj_boost(self):
+        """oQ3.5 protects routed expert down_proj above base bits
         even with negligible sensitivity scores."""
+        oq_level = 3.5
         named_shapes = {
             "model.layers.0.mlp.switch_mlp.down_proj": (8, 256, 256),
             "model.layers.0.mlp.switch_mlp.gate_proj": (8, 256, 256),
@@ -1042,25 +1042,24 @@ class TestLevelBudgetPlan:
         )
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
-        assert boost["bits"] == expected_bits
+        assert boost["bits"] == 4
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
-    def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
-        """The non-budget predicate floor mirrors the mandatory boost."""
+    def test_oq35_predicate_floor_for_expert_down_proj(self):
+        """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""
         config = {
             "num_hidden_layers": 32,
             "num_experts": 8,
             "hidden_size": 1024,
         }
         result = universal_quant_predicate(
-            "model.layers.5.mlp.switch_mlp.down_proj", None, config, oq_level
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, 3.5
         )
         assert isinstance(result, dict)
-        assert result["bits"] == expected_bits
+        assert result["bits"] == 4
 
-    @pytest.mark.parametrize("oq_level", [2.7, 2.8])
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7, 2.8])
     def test_oq2x_predicate_keeps_routed_down_proj_at_base_without_plan(self, oq_level):
-        """oQ2.7/oQ2.8 use budget-planned routed boosts, not a blanket floor."""
+        """oQ2.5/oQ2.7/oQ2.8 use budget-planned routed boosts."""
         config = {
             "num_hidden_layers": 32,
             "num_experts": 8,
@@ -1082,10 +1081,11 @@ class TestLevelBudgetPlan:
         assert 2 in _OQ_BPW_TARGETS
         assert _bpw_targets_for_level(2) == (2.8, 3.0)
 
-    def test_oq27_uses_routed_layer_boosts(self):
-        assert 2.7 in OQ_LEVELS
-        assert 2.7 in _ROUTED_LAYER_BOOST_LEVELS
-        assert 2.7 not in _LEVEL_EXPERT_DOWN_BOOST
+    def test_oq2_fractional_levels_use_routed_layer_boosts(self):
+        for level in (2.5, 2.7, 2.8):
+            assert level in OQ_LEVELS
+            assert level in _ROUTED_LAYER_BOOST_LEVELS
+            assert level not in _LEVEL_EXPERT_DOWN_BOOST
 
     def test_budget_plan_oq8_not_enabled(self):
         assert 8 not in _OQ_BPW_TARGETS
@@ -1191,9 +1191,9 @@ class TestLevelBudgetPlan:
         for k in plan.boost_map:
             assert "switch_mlp" not in k
 
-    @pytest.mark.parametrize("oq_level", [2.7, 2.8])
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7, 2.8])
     def test_oq2x_boosts_routed_down_proj_by_layer_sensitivity(self, oq_level):
-        """oQ2.7/oQ2.8 boost routed projections by whole layer modules."""
+        """oQ2.5/oQ2.7/oQ2.8 boost routed projections by whole layer modules."""
         named_shapes = {}
         for i in range(2):
             named_shapes[f"model.layers.{i}.ffn.switch_mlp.gate_proj"] = (8, 64, 64)
@@ -1210,9 +1210,9 @@ class TestLevelBudgetPlan:
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
         assert "model.layers.1.ffn.switch_mlp.down_proj" not in plan.boost_map
 
-    @pytest.mark.parametrize("oq_level", [2.7, 2.8])
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7, 2.8])
     def test_oq2x_boosts_gate_up_pair_after_routed_down_proj(self, oq_level):
-        """After routed w2/down_proj, oQ2.7/oQ2.8 boost gate+up as a pair."""
+        """After routed w2/down_proj, oQ2.5/oQ2.7/oQ2.8 boost gate+up as a pair."""
         named_shapes = {
             "model.layers.0.ffn.switch_mlp.gate_proj": (8, 64, 64),
             "model.layers.0.ffn.switch_mlp.up_proj": (8, 64, 64),
@@ -4170,7 +4170,7 @@ class TestReplayChainGuards:
 
 
 # =============================================================================
-# End-to-end: oQ2.5 half-level
+# End-to-end: oQ2.5 routed-layer boost
 # =============================================================================
 
 
@@ -4178,7 +4178,7 @@ class TestReplayChainGuards:
 class TestQuantizeOqStreamingOq25:
     def test_oq25_end_to_end_synthetic_moe(self, tmp_path):
         """oQ2.5 output: 2-bit affine base with routed expert down_proj
-        protected at 3-bit via the mandatory half-level boost."""
+        selected at 3-bit through the routed-layer budget plan."""
         from safetensors.numpy import save_file as np_save
 
         src = tmp_path / "src"
@@ -4190,6 +4190,9 @@ class TestQuantizeOqStreamingOq25:
                     8, h, h
                 ).astype(np.float32),
                 "model.layers.0.mlp.switch_mlp.gate_proj.weight": np.random.randn(
+                    8, h, h
+                ).astype(np.float32),
+                "model.layers.0.mlp.switch_mlp.up_proj.weight": np.random.randn(
                     8, h, h
                 ).astype(np.float32),
                 "model.layers.0.self_attn.q_proj.weight": np.random.randn(h, h).astype(
@@ -4233,3 +4236,4 @@ class TestQuantizeOqStreamingOq25:
             tensors.update(mx.load(str(sf)))
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
+        assert "model.layers.0.mlp.switch_mlp.up_proj.scales" in tensors

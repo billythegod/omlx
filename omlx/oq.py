@@ -76,10 +76,10 @@ _LEVEL_PROTECTION: dict[float, str] = {
     8: "full",
 }
 
-# Fractional levels: mandatory protection for routed expert down_proj
-# (Super Weights), expressed as bits above the level's base bits.
-# 2.5 -> 3-bit, 3.5 -> 4-bit.
-_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 3.5: 1}
+# Mandatory protection for routed expert down_proj on fractional levels that
+# reserve a blanket Super Weights floor instead of sensitivity-selected routing.
+# 3.5 -> 4-bit.
+_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {3.5: 1}
 
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
@@ -93,7 +93,7 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     6: (6.5, 6.7),
 }
 
-_ROUTED_LAYER_BOOST_LEVELS = {2.7, 2.8}
+_ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7, 2.8}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 
@@ -158,12 +158,11 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ2.5/oQ3.5: fractional levels — lower level's base bits,
-            routed expert down_proj protected above base per
-            _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
-        oQ2.7/oQ2.8: base 2-bit + routed layer boosts selected by layer
+        oQ2.5/oQ2.7/oQ2.8: base 2-bit + routed layer boosts selected by layer
             sensitivity; routed w2/down_proj first, then w1/w3 as paired
             layer-wide boosts while staying under the bpw cap
+        oQ3.5: base 3-bit with routed expert down_proj protected above base per
+            _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
         oQ3: base 3-bit + full protection → ~3.5 bpw
         oQ4-oQ6: base N-bit + full protection
         oQ7: base 8-bit + full protection
@@ -341,8 +340,8 @@ def universal_quant_predicate(
         if is_routed_expert:
             down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
             if down_boost:
-                # Fractional levels protect routed expert down_proj above
-                # the base bits (Super Weights protection).
+                # Mandatory fractional levels protect routed expert down_proj
+                # above the base bits (Super Weights protection).
                 return bits(base_bits + down_boost)
             return True
         if sensitive:
@@ -582,8 +581,9 @@ def _apply_routed_layer_boosts(
     """Boost routed expert modules by layer while staying MLX-loader portable.
 
     MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
-    not per expert. For oQ2.7/oQ2.8 we therefore rank layers by sensitivity and boost
-    whole routed projection modules: down/w2 first, then gate+up as a pair.
+    not per expert. For oQ2.5/oQ2.7/oQ2.8 we therefore rank layers by
+    sensitivity and boost whole routed projection modules: down/w2 first,
+    then gate+up as a pair.
     """
     if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
         return total_bits_f, current_bpw
@@ -739,8 +739,8 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
-    # Fractional levels (oQ2.5 / oQ3.5): mandatory expert down_proj
-    # boost above base bits (Super Weights protection).
+    # Mandatory expert down_proj boost above base bits (Super Weights
+    # protection) for fractional levels that reserve a blanket floor.
     _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
     if _down_boost:
         for path, shape in named_shapes.items():
