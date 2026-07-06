@@ -43,11 +43,9 @@ def import_error() -> Exception | None:
 
 
 def _has_weighted_sum() -> bool:
-    try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-    except Exception:
-        return hasattr(mx.fast, "glm_moe_weighted_sum")
-    return glm_fast.has_symbol("glm_moe_weighted_sum")
+    return hasattr(_ext, "qwen35_moe_weighted_sum") or hasattr(
+        mx.fast, "qwen35_moe_weighted_sum"
+    )
 
 
 def has_symbol(name: str) -> bool:
@@ -60,7 +58,7 @@ def native_symbols() -> tuple[str, ...]:
     symbols: list[str] = []
     if _ext is not None:
         symbols.extend(name for name in NATIVE_SYMBOLS if hasattr(_ext, name))
-    if _has_weighted_sum():
+    if _has_weighted_sum() and "qwen35_moe_weighted_sum" not in symbols:
         symbols.append("qwen35_moe_weighted_sum")
     return tuple(symbols)
 
@@ -192,25 +190,21 @@ def qwen35_moe_weighted_sum(
     *,
     stream=None,
 ) -> mx.array:
-    try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-    except Exception as exc:
-        if not hasattr(mx.fast, "glm_moe_weighted_sum"):
-            raise RuntimeError(
-                "glm_moe_weighted_sum native kernel is unavailable"
-            ) from exc
-        return mx.fast.glm_moe_weighted_sum(
+    if _ext is not None and hasattr(_ext, "qwen35_moe_weighted_sum"):
+        return _ext.qwen35_moe_weighted_sum(
+            x_sorted,
+            inv_order,
+            scores,
+            **_native_stream_kwargs(stream),
+        )
+    if hasattr(mx.fast, "qwen35_moe_weighted_sum"):
+        return mx.fast.qwen35_moe_weighted_sum(
             x_sorted,
             inv_order,
             scores,
             stream=stream or mx.gpu,
         )
-    return glm_fast.glm_moe_weighted_sum(
-        x_sorted,
-        inv_order,
-        scores,
-        stream=stream,
-    )
+    raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
 
 
 def __getattr__(name: str) -> Any:

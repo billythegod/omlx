@@ -56,4 +56,11 @@ NB_MODULE(_ext, m) {
       "biases"_a,
       "variant"_a = 8,
       "stream"_a = nb::none());
+  m.def(
+      "qwen35_moe_weighted_sum",
+      &omlx::qwen35_prefill_kernels::qwen35_moe_weighted_sum,
+      "x_sorted"_a,
+      "inv_order"_a,
+      "scores"_a,
+      "stream"_a = nb::none());
 }

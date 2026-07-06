@@ -112,6 +112,7 @@ def test_qwen_native_symbols_are_not_registered_on_glm_extension():
     assert not glm_fast.has_symbol("qwen35_q5_affine_qmm_t")
     assert not glm_fast.has_symbol("qwen35_q6_affine_qmm_t")
     assert not glm_fast.has_symbol("qwen35_q8_affine_qmm_t")
+    assert not glm_fast.has_symbol("qwen35_moe_weighted_sum")
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
