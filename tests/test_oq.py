@@ -1234,8 +1234,8 @@ class TestLevelBudgetPlan:
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.up_proj"]["bits"] == 3
 
     @pytest.mark.parametrize("oq_level", [2.5, 2.7])
-    def test_oq2x_prioritizes_routed_down_before_dense_greedy(self, oq_level):
-        """Code-preserving 2-bit levels spend target budget on routed down first."""
+    def test_oq2x_prioritizes_dense_greedy_before_routed_fallback(self, oq_level):
+        """oQ2.5/oQ2.7 spend target budget on dense sensitivity first."""
         named_shapes = {
             "model.layers.0.ffn.switch_mlp.down_proj": (8, 64, 64),
             "model.layers.0.mlp.gate_proj": (8, 64, 64),
@@ -1248,8 +1248,8 @@ class TestLevelBudgetPlan:
         plan = _build_quant_plan(
             named_shapes, config, oq_level, target_bpw=3.0, hard_cap_bpw=3.01
         )
-        assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
-        assert "model.layers.0.mlp.gate_proj" not in plan.boost_map
+        assert plan.boost_map["model.layers.0.mlp.gate_proj"]["bits"] == 3
+        assert "model.layers.0.ffn.switch_mlp.down_proj" not in plan.boost_map
 
     def test_oq2_budget_plan_respects_cap(self):
         """oQ2 with budget plan should stay within hard cap."""

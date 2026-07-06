@@ -6,8 +6,7 @@ unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
 Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 (base bits differ, same predicate). Fractional levels keep the lower level's
-base bits and add targeted code-preserving routed-expert protection plus a
-higher bpw budget.
+base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import hashlib
@@ -75,9 +74,8 @@ _LEVEL_PROTECTION: dict[float, str] = {
     8: "full",
 }
 
-# Mandatory protection for routed expert down_proj on fractional levels that
-# reserve a blanket Super Weights floor instead of sensitivity-selected routing.
-# 3.5 -> 4-bit.
+# Fractional levels that reserve a blanket Super Weights floor.
+# 3.5 -> routed expert down_proj 4-bit.
 _LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {3.5: 1}
 
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
@@ -92,7 +90,6 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
 }
 
 _ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7}
-_CODE_PRESERVE_FRACTIONAL_LEVELS = {2.5, 2.7}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
 
@@ -157,10 +154,9 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ2.5/oQ2.7: base 2-bit + code-preserving routed layer boosts
-            selected by layer sensitivity and late-layer position; routed
-            w2/down_proj first, then w1/w3 as paired layer-wide boosts while
-            staying under the bpw cap
+        oQ2.5/oQ2.7: base 2-bit + routed layer boosts selected by layer
+            sensitivity; routed w2/down_proj first, then w1/w3 as paired
+            layer-wide boosts while staying under the bpw cap
         oQ3.5: base 3-bit with routed expert down_proj protected above base per
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
         oQ3: base 3-bit + full protection → ~3.5 bpw
@@ -539,40 +535,6 @@ def _routed_expert_projection(path: str) -> str | None:
     return None
 
 
-def _num_layers_from_config(config: dict, default: int = 32) -> int:
-    tc = config.get("text_config", {})
-    return int(
-        config.get("num_hidden_layers")
-        or (tc.get("num_hidden_layers") if isinstance(tc, dict) else None)
-        or default
-    )
-
-
-def _code_preserve_layer_score(
-    *,
-    layer_idx: int,
-    layer_score: float,
-    max_layer_score: float,
-    num_layers: int,
-    oq_level: float,
-) -> float:
-    """Raise generation-critical edge/late layers for aggressive 2-bit levels."""
-    if oq_level not in _CODE_PRESERVE_FRACTIONAL_LEVELS:
-        return layer_score
-    if layer_idx < 0 or num_layers <= 1:
-        return layer_score
-
-    anchor = max(max_layer_score, 1e-12)
-    pos = layer_idx / max(num_layers - 1, 1)
-    if pos >= 0.80:
-        return layer_score + 0.50 * anchor
-    if pos >= 0.65:
-        return layer_score + 0.25 * anchor
-    if pos < 0.125:
-        return layer_score + 0.20 * anchor
-    return layer_score
-
-
 _MANDATORY_BOOST_PATTERNS = {
     "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
     "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
@@ -616,8 +578,8 @@ def _apply_routed_layer_boosts(
 
     MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
     not per expert. For oQ2.5/oQ2.7 we therefore rank layers by sensitivity
-    plus a small late-layer generation prior, then boost whole routed projection
-    modules: down/w2 first, then gate+up as a pair.
+    and boost whole routed projection modules: down/w2 first, then gate+up as
+    a pair.
     """
     if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
         return total_bits_f, current_bpw
@@ -625,8 +587,6 @@ def _apply_routed_layer_boosts(
     from collections import defaultdict
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
-    max_layer_score = max(layer_scores.values(), default=0.0)
-    num_layers = _num_layers_from_config(config)
     grouped: dict[tuple[int, str], list[tuple[str, tuple]]] = defaultdict(list)
     for path, shape in named_shapes.items():
         if path in fixed_overrides:
@@ -641,14 +601,7 @@ def _apply_routed_layer_boosts(
         grouped[(layer_idx, phase)].append((path, shape))
 
     def group_score(layer_idx: int) -> float:
-        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-        return _code_preserve_layer_score(
-            layer_idx=layer_idx,
-            layer_score=layer_score,
-            max_layer_score=max_layer_score,
-            num_layers=num_layers,
-            oq_level=oq_level,
-        )
+        return float(layer_scores.get(str(layer_idx), 0.0))
 
     def try_boost_group(items: list[tuple[str, tuple]]) -> bool:
         nonlocal total_bits_f, current_bpw
@@ -715,10 +668,10 @@ def _build_quant_plan(
 
     Strategy:
     1. Mandatory pre-allocation: consensus-critical tensors (lm_head → 8-bit)
-    2. For oQ2.5/oQ2.7, routed expert down/gate/up boosts get the remaining
-       target budget before opportunistic non-expert boosts.
-    3. Data-driven: remaining non-expert tensors compete by sensitivity and
-       layer-position score. Higher score → more bits.
+    2. Data-driven: all non-expert tensors compete equally, ranked by
+       layer sensitivity score. Higher sensitivity → more bits.
+    3. Routed experts stay at base bits except explicit fractional floors and
+       the oQ2.5/oQ2.7 fallback routed-layer boost.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
@@ -733,8 +686,6 @@ def _build_quant_plan(
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
-    num_layers = _num_layers_from_config(config)
-    routed_first = oq_level in _CODE_PRESERVE_FRACTIONAL_LEVELS
 
     total_params = 0
     expert_params = 0
@@ -785,8 +736,8 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
-    # Mandatory expert down_proj boost above base bits (Super Weights
-    # protection) for fractional levels that reserve a blanket floor.
+    # Fractional levels with a blanket Super Weights floor: mandatory expert
+    # down_proj boost above base bits.
     _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
     if _down_boost:
         for path, shape in named_shapes.items():
@@ -853,69 +804,38 @@ def _build_quant_plan(
         total_bits_f += delta
         current_bpw = next_bpw
 
-    # Aggressive 2-bit fractional levels are most prone to code-generation
-    # regressions when routed expert output paths stay at the base width.
-    # Reserve the remaining target budget for routed down_proj first, then
-    # paired gate/up, before opportunistic non-expert sensitivity boosts.
-    if routed_first and current_bpw < target_bpw:
-        total_bits_f, current_bpw = _apply_routed_layer_boosts(
-            named_shapes,
-            config,
-            oq_level,
-            boost_map,
-            fixed_overrides,
-            base_bits,
-            base_group_size,
-            base_mode,
-            total_bits_f,
-            total_params,
-            current_bpw,
-            target_bpw,
-            hard_cap_bpw,
-        )
-
     # Sensitivity-based greedy boost: boost tensors from their current bits
     # (which may already be elevated by the protection floor) using remaining
     # budget up to hard_cap_bpw.
     candidates = []
-    if not (routed_first and current_bpw >= target_bpw):
-        for path, shape in named_shapes.items():
-            if _is_routed_expert(path) or path in fixed_overrides:
-                continue
-            pred = universal_quant_predicate(
-                path, module, {**config, "_oq_boost_map": {}}, oq_level
-            )
-            if pred is False:
-                continue
-            layer_idx = _extract_layer_index(path)
-            if layer_idx < 0:
-                continue
-            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-            priority_score = _code_preserve_layer_score(
-                layer_idx=layer_idx,
-                layer_score=layer_score,
-                max_layer_score=max_layer_score,
-                num_layers=num_layers,
-                oq_level=oq_level,
-            )
-            # Current bits (floor or base)
-            cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
-            cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
-            cur_mode = _mode_for_bits(cur_bits)
-            cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
-            # Max target based on sensitivity
-            ratio = layer_score / max_layer_score if max_layer_score > 0 else 0
-            if ratio >= 0.5:
-                max_target = 8
-            elif ratio >= 0.2:
-                max_target = min(cur_bits + 2, 8)
-            else:
-                max_target = min(cur_bits + 1, 8)
-            if max_target <= cur_bits:
-                continue
-            candidates.append(
-                (priority_score, path, shape, cur_bits, cur_cost, max_target)
-            )
+    for path, shape in named_shapes.items():
+        if _is_routed_expert(path) or path in fixed_overrides:
+            continue
+        pred = universal_quant_predicate(
+            path, module, {**config, "_oq_boost_map": {}}, oq_level
+        )
+        if pred is False:
+            continue
+        layer_idx = _extract_layer_index(path)
+        if layer_idx < 0:
+            continue
+        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+        # Current bits (floor or base)
+        cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
+        cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cur_mode = _mode_for_bits(cur_bits)
+        cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+        # Max target based on sensitivity
+        ratio = layer_score / max_layer_score if max_layer_score > 0 else 0
+        if ratio >= 0.5:
+            max_target = 8
+        elif ratio >= 0.2:
+            max_target = min(cur_bits + 2, 8)
+        else:
+            max_target = min(cur_bits + 1, 8)
+        if max_target <= cur_bits:
+            continue
+        candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
 
     for _score, path, shape, cur_bits, cur_cost, max_target in sorted(
         candidates, key=lambda x: x[0], reverse=True
@@ -960,16 +880,7 @@ def _build_quant_plan(
             cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
             layer_idx = _extract_layer_index(path)
             layer_score = float(layer_scores.get(str(layer_idx), 0.0))
-            priority_score = _code_preserve_layer_score(
-                layer_idx=layer_idx,
-                layer_score=layer_score,
-                max_layer_score=max_layer_score,
-                num_layers=num_layers,
-                oq_level=oq_level,
-            )
-            fallback_candidates.append(
-                (priority_score, path, shape, cur_bits, cur_cost)
-            )
+            fallback_candidates.append((layer_score, path, shape, cur_bits, cur_cost))
 
         for _score, path, shape, cur_bits, cur_cost in sorted(
             fallback_candidates, key=lambda x: x[0], reverse=True
@@ -999,7 +910,7 @@ def _build_quant_plan(
             if current_bpw >= target_bpw:
                 break
 
-    if not routed_first and current_bpw < target_bpw:
+    if current_bpw < target_bpw:
         total_bits_f, current_bpw = _apply_routed_layer_boosts(
             named_shapes,
             config,
