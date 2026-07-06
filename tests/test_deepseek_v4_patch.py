@@ -4,6 +4,7 @@
 import importlib
 import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -784,6 +785,95 @@ class TestCacheMaterialization:
         assert loop_pos < materialize_pos < pipeline_send_pos
 
 
+class TestDeepseekV4SwitchGLU:
+    """DeepSeek-V4 SwitchGLU execution guards."""
+
+    def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        config = dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=0,
+            qk_rope_head_dim=4,
+            head_dim=4,
+            o_lora_rank=0,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=2,
+            swiglu_limit=10.0,
+        )
+
+        moe = dsv4.DeepseekV4MoE(config, layer_idx=0)
+
+        assert moe.switch_mlp.activation.limit == config.swiglu_limit
+        assert moe.shared_experts.swiglu_limit == config.swiglu_limit
+
+    def test_skips_fused_weighted_sum_for_cache_stability(
+        self, applied_patch, monkeypatch
+    ):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "has_symbol",
+            lambda name: name == "glm_moe_weighted_sum",
+        )
+
+        def fail_weighted_sum(*args, **kwargs):
+            raise AssertionError("DeepSeek V4 must not use fused weighted sum")
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "glm_moe_weighted_sum",
+            fail_weighted_sum,
+            raising=False,
+        )
+
+        mx.random.seed(11)
+        layer = switch_layers.SwitchGLU(
+            input_dims=16,
+            hidden_dims=32,
+            num_experts=4,
+            bias=False,
+        )
+        x = mx.random.normal((1, 8, 16), dtype=mx.float32)
+        indices = mx.array(
+            [
+                [
+                    [0, 1, 2, 3, 0, 1, 2, 3],
+                    [1, 2, 3, 0, 1, 2, 3, 0],
+                    [2, 3, 0, 1, 2, 3, 0, 1],
+                    [3, 0, 1, 2, 3, 0, 1, 2],
+                    [0, 2, 1, 3, 0, 2, 1, 3],
+                    [1, 3, 2, 0, 1, 3, 2, 0],
+                    [2, 0, 3, 1, 2, 0, 3, 1],
+                    [3, 1, 0, 2, 3, 1, 0, 2],
+                ]
+            ],
+            dtype=mx.int32,
+        )
+        scores = mx.softmax(
+            mx.random.normal((1, 8, 8), dtype=mx.float32),
+            axis=-1,
+        )
+
+        y = layer(x, indices, scores=scores)
+        mx.eval(y)
+
+        assert y.shape == (1, 8, 8, 16)
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 
@@ -870,6 +960,63 @@ class TestMakeQuantizationConfigMtp:
 
         qcfg = dsv4.make_quantization_config(_ModelStub())
         assert not any(k.startswith("mtp.") for k in qcfg)
+
+
+class TestDeepSeekV4SanitizeAffineSwitchMLP:
+    """Sanitize should enable the FP16 affine routed-MoE fast path."""
+
+    def test_affine_switch_mlp_scale_bias_cast_to_fp16(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        fake_model = SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=2,
+                o_groups=1,
+                o_lora_rank=1,
+            )
+        )
+        weights = {
+            "model.layers.0.ffn.switch_mlp.up_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.shared_experts.up_proj.scales": mx.zeros(
+                (4, 1), dtype=mx.bfloat16
+            ),
+        }
+
+        out = dsv4.Model.sanitize(fake_model, dict(weights))
+
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.scales"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.biases"].dtype == mx.float16
+        assert (
+            out["model.layers.0.ffn.switch_mlp.down_proj.scales"].dtype
+            == mx.float16
+        )
+        assert (
+            out["model.layers.0.ffn.switch_mlp.down_proj.biases"].dtype
+            == mx.float16
+        )
+        assert (
+            out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype
+            == mx.bfloat16
+        )
 
 
 class TestMtpSanitizeWoAReshape:

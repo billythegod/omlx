@@ -4,6 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "deepseek_v4_sparse_attention.h"
 #include "exact_block_attention.h"
 #include "fused_moe.h"
 #include "sparse_mla.h"
@@ -60,6 +61,19 @@ NB_MODULE(_ext, m) {
       "causal"_a = true,
       "stream"_a = nb::none());
   m.def(
+      "deepseek_v4_sparse_attention",
+      &omlx::glm_kernels::deepseek_v4_sparse_attention,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "topk_indices"_a,
+      "sinks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "compress_ratio"_a,
+      "local_window"_a,
+      "stream"_a = nb::none());
+  m.def(
       "glm_dsa_q8_vup_flat",
       &omlx::glm_kernels::glm_dsa_q8_vup_flat,
       "x"_a,
@@ -73,5 +87,77 @@ NB_MODULE(_ext, m) {
       "x_sorted"_a,
       "inv_order"_a,
       "scores"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_blocks",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_blocks,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_pair_blocks",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_blocks,
+      "x"_a,
+      "weight0"_a,
+      "scales0"_a,
+      "weight1"_a,
+      "scales1"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_concat_blocks,
+      "x"_a,
+      "weight0"_a,
+      "scales0"_a,
+      "weight1"_a,
+      "scales1"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_affine_gather_qmm_blocks",
+      &omlx::glm_kernels::deepseek_affine_gather_qmm_blocks,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "group_size"_a,
+      "bits"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_affine_gather_qmm_pair_concat_blocks",
+      &omlx::glm_kernels::deepseek_affine_gather_qmm_pair_concat_blocks,
+      "x"_a,
+      "weight0"_a,
+      "scales0"_a,
+      "biases0"_a,
+      "weight1"_a,
+      "scales1"_a,
+      "biases1"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "group_size"_a,
+      "bits"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_expert",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_expert,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "indices"_a,
+      "variant"_a = 0,
       "stream"_a = nb::none());
 }
