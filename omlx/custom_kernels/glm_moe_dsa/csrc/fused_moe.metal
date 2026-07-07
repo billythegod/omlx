@@ -1,6 +1,6 @@
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
-#include "kernels/quantized_glm.h"
+#include "kernels/quantized_moe.h"
 
 #define instantiate_quantized_head_flat(name, type, group_size, bits, aligned) \
   instantiate_kernel(                                                          \

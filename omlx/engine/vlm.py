@@ -1514,6 +1514,73 @@ class VLMBatchedEngine(BaseEngine):
                 apply_sdpa256_attention_patch()
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
+        # Installed after sdpa256 so matched Qwen dense attention takes the
+        # simdgroup-MMA path, while unsupported cases fall through unchanged.
+        if (
+            getattr(self._model_settings, "fa256_steel_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_fa256_attention import (
+                    apply_qwen35_fa256_attention_patch,
+                )
+
+                apply_qwen35_fa256_attention_patch()
+            except Exception:
+                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
+        # Decode and masked paths keep the original mlx-vlm kernel.
+        gdn_prefill_enabled = getattr(
+            self._model_settings,
+            "gdn_prefill_enabled",
+            getattr(self._model_settings, "gdn_chunked_prefill_enabled", True),
+        )
+        if gdn_prefill_enabled is not False:
+            try:
+                from ..patches.qwen35_gdn_chunked import (
+                    apply_qwen35_gdn_prefill_patch,
+                )
+
+                apply_qwen35_gdn_prefill_patch()
+            except Exception:
+                logger.debug("GDN prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 q4 MLP prefill -> native qmm tile tuned for long batches.
+        # Decode and target-verify paths keep the original QuantizedLinear.
+        if (
+            getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_q4_mlp import (
+                    apply_qwen35_q4_mlp_patch,
+                    apply_qwen35_q4_prefill_linear_patch,
+                )
+
+                apply_qwen35_q4_mlp_patch()
+                apply_qwen35_q4_prefill_linear_patch()
+            except Exception:
+                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
+        # SwitchGLU. Decode and target-verify keep the original path.
+        if (
+            getattr(self._model_settings, "qwen35_moe_weighted_sum_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_weighted_sum import (
+                    apply_qwen35_moe_weighted_sum_patch,
+                )
+
+                apply_qwen35_moe_weighted_sum_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                )
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
