@@ -50,6 +50,7 @@ class TestMacOS27Workarounds:
 
     def test_homebrew_clean_pass_skipped_on_macos_27(self, formula):
         """Homebrew's clean pass also runs strip over the venv's dylibs."""
+        assert "on_macos do" in formula
         assert f'skip_clean "libexec" if {MACOS_27_GUARD}' in formula
 
 

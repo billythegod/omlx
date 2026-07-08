@@ -19,7 +19,9 @@ class Omlx < Formula
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries
   # (llvm/llvm-project#203678). Skip Homebrew's post-install clean pass over
   # the venv so it never runs `strip` on the compiled dylibs.
-  skip_clean "libexec" if MacOS.version >= "27"
+  on_macos do
+    skip_clean "libexec" if MacOS.version >= "27"
+  end
 
   # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
   # mlx-lm. Fetch source separately so we can patch the pin before install.
