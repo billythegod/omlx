@@ -42,21 +42,19 @@ dependencies = [
     # Vanilla MLX v0.31.2; optional custom kernels live under
     # omlx.custom_kernels.* when built for release.
     "mlx==0.31.2",
-    # mlx-lm from commit (2ed2231, v0.31.3) - DeepSeek/GLM DSA indexer
-    # RoPE fix, trust_remote_code load gate, transformers 5.7.0 compatibility,
-    # and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
+    # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
+    # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
+    # RoPE fix, trust_remote_code load gate, transformers 5.7.0
+    # compatibility, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    # <5.13: transformers 5.13.0 (released 2026-07-03) tightened
-    # _LazyAutoMapping.register to require config classes, breaking mlx-lm
-    # 0.31.3's AutoTokenizer.register("NewlineTokenizer", ...) at import time
-    # (AttributeError: 'str' object has no attribute '__module__'). Every
-    # `import mlx_lm` fails on a fresh resolve. Lift once the mlx-lm pin
-    # advances past a fix.
+    # Keep <5.13 until the broader dependency set gets a dedicated resolver
+    # smoke test with transformers 5.13+. The mlx-lm pin above includes the
+    # known NewlineTokenizer registration fix.
     "transformers>=5.7.0,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
@@ -224,7 +222,7 @@ include = ["omlx*"]
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
     "mlx==0.31.2",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
 ]
 
 [tool.black]
