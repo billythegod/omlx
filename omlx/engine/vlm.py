@@ -1031,10 +1031,9 @@ def _smart_resize_tokens(
 def _read_image_dims(part: dict) -> Optional[tuple]:
     """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
 
-    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
-    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
-    anything that would need a network fetch or that fails to parse, so callers
-    fall back to the conservative per-image upper bound."""
+    Handles only ``data:`` base64 URIs. Returns ``None`` for anything else so
+    callers fall back to the conservative per-image upper bound without opening
+    request-supplied paths or fetching remote URLs."""
     import base64 as _b64
     import binascii
     import io as _io
@@ -1044,32 +1043,34 @@ def _read_image_dims(part: dict) -> Optional[tuple]:
     obj = part.get("image_url")
     if obj is None:
         obj = part.get("input_image") or part.get("image")
-    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    url = (
+        obj
+        if isinstance(obj, str)
+        else (obj.get("url") if isinstance(obj, dict) else None)
+    )
     if not isinstance(url, str) or not url:
         return None
 
     raw = None
     s = url.strip()
     if s.startswith("data:"):
-        _, sep, encoded = s.partition(",")
-        if sep == ",":
-            try:
-                raw = _b64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
-                return None
-    elif s.startswith(("http://", "https://")):
-        return None  # no network in preflight
-    else:
+        prefix, sep, encoded = s.partition(",")
+        prefix_lower = prefix.lower()
+        if (
+            sep != ","
+            or not prefix_lower.startswith("data:image/")
+            or ";base64" not in prefix_lower
+        ):
+            return None
         try:
-            raw = _b64.b64decode(s, validate=True)
+            raw = _b64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
-            raw = None  # not base64 -> treat as path below
+            return None
+    else:
+        return None
 
     try:
-        if raw is not None:
-            with _Image.open(_io.BytesIO(raw)) as im:
-                return im.size  # (width, height)
-        with _Image.open(s) as im:
+        with _Image.open(_io.BytesIO(raw)) as im:
             return im.size
     except Exception:
         return None
@@ -2255,7 +2256,7 @@ class VLMBatchedEngine(BaseEngine):
         Args:
             messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
-            audio: List of audio data (BytesIO, file paths, or numpy arrays)
+            audio: List of audio data (BytesIO buffers, tuples, or numpy arrays)
 
         Returns:
             Tuple of (
@@ -2290,9 +2291,8 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         # Normalize audio to numpy float32 arrays expected by processor.
-        # extract_images_from_messages produces BytesIO / file-path strings, but
-        # the processor's __call__ expects numpy arrays or (array, sample_rate)
-        # tuples. load_audio handles all three source types.
+        # Request-facing string paths are rejected before this point; remaining
+        # sources are inline buffers, arrays, or (array, sample_rate) tuples.
         if audio:
             if any(not isinstance(a, tuple) for a in audio):
                 from ..patches.mlx_audio_compat import (
