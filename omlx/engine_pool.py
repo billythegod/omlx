@@ -86,6 +86,7 @@ class EngineEntry:
     )
     source_type: str = "local"
     source_repo_id: str | None = None
+    is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -389,6 +390,7 @@ class EnginePool:
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
+                    is_helper=getattr(info, "is_helper", False),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -1831,6 +1833,7 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,

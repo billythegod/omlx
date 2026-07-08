@@ -2508,13 +2508,46 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
+
+        hide_helpers = bool(
+            _server_state.global_settings is not None
+            and _server_state.global_settings.model.hide_helper_models
+        )
+        # Set of draft-model references (paths / repo ids) pointed at by other
+        # models' speculative settings — used to flag "helper" drafters that
+        # only differ from a chat model by being referenced elsewhere.
+        referenced_drafts: set[str] = set()
+        if hide_helpers and settings_manager:
+            for _ms in settings_manager.get_all_settings().values():
+                for ref in (
+                    _ms.specprefill_draft_model,
+                    _ms.dflash_draft_model,
+                    _ms.vlm_mtp_draft_model,
+                ):
+                    if ref:
+                        referenced_drafts.add(ref)
+
         for m in status["models"]:
             model_id = m["id"]
             display_id = model_id
+            ms = None
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
                 if ms.model_alias:
                     display_id = ms.model_alias
+            # Per-model hide: user-selected, always applied.
+            if ms is not None and ms.is_hidden:
+                continue
+            # Global helper hide: skip drafters when the toggle is on. A model
+            # is a drafter if intrinsically flagged at discovery (config marker)
+            # or referenced as another model's draft.
+            if hide_helpers and (
+                m.get("is_helper")
+                or model_id in referenced_drafts
+                or m.get("model_path") in referenced_drafts
+                or (m.get("source_repo_id") in referenced_drafts)
+            ):
+                continue
             models.append(
                 ModelInfo(
                     id=display_id,

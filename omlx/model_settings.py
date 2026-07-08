@@ -214,6 +214,7 @@ class ModelSettings:
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository

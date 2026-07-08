@@ -17,8 +17,68 @@ from omlx.model_discovery import (
     discover_models_from_dirs,
     estimate_model_size,
     format_size,
+    is_helper_config_model_type,
+    is_helper_model_config,
     model_directory_access_error,
 )
+
+
+class TestIsHelperConfigModelType:
+    """Tests for helper (dFlash / Assistant / Draft) model_type detection."""
+
+    @pytest.mark.parametrize(
+        "config_model_type",
+        ["gemma4_assistant", "qwen3_5_mtp", "foo_mtp", "bar_assistant", "QWEN3_5_MTP"],
+    )
+    def test_helper_types(self, config_model_type):
+        assert is_helper_config_model_type(config_model_type) is True
+
+    @pytest.mark.parametrize(
+        "config_model_type",
+        ["qwen3", "gemma4_text", "gemma4", "llama", "qwen2_5_vl", "", None],
+    )
+    def test_non_helper_types(self, config_model_type):
+        assert is_helper_config_model_type(config_model_type) is False
+
+
+class TestIsHelperModelConfig:
+    """Tests for full-config drafter detection (model_type / architecture / config-block)."""
+
+    def test_dflash_draft_via_architecture(self):
+        # DFlash drafts declare a plain qwen3 model_type but a DFlashDraftModel arch.
+        config = {"model_type": "qwen3", "architectures": ["DFlashDraftModel"]}
+        assert is_helper_model_config(config) is True
+
+    def test_dflash_draft_via_config_block(self):
+        config = {"model_type": "qwen3", "dflash_config": {"block_size": 16}}
+        assert is_helper_model_config(config) is True
+
+    def test_assistant_via_model_type(self):
+        config = {
+            "model_type": "gemma4_assistant",
+            "architectures": ["Gemma4Assistant"],
+        }
+        assert is_helper_model_config(config) is True
+
+    def test_mtp_via_model_type(self):
+        config = {"model_type": "qwen3_5_mtp"}
+        assert is_helper_model_config(config) is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]},
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForConditionalGeneration"],
+            },
+            {"model_type": "llama"},
+            {},
+            {"architectures": None},
+        ],
+    )
+    def test_non_helper_configs(self, config):
+        assert is_helper_model_config(config) is False
 
 
 class TestDetectModelType:
