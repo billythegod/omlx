@@ -13,6 +13,9 @@ macOS 27 betas broke `brew install omlx` in several ways (issue #2110):
   Python instead of the formula's venv when building custom kernels.
 - The custom-kernel verification ran from the build directory, where the
   raw omlx/ source tree shadows the installed package.
+- Later pip steps (mlx-audio, python-multipart) ran without --no-binary,
+  so a prebuilt wheel could clobber a source-built package, and pip's
+  wheel cache could resurrect a dylib built before the strip guards.
 
 The formula is Ruby, so these are text-level assertions that the guards
 stay present in Formula/omlx.rb.
@@ -52,6 +55,29 @@ class TestMacOS27Workarounds:
         """Homebrew's clean pass also runs strip over the venv's dylibs."""
         assert "on_macos do" in formula
         assert f'skip_clean "libexec" if {MACOS_27_GUARD}' in formula
+
+    def test_pip_cache_bypassed_on_macos_27(self, formula):
+        """Pip reuses locally built wheels even under --no-binary, so a
+        wheel cached before the strip guards existed stays corrupted."""
+        assert 'pip_flags << "--no-cache-dir"' in formula
+
+
+class TestSharedPipFlags:
+    def test_shared_pip_install_array(self, formula):
+        """All pip steps must share the --no-binary/--no-cache-dir flags."""
+        assert (
+            'pip_install = [libexec/"bin/pip", "install", *pip_flags,'
+            ' "--no-binary", no_binary]' in formula
+        )
+        assert "system(*pip_install, install_spec)" in formula
+        assert 'system(*pip_install, ".[all]")' in formula
+        assert 'system(*pip_install, "python-multipart>=0.0.5")' in formula
+
+    def test_no_bare_pip_install_besides_spacy_wheel(self, formula):
+        """The only direct pip invocation is the --no-deps local spaCy model
+        wheel; any new bare `pip install` would bypass the shared flags."""
+        assert formula.count('bin/pip", "install"') == 2
+        assert 'system libexec/"bin/pip", "install", "--no-deps"' in formula
 
 
 class TestCustomKernelBuild:

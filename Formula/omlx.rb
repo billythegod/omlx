@@ -60,6 +60,7 @@ class Omlx < Formula
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
     no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
+    pip_flags = []
     if MacOS.version >= "27"
       # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
       # 8-byte boundary; prebuilt Rust wheels aligned to 4 bytes fail dlopen
@@ -69,7 +70,16 @@ class Omlx < Formula
       no_binary += ",tokenizers"
       ENV["CARGO_PROFILE_RELEASE_STRIP"] = "false"
       ENV["MATURIN_STRIP"] = "false"
+      # Pip reuses locally built wheels even under --no-binary, so a wheel
+      # cached before the strip guards existed stays corrupted. Bypass the
+      # cache entirely.
+      pip_flags << "--no-cache-dir"
     end
+
+    # Every pip step must share these flags; a later step without --no-binary
+    # (e.g. mlx-audio) can clobber a source-built package with a prebuilt
+    # wheel that fails dlopen on macOS 27 (#2110).
+    pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
       kernel_sources = [
@@ -89,9 +99,7 @@ class Omlx < Formula
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
-    system libexec/"bin/pip", "install",
-           "--no-binary", no_binary,
-           install_spec
+    system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
       # Run from libexec so buildpath's raw omlx/ source tree doesn't shadow
@@ -109,7 +117,7 @@ class Omlx < Formula
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
-      system libexec/"bin/pip", "install", ".[all]"
+      system(*pip_install, ".[all]")
     end
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
@@ -123,7 +131,7 @@ class Omlx < Formula
            "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
-    system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
+    system(*pip_install, "python-multipart>=0.0.5")
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
