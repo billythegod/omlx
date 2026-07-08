@@ -1106,6 +1106,44 @@ def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
 
 
+class _BoundaryStoreUnavailable(Exception):
+    """No boundary-aligned snapshot exists for non-sliceable cache state.
+
+    Raised inside the final-response store path when the model needs
+    boundary snapshots but none were captured (e.g. every capture was
+    skipped by the speculative-decode skew guard). Storing the live
+    state instead would label off-boundary recurrent/rotating state
+    with a block-boundary token count and corrupt later prefix hits;
+    the handler skips the store and releases the block references.
+    """
+
+
+def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
+    """First integer ``offset`` found walking into composite caches.
+
+    CacheList-style wrappers (DeepSeek-V4 / GLM per-layer caches) expose
+    no ``offset`` themselves — the token position lives on their leading
+    sub-cache (RotatingKVCache / KVCache, whose ``offset`` counts
+    forwarded tokens). Walk depth-first so that leading leaf decides;
+    later sub-caches may count something else entirely (PoolingCache's
+    ``offset`` is the pooled-window count).
+    """
+    subs = getattr(cache_obj, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        for sub in subs:
+            offset = _first_leaf_cache_offset(sub)
+            if offset is not None:
+                return offset
+        return None
+    offset = getattr(cache_obj, "offset", None)
+    if offset is None:
+        return None
+    try:
+        return int(offset)
+    except Exception:
+        return None
+
+
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     """Return True if any layer cache is non-sliceable (needs snapshots).
 
@@ -4954,16 +4992,33 @@ class Scheduler:
             self._boundary_snapshot_required = False
             return False
 
-        self._boundary_snapshot_required = any(
-            self._cache_tree_has_stateful_non_sliceable(layer_cache)
-            for layer_cache in cache_list
-        )
+        try:
+            self._boundary_snapshot_required = any(
+                self._cache_tree_has_stateful_non_sliceable(layer_cache)
+                for layer_cache in cache_list
+            )
+        except TypeError:
+            # make_cache() returned something non-iterable (stub models in
+            # tests); treat as not snapshot-needing.
+            self._boundary_snapshot_required = False
+            return False
 
         if self._boundary_snapshot_required:
             logger.info(
                 "Enabled boundary cache snapshots for stateful non-sliceable "
                 "cache layers"
             )
+            # Ask the speculative (MTP) decode path to land its commits on
+            # block boundaries: its emit queue otherwise leaves the cache a
+            # few tokens ahead of the emitted count when a boundary token
+            # surfaces, which forces the consistency guard in
+            # _extract_boundary_snapshot to skip most captures.
+            block = int(self.config.paged_cache_block_size or 0)
+            if block > 0:
+                try:
+                    self.model._omlx_mtp_commit_align = block
+                except Exception:
+                    pass
         else:
             logger.debug(
                 "Boundary cache snapshots disabled (no stateful non-sliceable "
@@ -4972,11 +5027,24 @@ class Scheduler:
 
         return self._boundary_snapshot_required
 
-    def _extract_boundary_snapshot(self, uid: int) -> list[Any] | None:
+    def _extract_boundary_snapshot(
+        self, uid: int, expected_tokens: int | None = None
+    ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
         Uses BatchGenerator.extract_cache() which returns
         Dict[uid, (cache_list, tokens_list)].
+
+        ``expected_tokens`` guards positional consistency: a snapshot labeled
+        "state at N tokens" must be extracted while the cache holds exactly N
+        forwarded tokens. The standard decode step always satisfies this at
+        emit time, but speculative (MTP) decode advances the cache in bursts
+        and emits from a queue, so the cache can be a few tokens ahead of —
+        or one behind — the emitted count when the boundary token surfaces.
+        A skewed snapshot would pair block-aligned KV with recurrent (SSM)
+        state from a different position and corrupt later prefix-cache hits
+        on hybrid models; skipping the capture merely costs a reuse
+        opportunity.
         """
         if self.batch_generator is None:
             return None
@@ -4992,6 +5060,26 @@ class Scheduler:
                     if uid not in result:
                         return None
                     cache_list, _tokens = result[uid]
+                    if expected_tokens is not None:
+                        # Walk into CacheList wrappers: DeepSeek-V4/GLM layer
+                        # caches carry their token offset on a sub-cache, and
+                        # checking only the wrapper would silently pass a
+                        # skewed capture through.
+                        for c in cache_list:
+                            offset = _first_leaf_cache_offset(c)
+                            if offset is None:
+                                continue
+                            if offset != expected_tokens:
+                                logger.debug(
+                                    "Skipping boundary snapshot for uid=%s: "
+                                    "cache offset %d != boundary %d "
+                                    "(speculative decode skew)",
+                                    uid,
+                                    offset,
+                                    expected_tokens,
+                                )
+                                return None
+                            break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
                     return [
@@ -5024,7 +5112,9 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
-        snapshot_cache = self._extract_boundary_snapshot(uid)
+        snapshot_cache = self._extract_boundary_snapshot(
+            uid, expected_tokens=total_tokens
+        )
         if not snapshot_cache:
             return
 
@@ -8900,6 +8990,17 @@ class Scheduler:
                                                 cacheable_sequence,
                                             )
                                         )
+                                        if (
+                                            boundary_override is None
+                                            and self._detect_boundary_snapshot_need()
+                                        ):
+                                            # Non-sliceable cache state is only
+                                            # storable from boundary-aligned
+                                            # snapshots; the live state sits at
+                                            # the current decode offset (which
+                                            # speculative decode can leave off
+                                            # the emitted count entirely).
+                                            raise _BoundaryStoreUnavailable()
                                         if boundary_override is not None:
                                             (
                                                 token_sequence_to_store,
@@ -9052,6 +9153,25 @@ class Scheduler:
                                 f"{len(request.prompt_token_ids)} prompt + "
                                 f"{len(request.output_token_ids)} output)"
                             )
+                        except _BoundaryStoreUnavailable:
+                            logger.debug(
+                                "Skipping cache store for %s: no boundary-aligned "
+                                "snapshot for non-sliceable cache state (all "
+                                "captures skipped, e.g. by the speculative-decode "
+                                "skew guard); storing live state would corrupt "
+                                "later prefix hits",
+                                request_id,
+                            )
+                            block_table = None
+                            if self.paged_cache_manager:
+                                block_table = self.paged_cache_manager.get_block_table(
+                                    request_id
+                                )
+                            if block_table and self.paged_cache_manager:
+                                self.paged_cache_manager.release_for_eviction(
+                                    block_table.block_ids
+                                )
+                            self.block_aware_cache.clear_request_entry(request_id)
                         except Exception as e:
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
