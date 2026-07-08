@@ -9997,6 +9997,11 @@ class Scheduler:
         self.tokenizer = None
 
         # Release all cache-related references for GC
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
         self.paged_cache_manager = None
         self.block_aware_cache = None
         self.memory_monitor = None
@@ -10055,6 +10060,16 @@ class Scheduler:
             self._inflight_store_info.clear()
             self._cache_freshness_waits.clear()
             self._prefix_cache_prepared.clear()
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_all()
+            except Exception as e:
+                logger.warning("Boundary snapshot store cleanup error: %s", e)
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
+            self._boundary_snapshot_store = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None

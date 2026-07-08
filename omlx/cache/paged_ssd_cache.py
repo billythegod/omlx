@@ -1683,6 +1683,7 @@ class PagedSSDCacheManager(CacheManager):
         standard file I/O operations.
         """
         while True:
+            item = None
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
@@ -1695,12 +1696,18 @@ class PagedSSDCacheManager(CacheManager):
                 break
 
             block_hash, tensors_raw, metadata, file_path = item
-            self._write_block_file(
-                block_hash, tensors_raw, metadata, file_path, source="background"
-            )
-            self._clear_pending_write(
-                block_hash, remove_hot_cache=not self._hot_cache_enabled
-            )
+            try:
+                self._write_block_file(
+                    block_hash, tensors_raw, metadata, file_path, source="background"
+                )
+                self._clear_pending_write(
+                    block_hash, remove_hot_cache=not self._hot_cache_enabled
+                )
+            finally:
+                # Avoid pinning the last raw tensor-byte batch while the
+                # writer thread blocks waiting for more work.
+                item = None
+                block_hash = tensors_raw = metadata = file_path = None
 
     def save_block(
         self,

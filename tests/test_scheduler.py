@@ -1459,6 +1459,38 @@ class TestSchedulerReset:
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
         fake_executor.shutdown.assert_called_once_with(wait=False)
 
+    def test_shutdown_closes_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """shutdown() must stop the boundary snapshot writer thread.
+
+        cleanup_all() only clears the store contents. If shutdown() is skipped,
+        the writer thread can keep its last raw tensor-byte queue item alive.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        scheduler.shutdown()
+
+        store.cleanup_all.assert_called_once_with()
+        store.shutdown.assert_called_once_with()
+        assert scheduler._boundary_snapshot_store is None
+
+    def test_deep_reset_closes_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """deep_reset() destroys the scheduler and must stop snapshot writers."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        scheduler.deep_reset()
+
+        store.cleanup_all.assert_called_once_with()
+        store.shutdown.assert_called_once_with()
+        assert scheduler._boundary_snapshot_store is None
+
     def test_shutdown_fatal_exits_when_store_cache_worker_times_out(
         self, mock_model, mock_tokenizer
     ):
