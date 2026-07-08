@@ -1361,6 +1361,34 @@ class TestEnginePoolEviction:
         assert pool.loaded_model_count == 1
 
     @pytest.mark.asyncio
+    async def test_high_footprint_without_eviction_still_blocks_first_load(
+        self, small_mock_model_dir
+    ):
+        """Do not discount phys_footprint unless this admission evicted a model.
+
+        A high footprint with no evicted victim may be unrelated process pressure,
+        not reclaimable model residue. The committed-baseline retry must not let
+        the first model load past the process memory ceiling.
+        """
+        pool = _make_pool(ceiling=2500)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine) as cls,
+            patch("omlx.engine_pool.get_phys_footprint", return_value=2000),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+        ):
+            with pytest.raises(InsufficientMemoryError) as exc_info:
+                await pool.get_engine("model-a")
+
+        assert exc_info.value.current == 2000
+        cls.assert_not_called()
+        assert pool.loaded_model_count == 0
+
+    @pytest.mark.asyncio
     async def test_insufficient_memory_all_pinned(self, tight_memory_pool):
         """Test InsufficientMemoryError when all models are pinned."""
         pool = tight_memory_pool
