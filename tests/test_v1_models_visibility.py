@@ -75,6 +75,20 @@ def test_per_model_hidden_excluded(tmp_path):
     assert "chat-b" not in ids
 
 
+def test_hidden_source_profile_excluded(tmp_path):
+    state = _state([_model("chat-a")], tmp_path)
+    state.settings_manager.set_settings("chat-a", ModelSettings(is_hidden=True))
+    state.settings_manager.save_profile(
+        "chat-a",
+        "fast",
+        "Fast",
+        None,
+        {"temperature": 0.1},
+        expose_as_model=True,
+    )
+    assert _list_ids(state) == []
+
+
 def test_hidden_ignored_when_helper_toggle_off(tmp_path):
     # A drafter is visible while the global toggle is off.
     models = [_model("chat-a"), _model("drafter", is_helper=True)]
@@ -88,6 +102,20 @@ def test_global_hide_helper_excludes_intrinsic_flag(tmp_path):
     state = _state(models, tmp_path, hide_helpers=True)
     ids = _list_ids(state)
     assert ids == ["chat-a"]
+
+
+def test_global_hide_helper_excludes_helper_source_profile(tmp_path):
+    models = [_model("chat-a"), _model("drafter", is_helper=True)]
+    state = _state(models, tmp_path, hide_helpers=True)
+    state.settings_manager.save_profile(
+        "drafter",
+        "fast",
+        "Fast",
+        None,
+        {"temperature": 0.1},
+        expose_as_model=True,
+    )
+    assert _list_ids(state) == ["chat-a"]
 
 
 def test_global_hide_helper_excludes_referenced_draft(tmp_path):

@@ -2527,6 +2527,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     if ref:
                         referenced_drafts.add(ref)
 
+        excluded_model_ids: set[str] = set()
         for m in status["models"]:
             model_id = m["id"]
             display_id = model_id
@@ -2536,17 +2537,18 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 if ms.model_alias:
                     display_id = ms.model_alias
             # Per-model hide: user-selected, always applied.
-            if ms is not None and ms.is_hidden:
-                continue
+            is_hidden = ms is not None and ms.is_hidden
             # Global helper hide: skip drafters when the toggle is on. A model
             # is a drafter if intrinsically flagged at discovery (config marker)
             # or referenced as another model's draft.
-            if hide_helpers and (
+            is_hidden_helper = hide_helpers and (
                 m.get("is_helper")
                 or model_id in referenced_drafts
                 or m.get("model_path") in referenced_drafts
                 or (m.get("source_repo_id") in referenced_drafts)
-            ):
+            )
+            if is_hidden or is_hidden_helper:
+                excluded_model_ids.add(model_id)
                 continue
             models.append(
                 ModelInfo(
@@ -2563,6 +2565,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 profile_model_id = profile["model_id"]
                 if (
                     source_model_id not in physical_ids
+                    or source_model_id in excluded_model_ids
                     or profile_model_id in existing_ids
                 ):
                     continue
