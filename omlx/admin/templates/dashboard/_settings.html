@@ -1135,11 +1135,13 @@
                                                   x-text="model.settings?.model_alias"></span>
                                             <span x-show="model.is_helper" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
-                                                  :title="window.t('settings.models.table.helper_tooltip')"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
+                                                  @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
                                             <span x-show="model.is_hidden" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
-                                                  :title="window.t('settings.models.table.hidden_tooltip')"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
+                                                  @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
@@ -1211,6 +1213,10 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
+                                                    @mouseenter="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
@@ -1230,8 +1236,11 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_hidden', !model.is_hidden)"
+                                                    @mouseenter="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
-                                                    :title="!model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip')"
                                                     class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
@@ -1250,6 +1259,10 @@
                                             <template x-if="!model.virtual && (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type)">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.is_default
                                                         ? 'bg-black border-black'
                                                         : 'bg-white border-neutral-300 hover:border-neutral-400'"
