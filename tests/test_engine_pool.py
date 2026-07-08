@@ -2557,9 +2557,9 @@ class TestFailedLoadReclaim:
         with (
             patch("omlx.engine_pool.BatchedEngine", return_value=failing_engine),
             patch.object(pool, "_schedule_failed_load_reclaim") as scheduled,
+            pytest.raises(ModelUnavailableError),
         ):
-            with pytest.raises(Exception):
-                await pool._load_engine("model-a")
+            await pool._load_engine("model-a")
 
         scheduled.assert_called_once()
         args = scheduled.call_args[0]
