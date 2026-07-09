@@ -4758,6 +4758,22 @@ def _load_calibration_data(
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
+    if dataset == _OQE_CALIB_DATASET:
+        # oQe (enhanced=True) requests this built-in corpus by name. If the data
+        # file is not present in the installed package, the generic handler below
+        # would swallow the error and silently calibrate the imatrix on a smaller,
+        # different corpus, producing a subtly worse enhanced model with no signal
+        # to the caller. Fail loudly instead: a missing built-in data file is a
+        # broken installation the user cannot fix by retrying. See package-data in
+        # pyproject.toml, which must ship oqe_calibration_data.json.
+        oqe_path = Path(__file__).parent / "oqe_calibration_data.json"
+        if not oqe_path.exists():
+            raise FileNotFoundError(
+                f"oQe calibration corpus not found at {oqe_path}. This file ships "
+                "with omlx but is missing from the current installation, so "
+                "enhanced quantization cannot calibrate correctly. Reinstall omlx "
+                "from a distribution that includes oqe_calibration_data.json."
+            )
     if dataset in ("code_multilingual", "code", "multilingual", _OQE_CALIB_DATASET):
         try:
             return _load_builtin_calibration(
