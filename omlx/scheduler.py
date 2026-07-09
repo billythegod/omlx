@@ -7415,6 +7415,20 @@ class Scheduler:
             _sync_and_clear_cache(self._stream)
         except Exception as e:
             logger.warning(f"Metal cache clear failed during error recovery: {e}")
+        # Requests failed mid-prefill leave PrefillProgressTracker entries
+        # behind (auto-removal only fires at processed >= total). The local
+        # RuntimeError handlers in the prefill paths cover the common memory
+        # errors (#1405), but any other exception type bubbles up here and
+        # would leak a phantom "PP" row on the dashboard.
+        tracker = get_prefill_tracker()
+        for rid in failed_ids:
+            tracker.remove(rid)
+        # Republish the admin snapshot now that the queues are empty. The
+        # snapshot is normally published at the end of a successful step();
+        # when step() raises, the last published snapshot still lists the
+        # failed requests, so the dashboard and the macOS app keep showing
+        # them as "generating" until the next successful step (#2126).
+        self._publish_admin_snapshot()
         return failed_ids
 
     def get_num_waiting(self) -> int:

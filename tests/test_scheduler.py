@@ -3229,6 +3229,52 @@ class TestCacheCorruptionRecovery:
         for rid in failed_ids:
             assert rid not in scheduler.requests
 
+    def test_fail_all_requests_republishes_admin_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests must publish a fresh (empty) admin snapshot.
+
+        The snapshot is normally published at the end of a successful step().
+        When step() raises and fail_all_requests() clears the queues, the
+        stale snapshot would keep listing the dead requests, so the dashboard
+        and the macOS app show them as "generating" forever (#2126).
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # Simulate the last successful step publishing the running requests.
+        scheduler._publish_admin_snapshot()
+        assert len(scheduler.snapshot_for_admin()["running_by_id"]) == 3
+
+        scheduler.fail_all_requests()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {}
+        assert snap["waiting"] == []
+
+    def test_fail_all_requests_removes_prefill_tracker_entries(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests must drop PrefillProgressTracker entries.
+
+        A request failed mid-prefill never reaches processed >= total, so its
+        tracker entry has no auto-removal path. The local RuntimeError
+        handlers in the prefill paths cover memory errors (#1405), but other
+        exception types bubble up to fail_all_requests and would leave a
+        phantom "PP" row on the dashboard forever (#2126).
+        """
+        from omlx.prefill_progress import get_prefill_tracker
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        tracker = get_prefill_tracker()
+        tracker.clear()
+        tracker.update("req-0", processed=10, total=100, model_id="test")
+        assert tracker.get_model_progress("test"), "tracker entry not set up"
+
+        try:
+            scheduler.fail_all_requests()
+            assert tracker.get_model_progress("test") == []
+        finally:
+            tracker.clear()
+
     def test_fail_all_requests_preserves_cache(self, mock_model, mock_tokenizer):
         """fail_all_requests resets batch_generator but preserves block cache."""
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
