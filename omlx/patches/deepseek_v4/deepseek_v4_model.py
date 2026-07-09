@@ -1234,6 +1234,19 @@ class Model(nn.Module):
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
+            skip = False
+            for old, new in (
+                (".hc_attn.", ".attn_hc."),
+                (".hc_ffn.", ".ffn_hc."),
+            ):
+                if old in nk:
+                    candidate = nk.replace(old, new)
+                    if candidate in weights or candidate in remapped:
+                        skip = True
+                        break
+                    nk = candidate
+            if skip:
+                continue
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             remapped[nk] = v
