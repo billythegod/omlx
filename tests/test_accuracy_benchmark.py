@@ -318,3 +318,14 @@ class TestSamplingProfile:
         sampling_kwargs = await self._captured_sampling_kwargs(req, mock_pool)
         assert sampling_kwargs["temperature"] == 0.9
         assert sampling_kwargs["top_p"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_deterministic_keeps_chat_template_kwargs(self):
+        # Template kwargs are prompt construction, not sampling — forwarded
+        # even under the deterministic profile.
+        req = AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 1})
+        mock_pool = self._mock_pool(
+            ModelSettings(temperature=0.9, chat_template_kwargs={"custom_flag": True})
+        )
+        sampling_kwargs = await self._captured_sampling_kwargs(req, mock_pool)
+        assert sampling_kwargs == {"chat_template_kwargs": {"custom_flag": True}}
