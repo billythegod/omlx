@@ -252,6 +252,12 @@ _clean_custom_kernel_build_artifacts() {
     fi
 }
 
+_sdk_supports_nax() {
+    local sdk_version
+    sdk_version="$(xcrun -sdk macosx --show-sdk-version 2>/dev/null)" || return 1
+    [ "$(printf '%s\n26.2\n' "$sdk_version" | sort -V | head -1)" = "26.2" ]
+}
+
 _custom_kernel_minos() {
     otool -l "$1" 2>/dev/null | awk '
         /LC_BUILD_VERSION/ { in_build = 1 }
@@ -372,6 +378,16 @@ _build_custom_kernels() {
         || die "custom kernel build finished but MiniMax M3 metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
         || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
+    # The NAX (M5 tensor unit) metallib is SDK-gated in cmake, not
+    # deployment-gated: any build on SDK 26.2+ must produce it. A silent
+    # omission would ship DMGs whose M5 qmm quietly falls back to the
+    # classic kernels (same failure shape as issue #2137).
+    if _sdk_supports_nax; then
+        [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels_nax.metallib" ] \
+            || die "custom kernel build finished but the Qwen3.5 NAX metallib is missing despite SDK $(xcrun -sdk macosx --show-sdk-version) supporting it; see the cmake output."
+    else
+        warn "macOS SDK < 26.2: building without the Qwen3.5 NAX metallib; M5 GPUs will use the classic kernels."
+    fi
     _validate_custom_kernel_deployment_target "$deployment_target"
     _check_custom_kernel_abi "$custom_kernel_pythonpath"
     ok "  + custom kernels ($deployment_target)"

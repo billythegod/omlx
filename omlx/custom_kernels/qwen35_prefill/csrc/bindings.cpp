@@ -22,6 +22,16 @@ NB_MODULE(_ext, m) {
       "a"_a);
 
   m.def(
+      "is_nax_available",
+      &omlx::qwen35_prefill_kernels::is_nax_available);
+  m.def(
+      "nax_qmm_kernels_built",
+      &omlx::qwen35_prefill_kernels::nax_qmm_kernels_built);
+  m.def(
+      "nax_qmm_runtime_active",
+      &omlx::qwen35_prefill_kernels::nax_qmm_runtime_active);
+
+  m.def(
       "qwen35_fa256_attention",
       &omlx::qwen35_prefill_kernels::qwen35_fa256_attention,
       "q"_a,
@@ -40,6 +50,8 @@ NB_MODULE(_ext, m) {
       "scales"_a,
       "biases"_a,
       "variant"_a = 8,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q5_affine_qmm_t",
@@ -49,6 +61,8 @@ NB_MODULE(_ext, m) {
       "scales"_a,
       "biases"_a,
       "variant"_a = 8,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q6_affine_qmm_t",
@@ -58,6 +72,8 @@ NB_MODULE(_ext, m) {
       "scales"_a,
       "biases"_a,
       "variant"_a = 8,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_q8_affine_qmm_t",
@@ -67,6 +83,8 @@ NB_MODULE(_ext, m) {
       "scales"_a,
       "biases"_a,
       "variant"_a = 8,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "qwen35_moe_weighted_sum",

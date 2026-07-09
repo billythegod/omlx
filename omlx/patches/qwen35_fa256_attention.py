@@ -21,6 +21,8 @@ import sys
 
 import mlx.core as mx
 
+from omlx.custom_kernels.nax import is_nax_available
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -86,7 +88,19 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("OMLX_FA256_STEEL", "1") == "0":
+    steel_env = os.environ.get("OMLX_FA256_STEEL", "").strip()
+    if steel_env == "0":
+        return False
+    if steel_env != "1" and is_nax_available():
+        # Auto: on NAX GPUs (M5 family) stock SDPA's head_dim-256 fallback
+        # runs its matmuls on the tensor units and beats this pre-NAX steel
+        # kernel, so routing it would regress prefill (M5 Max report:
+        # 4k pp 828 -> 400 tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the
+        # kernel on for benchmarking; a NAX port of this kernel is the
+        # tracked follow-up.
+        logger.info(
+            "Qwen FA-256 steel patch skipped: NAX GPU, stock SDPA is faster"
+        )
         return False
 
     kernel = _native_kernel()

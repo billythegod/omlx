@@ -1293,3 +1293,63 @@ class TestPoolingCacheTrimRollback:
         # in the remainder buffer and no pooled row remains visible.
         assert cache.remainder == 3
         assert cache.size() == 0
+
+
+class TestNaxMoEStockRouting:
+    """NAX GPUs route prefill-sized MoE gemms to stock mx.gather_qmm."""
+
+    @pytest.fixture(autouse=True)
+    def _nax_off_by_default(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        # Pin detection off so the block-kernel tests behave identically on
+        # M5-family machines; each test overrides what it needs.
+        monkeypatch.setattr(sl, "is_nax_available", lambda: False)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "")
+        yield
+
+    def test_prefers_stock_for_prefill_route_counts_only(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        assert not sl._nax_prefers_stock(8)
+        assert not sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES - 1)
+        assert sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES)
+        assert sl._nax_prefers_stock(1 << 20)
+
+    def test_no_stock_routing_without_nax(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_kill_switch_keeps_block_kernels(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "0")
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_force_routes_everything(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "1")
+        assert sl._nax_prefers_stock(1)
+
+    def test_native_block_kind_short_circuits_on_nax_prefill(self, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        linear = sl.QuantizedSwitchLinear(
+            64, 64, num_experts=2, bias=False, group_size=64, bits=4
+        )
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: n >= 1024)
+        prefill_x = mx.zeros((2048, 1, 64), dtype=mx.bfloat16)
+        assert linear._native_block_kind(prefill_x, True) is None
+        # Decode-sized calls fall through to the regular block-kernel gates:
+        # the NAX gate must not change what they resolve to.
+        decode_x = mx.zeros((8, 1, 64), dtype=mx.bfloat16)
+        gated = linear._native_block_kind(decode_x, True)
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: False)
+        assert gated == linear._native_block_kind(decode_x, True)
