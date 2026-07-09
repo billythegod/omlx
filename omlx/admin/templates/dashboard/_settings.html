@@ -1124,9 +1124,23 @@
                                     <div class="flex items-center gap-4 px-6 py-4">
                                         <!-- Model Name -->
                                         <div class="flex-1 min-w-0 flex items-center gap-3">
-                                            <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
-                                                <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
-                                            </div>
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @blur="hideTip()"
+                                                    :class="model.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600'"
+                                                    class="hidden sm:flex w-8 h-8 items-center justify-center flex-shrink-0 rounded-lg hover:bg-neutral-100 transition-colors focus:outline-none">
+                                                    <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="model.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <div class="hidden sm:flex w-8 h-8 bg-neutral-100 rounded-lg items-center justify-center flex-shrink-0">
+                                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                                </div>
+                                            </template>
                                             <p class="text-sm font-medium text-neutral-900 break-all sm:truncate"
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>

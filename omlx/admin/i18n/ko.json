@@ -471,6 +471,8 @@
   "settings.models.table.hidden_tooltip": "/v1/models API에서 숨김",
   "settings.models.table.visible_on_tooltip": "/v1/models에 나열됨 — 클릭하여 숨기기",
   "settings.models.table.visible_off_tooltip": "/v1/models에서 숨김 — 클릭하여 나열",
+  "settings.models.table.favorite_on_tooltip": "Favorite — listed first in model lists; click to remove",
+  "settings.models.table.favorite_off_tooltip": "Add to favorites — listed first in model lists",
   "settings.models.table.status_loading": "로딩 중",
   "settings.models.table.status_loaded": "로드됨",
   "settings.models.table.status_unload": "언로드",

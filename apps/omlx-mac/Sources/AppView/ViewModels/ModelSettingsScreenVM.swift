@@ -30,7 +30,7 @@ final class ModelSettingsScreenVM {
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
-        case forceSampling, isPinned
+        case forceSampling, isPinned, isFavorite
         case trustRemoteCode
         case reasoningParser
         case chatTemplateKwargs
@@ -238,6 +238,7 @@ final class ModelSettingsScreenVM {
     var toolResultLimitTokens: String = "4096"
     var forceSampling: Bool = false
     var isPinned: Bool = false
+    var isFavorite: Bool = false
 
     // Security
     var trustRemoteCode: Bool = false
@@ -366,7 +367,7 @@ final class ModelSettingsScreenVM {
             return true
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
-        case .temperature, .ttl, .isPinned, .trustRemoteCode:
+        case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
             return false
         case .chatTemplateKwargs:
             return false
@@ -444,6 +445,7 @@ final class ModelSettingsScreenVM {
                     }
                     self.forceSampling = s.forceSampling ?? false
                     self.isPinned = s.isPinned ?? false
+                    self.isFavorite = s.isFavorite ?? false
                     self.trustRemoteCode = s.trustRemoteCode ?? false
                     self.reasoningParser = s.reasoningParser ?? ""
                     self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
@@ -575,6 +577,7 @@ final class ModelSettingsScreenVM {
             patch.maxToolResultTokens = n
         case .forceSampling:           patch.forceSampling = forceSampling
         case .isPinned:                patch.isPinned = isPinned
+        case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser

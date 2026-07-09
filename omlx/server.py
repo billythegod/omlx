@@ -2485,6 +2485,7 @@ async def _create_markitdown_chat_completion(
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
+    favorite_ids: set[str] = set()
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
@@ -2531,6 +2532,8 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             if is_hidden or is_hidden_helper:
                 excluded_model_ids.add(model_id)
                 continue
+            if ms is not None and ms.is_favorite:
+                favorite_ids.add(display_id)
             models.append(
                 ModelInfo(
                     id=display_id,
@@ -2563,6 +2566,10 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         m.id == MARKITDOWN_MODEL_ID for m in models
     ):
         models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
+
+    # Favorites first; stable sort keeps alphabetical order within groups.
+    if favorite_ids:
+        models.sort(key=lambda m: m.id not in favorite_ids)
 
     return ModelsResponse(data=models)
 

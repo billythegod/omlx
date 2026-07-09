@@ -110,7 +110,7 @@
                                         {{ t('models.manager.table.type') }}
                                         <span x-show="managerSortBy === 'type'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                                     </div>
-                                    <div class="w-24 text-right sm:text-center flex items-center justify-end sm:justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
+                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
                                         {{ t('models.manager.table.size') }}
                                         <span x-show="managerSortBy === 'size'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                                     </div>
@@ -125,6 +125,18 @@
                                         <div class="flex items-center gap-4 px-4 sm:px-6 py-3 hover:bg-neutral-50 transition-colors">
                                             <!-- Name -->
                                             <div class="min-w-0 flex-1 flex items-center gap-2">
+                                                <template x-if="managerModelInfo(model.name)">
+                                                    <button
+                                                        @click.stop="updateModelSetting(model.name, 'is_favorite', !managerModelInfo(model.name)?.is_favorite)"
+                                                        @mouseenter="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                        @mouseleave="hideTip()"
+                                                        @focus="showTip($event.currentTarget, managerModelInfo(model.name)?.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                        @blur="hideTip()"
+                                                        :class="managerModelInfo(model.name)?.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                        class="hidden sm:flex p-1 rounded-md flex-shrink-0 transition-all">
+                                                        <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="managerModelInfo(model.name)?.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                    </button>
+                                                </template>
                                                 <span class="text-sm font-medium text-neutral-900 truncate"
                                                       :title="model.display_name || model.name"
                                                       x-text="model.display_name || model.name"></span>
@@ -147,7 +159,7 @@
                                                       x-text="managerModelInfo(model.name)?.model_type || 'llm'"></span>
                                             </div>
                                             <!-- Size -->
-                                            <div class="w-24 text-right sm:text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
+                                            <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
                                             <!-- Actions -->
                                             <div class="flex items-center justify-end gap-1 shrink-0">
                                                 <template x-if="managerModelInfo(model.name)">

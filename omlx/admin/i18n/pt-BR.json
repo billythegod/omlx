@@ -471,6 +471,8 @@
   "settings.models.table.hidden_tooltip": "Oculto da API /v1/models",
   "settings.models.table.visible_on_tooltip": "Listado em /v1/models — clique para ocultar",
   "settings.models.table.visible_off_tooltip": "Oculto de /v1/models — clique para listar",
+  "settings.models.table.favorite_on_tooltip": "Favorite — listed first in model lists; click to remove",
+  "settings.models.table.favorite_off_tooltip": "Add to favorites — listed first in model lists",
   "settings.models.table.status_loading": "Carregando",
   "settings.models.table.status_loaded": "Carregado",
   "settings.models.table.status_unload": "Descarregar",

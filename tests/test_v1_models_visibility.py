@@ -138,3 +138,38 @@ def test_referenced_parent_stays_visible(tmp_path):
         "chat-a", ModelSettings(vlm_mtp_draft_model="/models/draft-llm")
     )
     assert "chat-a" in _list_ids(state)
+
+
+def test_favorites_listed_first(tmp_path):
+    models = [_model("chat-a"), _model("chat-b"), _model("chat-c")]
+    state = _state(models, tmp_path)
+    state.settings_manager.set_settings("chat-c", ModelSettings(is_favorite=True))
+    assert _list_ids(state) == ["chat-c", "chat-a", "chat-b"]
+
+
+def test_favorites_alphabetical_within_groups(tmp_path):
+    models = [_model("chat-a"), _model("chat-b"), _model("chat-c"), _model("chat-d")]
+    state = _state(models, tmp_path)
+    state.settings_manager.set_settings("chat-b", ModelSettings(is_favorite=True))
+    state.settings_manager.set_settings("chat-d", ModelSettings(is_favorite=True))
+    assert _list_ids(state) == ["chat-b", "chat-d", "chat-a", "chat-c"]
+
+
+def test_favorite_alias_listed_first(tmp_path):
+    # The favorite set must track display ids, since an alias replaces the id.
+    models = [_model("chat-a"), _model("chat-b")]
+    state = _state(models, tmp_path)
+    state.settings_manager.set_settings(
+        "chat-b", ModelSettings(is_favorite=True, model_alias="zz-alias")
+    )
+    assert _list_ids(state) == ["zz-alias", "chat-a"]
+
+
+def test_hidden_favorite_still_excluded(tmp_path):
+    # Favorite is ordering-only and never overrides the hidden filter.
+    models = [_model("chat-a"), _model("chat-b")]
+    state = _state(models, tmp_path)
+    state.settings_manager.set_settings(
+        "chat-b", ModelSettings(is_hidden=True, is_favorite=True)
+    )
+    assert _list_ids(state) == ["chat-a"]

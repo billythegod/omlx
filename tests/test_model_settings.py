@@ -25,6 +25,7 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
@@ -35,6 +36,14 @@ class TestModelSettings:
         assert d["trust_remote_code"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
+
+    def test_is_favorite_roundtrip(self):
+        """Test is_favorite field survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(is_favorite=True)
+        d = original.to_dict()
+        assert d["is_favorite"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.is_favorite is True
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""

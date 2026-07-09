@@ -156,6 +156,7 @@ class ModelSettingsRequest(BaseModel):
     is_pinned: bool | None = None
     is_default: bool | None = None
     is_hidden: bool | None = None
+    is_favorite: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
@@ -1922,6 +1923,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 server_state.default_model == model_id if server_state else False
             ),
             "is_hidden": bool(settings and settings.is_hidden),
+            "is_favorite": bool(settings and settings.is_favorite),
             "is_helper": (
                 bool(model_info.get("is_helper"))
                 or model_id in referenced_drafts
@@ -2500,6 +2502,8 @@ async def update_model_settings(
             server_state.default_model = model_id
     if request.is_hidden is not None:
         current_settings.is_hidden = request.is_hidden
+    if request.is_favorite is not None:
+        current_settings.is_favorite = request.is_favorite
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
 

@@ -471,6 +471,8 @@
   "settings.models.table.hidden_tooltip": "/v1/models API から非表示",
   "settings.models.table.visible_on_tooltip": "/v1/models に掲載中 — クリックで非表示",
   "settings.models.table.visible_off_tooltip": "/v1/models から非表示 — クリックで掲載",
+  "settings.models.table.favorite_on_tooltip": "Favorite — listed first in model lists; click to remove",
+  "settings.models.table.favorite_off_tooltip": "Add to favorites — listed first in model lists",
   "settings.models.table.status_loading": "読み込み中",
   "settings.models.table.status_loaded": "読み込み済み",
   "settings.models.table.status_unload": "アンロード",
