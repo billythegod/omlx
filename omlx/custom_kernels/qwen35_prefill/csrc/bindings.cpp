@@ -9,6 +9,18 @@ using namespace nb::literals;
 NB_MODULE(_ext, m) {
   m.doc() = "Native Qwen3.5/3.6 prefill kernels for oMLX";
 
+  // ABI canary: when the extension is built with a nanobind whose ABI tag
+  // differs from the one the mlx wheel was built with, the NB_DOMAIN is
+  // isolated and every mx.array argument is rejected with "incompatible
+  // function arguments" (issue #2139). fast.py calls this probe once at
+  // import and disables the native symbols when it fails.
+  m.def(
+      "abi_probe",
+      [](const mlx::core::array& a) {
+        return static_cast<int64_t>(a.size());
+      },
+      "a"_a);
+
   m.def(
       "qwen35_fa256_attention",
       &omlx::qwen35_prefill_kernels::qwen35_fa256_attention,
