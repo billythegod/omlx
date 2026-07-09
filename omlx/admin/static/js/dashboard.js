@@ -450,6 +450,15 @@
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
             benchAdvancedOptionsOpen: false,
+            benchExternalEnabled: false,
+            // Shared external endpoint settings (persisted in localStorage,
+            // used by both the throughput and accuracy bench tabs)
+            externalBaseUrl: localStorage.getItem('omlx_bench_external_base_url') || '',
+            externalApiKey: localStorage.getItem('omlx_bench_external_api_key') || '',
+            externalModel: localStorage.getItem('omlx_bench_external_model') || '',
+            // { base_url, model } snapshot of the current run when external
+            // (no API key — used for the text export header)
+            benchRunExternal: null,
             benchRunning: false,
             benchBenchId: null,
             benchProgress: null,
@@ -526,6 +535,8 @@
             accBatchSize: 1,
             accEnableThinking: false,
             accSamplingProfile: 'deterministic',
+            accAdvancedOptionsOpen: false,
+            accExternalEnabled: false,
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -1035,6 +1046,9 @@
                         } else if (field === 'is_hidden') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.is_hidden = value;
+                        } else if (field === 'is_favorite') {
+                            const model = this.models.find(m => m.id === modelId);
+                            if (model) model.is_favorite = value;
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -2794,9 +2808,35 @@
                 }
             },
 
+            // Shared external endpoint settings (both bench tabs)
+            saveExternalEndpoint() {
+                localStorage.setItem('omlx_bench_external_base_url', this.externalBaseUrl.trim());
+                localStorage.setItem('omlx_bench_external_api_key', this.externalApiKey);
+                localStorage.setItem('omlx_bench_external_model', this.externalModel.trim());
+            },
+
+            externalConfigValid() {
+                return !!(this.externalBaseUrl.trim() && this.externalModel.trim());
+            },
+
+            externalRequestBody() {
+                return {
+                    base_url: this.externalBaseUrl.trim(),
+                    api_key: this.externalApiKey,
+                    model: this.externalModel.trim(),
+                };
+            },
+
             // Benchmark functions
             async startBenchmark() {
-                if (!this.benchModelId) return;
+                if (this.benchExternalEnabled) {
+                    if (!this.externalConfigValid()) {
+                        this.benchError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                } else if (!this.benchModelId) {
+                    return;
+                }
 
                 // Collect selected prompt lengths
                 const promptLengths = Object.entries(this.benchPromptLengths)
@@ -2829,17 +2869,21 @@
                 this.benchUploadDone = null;
                 this.benchUploading = false;
                 this.benchUploadSkipped = null;
+                this.benchRunExternal = this.benchExternalEnabled
+                    ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
+                    : null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            model_id: this.benchModelId,
+                            model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
-                            force_lm_engine: this.benchForceLmEngine,
+                            force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                            external: this.benchExternalEnabled ? this.externalRequestBody() : null,
                         }),
                     });
 
@@ -2930,7 +2974,10 @@
                             es.close();
                             this.benchEventSource = null;
                         } else if (data.type === 'upload_skipped') {
-                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploadSkipped = {
+                                reason: data.reason || 'experimental_features',
+                                features: data.features || [],
+                            };
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
@@ -2993,8 +3040,13 @@
 
                 lines.push('oMLX - LLM inference, optimized for your Mac');
                 lines.push('https://github.com/jundot/omlx');
-                lines.push(`Benchmark Model: ${this.benchModelId}`);
-                lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
+                if (this.benchRunExternal) {
+                    lines.push(`Benchmark Model: ${this.benchRunExternal.model} @ ${this.benchRunExternal.base_url}`);
+                    lines.push('Engine: External OpenAI-compatible endpoint');
+                } else {
+                    lines.push(`Benchmark Model: ${this.benchModelId}`);
+                    lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
+                }
                 lines.push('='.repeat(80));
 
                 // Single Request Results
@@ -3133,19 +3185,39 @@
                             bench_id: data.bench_id,
                             model_id: data.model_id,
                             force_lm_engine: !!data.force_lm_engine,
+                            external: !!data.external,
                         };
                         return;
                     }
 
                     // Fresh slate: attach.
                     this.benchBenchId = data.bench_id;
-                    this.benchModelId = data.model_id;
-                    this.benchForceLmEngine = !!data.force_lm_engine;
+                    this._restoreBenchRunSource(data);
                     this.benchRunning = true;
                     this.benchOtherActive = null;
                     this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to load bench state:', err);
+                }
+            },
+
+            // Restore the config UI from an active run discovered via
+            // /api/bench/active. External model ids aren't in the local
+            // dropdown, so the external flag drives which controls light up.
+            _restoreBenchRunSource(data) {
+                if (data.external) {
+                    this.benchExternalEnabled = true;
+                    this.benchRunExternal = {
+                        // base_url is intentionally not exposed by the API;
+                        // fall back to this browser's stored setting.
+                        base_url: this.externalBaseUrl.trim(),
+                        model: data.model_id,
+                    };
+                } else {
+                    this.benchModelId = data.model_id;
+                    this.benchForceLmEngine = !!data.force_lm_engine;
+                    this.benchExternalEnabled = false;
+                    this.benchRunExternal = null;
                 }
             },
 
@@ -3158,8 +3230,7 @@
                 const other = this.benchOtherActive;
                 this.benchOtherActive = null;
                 this.benchBenchId = other.bench_id;
-                this.benchModelId = other.model_id;
-                this.benchForceLmEngine = !!other.force_lm_engine;
+                this._restoreBenchRunSource(other);
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];
@@ -3234,7 +3305,14 @@
             },
 
             async addToAccQueue() {
-                if (!this.accModelId) return;
+                if (this.accExternalEnabled) {
+                    if (!this.externalConfigValid()) {
+                        this.accError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                } else if (!this.accModelId) {
+                    return;
+                }
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
                     .map(([k]) => k);
@@ -3247,13 +3325,14 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            model_id: this.accModelId,
+                            model_id: this.accExternalEnabled ? this.externalModel.trim() : this.accModelId,
                             benchmarks: Object.fromEntries(
                                 selected.map(k => [k, this.accSampleSizes[k]])
                             ),
                             batch_size: this.accBatchSize,
-                            enable_thinking: this.accEnableThinking,
+                            enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            external: this.accExternalEnabled ? this.externalRequestBody() : null,
                         }),
                     });
                     if (!resp.ok) {
@@ -3968,6 +4047,10 @@
             // Filter + sort models
             get sortedModels() {
                 return [...this.filterModelsByName(this.models, this.modelSearch)].sort((a, b) => {
+                    // Favorites always sort first, regardless of the active column.
+                    const favDiff = (b.is_favorite ? 1 : 0) - (a.is_favorite ? 1 : 0);
+                    if (favDiff !== 0) return favDiff;
+
                     let aVal, bVal;
 
                     switch (this.sortBy) {
@@ -4060,6 +4143,11 @@
             get sortedManagerModels() {
                 const list = this.filterModelsByName(this.hfModels, this.managerSearch);
                 return [...list].sort((a, b) => {
+                    // Favorites always sort first, regardless of the active column.
+                    const aFav = this.managerModelInfo(a.name)?.is_favorite ? 1 : 0;
+                    const bFav = this.managerModelInfo(b.name)?.is_favorite ? 1 : 0;
+                    if (aFav !== bFav) return bFav - aFav;
+
                     let aVal, bVal;
                     switch (this.managerSortBy) {
                         case 'name':
