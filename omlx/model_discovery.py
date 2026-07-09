@@ -96,7 +96,7 @@ def is_helper_config_model_type(config_model_type: str | None) -> bool:
     DFlash drafts, whose model_type is a plain ``qwen3`` — use
     :func:`is_helper_model_config` when the full config dict is available.
     """
-    if not config_model_type:
+    if not isinstance(config_model_type, str) or not config_model_type:
         return False
     mt = config_model_type.lower()
     return mt.endswith(HELPER_CONFIG_MODEL_TYPE_SUFFIXES)
@@ -117,7 +117,12 @@ def is_helper_model_config(config: dict) -> bool:
         return True
     if any(key in config for key in _HELPER_CONFIG_KEYS):
         return True
-    for arch in config.get("architectures") or []:
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    elif not isinstance(architectures, list | tuple | set):
+        return False
+    for arch in architectures:
         arch_lower = str(arch).lower()
         if any(token in arch_lower for token in _HELPER_ARCH_TOKENS):
             return True

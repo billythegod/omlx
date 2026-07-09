@@ -38,7 +38,7 @@ class TestIsHelperConfigModelType:
 
     @pytest.mark.parametrize(
         "config_model_type",
-        ["qwen3", "gemma4_text", "gemma4", "llama", "qwen2_5_vl", "", None],
+        ["qwen3", "gemma4_text", "gemma4", "llama", "qwen2_5_vl", "", None, 123],
     )
     def test_non_helper_types(self, config_model_type):
         assert is_helper_config_model_type(config_model_type) is False
@@ -78,6 +78,7 @@ class TestIsHelperModelConfig:
             {"model_type": "llama"},
             {},
             {"architectures": None},
+            {"model_type": 123, "architectures": 123},
         ],
     )
     def test_non_helper_configs(self, config):
@@ -1504,6 +1505,17 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_hf_cache_bad_helper_schema_is_skipped(self, tmp_path):
+        """A malformed helper-looking schema must not abort HF cache discovery."""
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "acme", "BadSchema")
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": 123})
+        )
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert models == {}
+
     def test_hf_cache_mlx_metadata_is_discovered(self, tmp_path):
         """HF cache entries with safetensors format=mlx metadata are discovered."""
         np = pytest.importorskip("numpy")
@@ -1593,6 +1605,14 @@ class TestHfCacheDiscovery:
         bad_bytes.mkdir()
         (bad_bytes / "config.json").write_bytes(b'\xff\xfe{"a": 1}')
         assert _is_helper_checkpoint(bad_bytes) is False
+
+        # valid JSON with an unexpected schema must not raise either
+        bad_schema = tmp_path / "bad-schema"
+        bad_schema.mkdir()
+        (bad_schema / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": 123})
+        )
+        assert _is_helper_checkpoint(bad_schema) is False
 
     def test_mixed_flat_and_hf_cache(self, tmp_path):
         """Mix of flat models and HF cache entries."""
