@@ -8,7 +8,7 @@ class Omlx < Formula
   head "https://github.com/jundot/omlx.git", branch: "main"
 
   option "with-custom-kernel",
-         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
+         "Build native custom kernels for GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -85,6 +85,7 @@ class Omlx < Formula
       kernel_sources = [
         buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
         buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+        buildpath/"omlx/custom_kernels/qwen35_prefill/csrc",
       ]
       unless kernel_sources.all?(&:directory?)
         odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
@@ -108,8 +109,10 @@ class Omlx < Formula
         system libexec/"bin/python", "-c", <<~PYTHON
           from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
           from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+          from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
           assert glm_fast.is_native_available(), glm_fast.import_error()
           assert minimax_fast.is_native_available(), minimax_fast.import_error()
+          assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
         PYTHON
       end
     end

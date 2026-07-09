@@ -112,6 +112,7 @@ PACKAGING_DIR="$REPO_ROOT/packaging"
 CUSTOM_KERNEL_DIRS=(
     "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
     "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
+    "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
 )
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
@@ -240,7 +241,8 @@ _clean_custom_kernel_build_artifacts() {
     if [ -d "$REPO_ROOT/build" ]; then
         for ext_name in \
             "omlx.custom_kernels.glm_moe_dsa._ext" \
-            "omlx.custom_kernels.minimax_m3._ext"; do
+            "omlx.custom_kernels.minimax_m3._ext" \
+            "omlx.custom_kernels.qwen35_prefill._ext"; do
             find "$REPO_ROOT/build" \
                 -type d \
                 -name "$ext_name" \
@@ -301,6 +303,8 @@ _build_custom_kernels() {
         || die "custom kernel build finished but GLM metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
         || die "custom kernel build finished but MiniMax M3 metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
+        || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
     _validate_custom_kernel_deployment_target "$deployment_target"
     ok "  + custom kernels ($deployment_target)"
 }
