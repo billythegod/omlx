@@ -173,6 +173,76 @@ def _patch_update_eval_policy() -> None:
     cls._omlx_multirow_eval_patched = True
 
 
+def _patch_vlm_target_verify_attention() -> None:
+    """Make mlx-vlm's qwen3_5 MTP verify attention TurboQuant-safe.
+
+    The upstream verify path slices ``keys[:, :, : prefix + i + 1, :]`` per
+    draft row before calling SDPA. With TurboQuant the fetched keys/values
+    are packed ``_QuantizedStateProxy`` objects that are not subscriptable,
+    so every verify forward crashes (issue #2139). Route TurboQuant caches
+    through one causal SDPA call instead — the TurboQuant-patched dispatcher
+    handles decode-shaped multi-row natively with identical semantics (row i
+    attends the first ``prefix + i + 1`` positions).
+    """
+    try:
+        from mlx_vlm.models.qwen3_5 import language as q35_lang
+    except ImportError:
+        return
+    if getattr(q35_lang, "_omlx_tq_target_verify_patched", False):
+        return
+    original = getattr(q35_lang, "_target_verify_left_padded_attention", None)
+    if original is None:
+        return
+
+    def patched(queries, keys, values, *, cache, scale, mask):
+        from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
+
+        from ..turboquant_kv import BatchTurboQuantKVCache
+
+        real_cache = cache
+        if hasattr(cache, "_cache") and not isinstance(
+            cache, (_TQCache, BatchTurboQuantKVCache)
+        ):
+            real_cache = cache._cache
+        if not isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            return original(queries, keys, values, cache=cache, scale=scale, mask=mask)
+
+        sdpa = q35_lang.scaled_dot_product_attention
+        if queries.shape[0] == 1 and not isinstance(mask, mx.array):
+            return sdpa(
+                queries, keys, values, cache=cache, scale=scale, mask="causal"
+            )
+        # Left-padded batches / explicit array masks: dequantize once and
+        # replicate the caller's per-row causal slicing on dense arrays.
+        dk, dv = real_cache.dequantize(keys_state=keys, values_state=values)
+        dk = dk.astype(queries.dtype)
+        dv = dv.astype(queries.dtype)
+        L = queries.shape[2]
+        prefix_len = dk.shape[-2] - L
+        return mx.concatenate(
+            [
+                sdpa(
+                    queries[:, :, i : i + 1, :],
+                    dk[:, :, : prefix_len + i + 1, :],
+                    dv[:, :, : prefix_len + i + 1, :],
+                    cache=None,
+                    scale=scale,
+                    mask=(
+                        mask[..., i : i + 1, : prefix_len + i + 1]
+                        if isinstance(mask, mx.array) and mask.ndim >= 4
+                        else None
+                    ),
+                )
+                for i in range(L)
+            ],
+            axis=2,
+        )
+
+    q35_lang._target_verify_left_padded_attention = patched
+    q35_lang._omlx_tq_target_verify_original = original
+    q35_lang._omlx_tq_target_verify_patched = True
+
+
 def apply_turboquant_attention_patch() -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for TurboQuant."""
     global _PATCHED
@@ -188,6 +258,13 @@ def apply_turboquant_attention_patch() -> bool:
         _patch_update_eval_policy()
     except Exception:
         logger.debug("TurboQuant update eval-policy patch skipped", exc_info=True)
+
+    try:
+        _patch_vlm_target_verify_attention()
+    except Exception:
+        logger.debug(
+            "TurboQuant VLM target-verify attention patch skipped", exc_info=True
+        )
 
     original_sdpa = mlx_base.scaled_dot_product_attention
 
