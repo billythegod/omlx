@@ -7415,6 +7415,20 @@ class Scheduler:
             _sync_and_clear_cache(self._stream)
         except Exception as e:
             logger.warning(f"Metal cache clear failed during error recovery: {e}")
+        # Requests failed mid-prefill leave PrefillProgressTracker entries
+        # behind (auto-removal only fires at processed >= total). The local
+        # RuntimeError handlers in the prefill paths cover the common memory
+        # errors (#1405), but any other exception type bubbles up here and
+        # would leak a phantom "PP" row on the dashboard.
+        tracker = get_prefill_tracker()
+        for rid in failed_ids:
+            tracker.remove(rid)
+        # Republish the admin snapshot now that the queues are empty. The
+        # snapshot is normally published at the end of a successful step();
+        # when step() raises, the last published snapshot still lists the
+        # failed requests, so the dashboard and the macOS app keep showing
+        # them as "generating" until the next successful step (#2126).
+        self._publish_admin_snapshot()
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -9997,6 +10011,11 @@ class Scheduler:
         self.tokenizer = None
 
         # Release all cache-related references for GC
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
         self.paged_cache_manager = None
         self.block_aware_cache = None
         self.memory_monitor = None
@@ -10055,6 +10074,16 @@ class Scheduler:
             self._inflight_store_info.clear()
             self._cache_freshness_waits.clear()
             self._prefix_cache_prepared.clear()
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_all()
+            except Exception as e:
+                logger.warning("Boundary snapshot store cleanup error: %s", e)
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
+            self._boundary_snapshot_store = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -10267,17 +10296,27 @@ class Scheduler:
         except Exception as e:
             logger.debug(f"Failed to extract model info: {e}")
 
-    def _infer_live_layer_cache_types(self) -> list[str] | None:
-        """Infer the layer-cache signature that future SSD saves will use."""
+    def _infer_live_layer_cache_types(
+        self,
+    ) -> tuple[list[str], float | None] | None:
+        """Infer the layer-cache signature that future SSD saves will use.
+
+        Returns ``(layer_cache_types, turboquant_kv_bits)`` — the predicted
+        per-layer type names plus the depth requests will quantize at (None
+        when TurboQuant is inactive or ineligible) — or None when no
+        signature can be inferred.
+        """
         if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
             return None
 
-        make_cache = getattr(self.model, "make_cache", None)
-        if not callable(make_cache):
-            return None
-
+        # Build the cache list the same way the request path does
+        # (make_prompt_cache defers to model.make_cache when the model
+        # defines one, and falls back to plain per-layer KVCache otherwise).
+        # Requiring model.make_cache here made the refresh a silent no-op
+        # for every plain dense model, so the manager never learned the
+        # TurboQuant layout or bit depth (#2045).
         try:
-            cache_list = make_cache()
+            cache_list = make_prompt_cache(self.model)
         except Exception as e:
             logger.debug("Failed to build cache list for SSD signature: %s", e)
             return None
@@ -10300,14 +10339,18 @@ class Scheduler:
             return None
 
         if self._turboquant_kv_bits is None:
-            return layer_cache_types
+            return layer_cache_types, None
 
         try:
-            if not self._turboquant_eligible(cache_list):
-                return layer_cache_types
+            eligible = self._turboquant_eligible(cache_list)
         except Exception as e:
+            # Fail safe: committing an un-rewritten (plain-KV) layout here
+            # would make the stale-signature sweep evict every valid
+            # TurboQuant block, so refuse to infer rather than guess.
             logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
-            return layer_cache_types
+            return None
+        if not eligible:
+            return layer_cache_types, None
 
         kv_indices = [
             i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
@@ -10318,7 +10361,12 @@ class Scheduler:
             if idx != last_kv_idx and idx < len(layer_cache_types):
                 layer_cache_types[idx] = "TurboQuantKVCache"
 
-        return layer_cache_types
+        # The depth is keyed off the same eligibility gate the request path
+        # uses, not the rewritten names: models whose convertible caches sit
+        # inside CacheList layers report bare "CacheList" names at every
+        # depth, so the bits field is the only signature discriminator for
+        # them (#2045).
+        return layer_cache_types, float(self._turboquant_kv_bits)
 
     def refresh_ssd_layer_signature(self) -> list[str] | None:
         """Set the SSD manager's live layer signature before prefix lookup."""
@@ -10326,14 +10374,24 @@ class Scheduler:
         if manager is None:
             return None
 
-        layer_cache_types = self._infer_live_layer_cache_types()
-        if not layer_cache_types:
+        inferred = self._infer_live_layer_cache_types()
+        if inferred is None:
+            if self._turboquant_kv_bits is not None:
+                logger.warning(
+                    "Could not infer the SSD cache layer signature; "
+                    "TurboQuant bit-depth compatibility checks stay disabled "
+                    "for this session (stale-depth blocks are not swept)."
+                )
             return None
+        layer_cache_types, turboquant_kv_bits = inferred
 
         try:
             set_signature = getattr(manager, "set_expected_layer_signature", None)
             if callable(set_signature):
-                set_signature(layer_cache_types)
+                set_signature(
+                    layer_cache_types,
+                    turboquant_kv_bits=turboquant_kv_bits,
+                )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
             manager.invalidate_stale_layer_signature()

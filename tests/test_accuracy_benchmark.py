@@ -20,6 +20,7 @@ from omlx.admin.accuracy_benchmark import (
     reset_accumulated_results,
     run_accuracy_benchmark,
 )
+from omlx.model_settings import ModelSettings
 
 
 class TestAccuracyBenchmarkRequest:
@@ -74,6 +75,29 @@ class TestAccuracyBenchmarkRequest:
             enable_thinking=True,
         )
         assert req.enable_thinking is True
+
+    def test_sampling_profile_default_deterministic(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+        )
+        assert req.sampling_profile == "deterministic"
+
+    def test_sampling_profile_model_settings_accepted(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+            sampling_profile="model_settings",
+        )
+        assert req.sampling_profile == "model_settings"
+
+    def test_sampling_profile_invalid_rejected(self):
+        with pytest.raises(Exception):
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 100},
+                sampling_profile="wild",
+            )
 
 
 class TestQueueAndResults:
@@ -241,3 +265,229 @@ class TestRunAccuracyBenchmark:
 
         # Should have stopped early
         assert len(run.results) == 0
+
+
+class TestSamplingProfile:
+    """sampling_profile gates whether per-model sampling reaches the evaluator.
+
+    Default "deterministic" must read nothing (reproducible greedy scores);
+    "model_settings" must forward the model's configured sampling. See #606 /
+    the #1254 deterministic-default request.
+    """
+
+    def _mock_pool(self, model_settings):
+        mock_engine = AsyncMock()
+        mock_engine.chat = AsyncMock(return_value=MagicMock(text="A"))
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
+        mock_pool.get_engine = AsyncMock(return_value=mock_engine)
+        mock_pool._unload_engine = AsyncMock()
+        mock_pool._settings_manager.get_settings = MagicMock(return_value=model_settings)
+        return mock_pool
+
+    async def _captured_sampling_kwargs(self, req, mock_pool):
+        run = create_run(req)
+        mock_result = MagicMock(
+            benchmark_name="mmlu", accuracy=0.5, total_questions=1,
+            correct_count=1, time_seconds=0.1, category_scores=None,
+            thinking_used=False,
+        )
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=mock_result)
+        mock_bench_cls = MagicMock(return_value=mock_evaluator)
+        with patch.dict("omlx.eval.BENCHMARKS", {"mmlu": mock_bench_cls}, clear=True):
+            await run_accuracy_benchmark(run, mock_pool)
+        return mock_evaluator.run.call_args.kwargs["sampling_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_deterministic_ignores_model_settings(self):
+        # Default profile is "deterministic".
+        req = AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 1})
+        mock_pool = self._mock_pool(ModelSettings(temperature=0.9, top_p=0.95))
+        assert await self._captured_sampling_kwargs(req, mock_pool) == {}
+
+    @pytest.mark.asyncio
+    async def test_model_settings_forwards_sampling(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 1},
+            sampling_profile="model_settings",
+        )
+        mock_pool = self._mock_pool(ModelSettings(temperature=0.9, top_p=0.95))
+        sampling_kwargs = await self._captured_sampling_kwargs(req, mock_pool)
+        assert sampling_kwargs["temperature"] == 0.9
+        assert sampling_kwargs["top_p"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_deterministic_keeps_chat_template_kwargs(self):
+        # Template kwargs are prompt construction, not sampling — forwarded
+        # even under the deterministic profile.
+        req = AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 1})
+        mock_pool = self._mock_pool(
+            ModelSettings(temperature=0.9, chat_template_kwargs={"custom_flag": True})
+        )
+        sampling_kwargs = await self._captured_sampling_kwargs(req, mock_pool)
+        assert sampling_kwargs == {"chat_template_kwargs": {"custom_flag": True}}
+
+
+# =============================================================================
+# External endpoint accuracy benchmark tests
+# =============================================================================
+
+
+def _external_dict():
+    return {
+        "base_url": "http://localhost:8001/v1",
+        "api_key": "sk-test",
+        "model": "remote-model",
+    }
+
+
+class TestExternalAccuracyRequest:
+    def test_external_accepted(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="remote-model",
+            benchmarks={"mmlu": 100},
+            external=_external_dict(),
+        )
+        assert req.external is not None
+        assert req.external.model == "remote-model"
+
+    def test_external_forces_thinking_off(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="remote-model",
+            benchmarks={"mmlu": 100},
+            enable_thinking=True,
+            external=_external_dict(),
+        )
+        assert req.enable_thinking is False
+
+    def test_local_keeps_thinking(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="local-model",
+            benchmarks={"mmlu": 100},
+            enable_thinking=True,
+        )
+        assert req.enable_thinking is True
+
+    def test_queue_status_flags_external(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="remote-model",
+            benchmarks={"mmlu": 100},
+            external=_external_dict(),
+        )
+        add_to_queue(req)
+        try:
+            entry = get_queue_status()["queue"][-1]
+            assert entry["external"] is True
+        finally:
+            from omlx.admin.accuracy_benchmark import _queue
+
+            _queue.clear()
+
+
+class TestExternalAccuracyRun:
+    def _mock_result(self):
+        return MagicMock(
+            benchmark_name="mmlu",
+            accuracy=0.5,
+            total_questions=2,
+            correct_count=1,
+            time_seconds=0.1,
+            category_scores=None,
+            thinking_used=False,
+            question_results=[],
+        )
+
+    def _mock_evaluator(self):
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=self._mock_result())
+        return mock_evaluator
+
+    def _external_request(self):
+        return AccuracyBenchmarkRequest(
+            model_id="remote-model",
+            benchmarks={"mmlu": 100},
+            batch_size=4,
+            external=_external_dict(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_run_uses_adapter_and_skips_pool(self):
+        run = create_run(self._external_request())
+        mock_pool = MagicMock()
+        mock_evaluator = self._mock_evaluator()
+        mock_bench_cls = MagicMock(return_value=mock_evaluator)
+
+        mock_adapter = MagicMock()
+        mock_adapter.preflight = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+
+        with (
+            patch.dict("omlx.eval.BENCHMARKS", {"mmlu": mock_bench_cls}, clear=True),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalAPIClient",
+                return_value=mock_client,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalChatAdapter",
+                return_value=mock_adapter,
+            ) as adapter_cls,
+        ):
+            await run_accuracy_benchmark(run, mock_pool)
+
+        assert run.status == "completed"
+        mock_pool.get_engine.assert_not_called()
+        mock_pool.get_loaded_model_ids.assert_not_called()
+        mock_pool._unload_engine.assert_not_called()
+        mock_adapter.preflight.assert_awaited_once()
+        adapter_cls.assert_called_once_with(mock_client, "deterministic")
+        # Evaluator got the adapter, empty sampling kwargs, thinking off
+        call = mock_evaluator.run.call_args
+        assert call.args[0] is mock_adapter
+        assert call.kwargs["sampling_kwargs"] == {}
+        assert call.kwargs["enable_thinking"] is False
+        assert call.kwargs["batch_size"] == 4
+        # Result carries the external flag and the remote model name
+        assert run.results[0]["external"] is True
+        assert run.results[0]["model_id"] == "remote-model"
+        mock_client.aclose.assert_awaited()
+        # Clean up accumulated results this test appended
+        reset_accumulated_results()
+
+    @pytest.mark.asyncio
+    async def test_external_preflight_failure_emits_error(self):
+        from omlx.admin.external_api import ExternalEndpointError
+
+        run = create_run(self._external_request())
+        mock_pool = MagicMock()
+
+        mock_adapter = MagicMock()
+        mock_adapter.preflight = AsyncMock(
+            side_effect=ExternalEndpointError(
+                "External endpoint rejected the API key (HTTP 401)"
+            )
+        )
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+
+        with (
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalAPIClient",
+                return_value=mock_client,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalChatAdapter",
+                return_value=mock_adapter,
+            ),
+        ):
+            await run_accuracy_benchmark(run, mock_pool)
+
+        assert run.status == "error"
+        assert "rejected the API key" in run.error_message
+        error_events = [e for e in run.events if e["type"] == "error"]
+        assert error_events
+        mock_client.aclose.assert_awaited()

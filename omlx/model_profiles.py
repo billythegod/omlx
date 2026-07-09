@@ -77,6 +77,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
     {
         "is_pinned",
         "is_default",
+        "is_hidden",
+        "is_favorite",
         "display_name",
         "description",
         "model_alias",

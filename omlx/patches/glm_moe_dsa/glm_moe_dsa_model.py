@@ -319,7 +319,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         )
         native_sparse_mla_shape = (
             topk_indices is not None
-            and self.num_heads == 64
+            and self.num_heads in (32, 64)  # 32 = tensor-sharded half of the 64 MLA heads
             and q_pe.shape[-1] == 64
             and kv_latent.shape[-1] == 512
             and k_pe.shape[-1] == 64

@@ -1,14 +1,14 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4.tar.gz"
-  sha256 "ff06063b215cd9f9ea6d311069f13f0523164cbb9eb2d05e29ef5b48d4dcbf48"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.5.0rc1.tar.gz"
+  sha256 "dcdeadfa184723be5501429dd4446856302c5275c22b55356f06ac576088f93a"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
 
   option "with-custom-kernel",
-         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
+         "Build native custom kernels for GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -36,7 +36,7 @@ class Omlx < Formula
   resource "en-core-web-sm" do
     url "https://github.com/explosion/spacy-models/releases/download/" \
         "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+    sha256 "dcdeadfa184723be5501429dd4446856302c5275c22b55356f06ac576088f93a"
   end
 
   service do
@@ -60,6 +60,7 @@ class Omlx < Formula
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
 
     no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
+    pip_flags = []
     if MacOS.version >= "27"
       # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
       # 8-byte boundary; prebuilt Rust wheels aligned to 4 bytes fail dlopen
@@ -69,12 +70,22 @@ class Omlx < Formula
       no_binary += ",tokenizers"
       ENV["CARGO_PROFILE_RELEASE_STRIP"] = "false"
       ENV["MATURIN_STRIP"] = "false"
+      # Pip reuses locally built wheels even under --no-binary, so a wheel
+      # cached before the strip guards existed stays corrupted. Bypass the
+      # cache entirely.
+      pip_flags << "--no-cache-dir"
     end
+
+    # Every pip step must share these flags; a later step without --no-binary
+    # (e.g. mlx-audio) can clobber a source-built package with a prebuilt
+    # wheel that fails dlopen on macOS 27 (#2110).
+    pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
       kernel_sources = [
         buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
         buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+        buildpath/"omlx/custom_kernels/qwen35_prefill/csrc",
       ]
       unless kernel_sources.all?(&:directory?)
         odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
@@ -89,9 +100,7 @@ class Omlx < Formula
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
-    system libexec/"bin/pip", "install",
-           "--no-binary", no_binary,
-           install_spec
+    system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
       # Run from libexec so buildpath's raw omlx/ source tree doesn't shadow
@@ -100,8 +109,10 @@ class Omlx < Formula
         system libexec/"bin/python", "-c", <<~PYTHON
           from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
           from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+          from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
           assert glm_fast.is_native_available(), glm_fast.import_error()
           assert minimax_fast.is_native_available(), minimax_fast.import_error()
+          assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
         PYTHON
       end
     end
@@ -109,7 +120,7 @@ class Omlx < Formula
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
-      system libexec/"bin/pip", "install", ".[all]"
+      system(*pip_install, ".[all]")
     end
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
@@ -123,7 +134,7 @@ class Omlx < Formula
            "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
-    system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
+    system(*pip_install, "python-multipart>=0.0.5")
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end

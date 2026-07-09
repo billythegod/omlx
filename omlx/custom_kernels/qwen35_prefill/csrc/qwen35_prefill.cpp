@@ -6,9 +6,12 @@
 #include <string>
 #include <vector>
 
+#include <atomic>
+
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
@@ -57,6 +60,14 @@ struct QwenQAffineVariant {
   int bn;
 };
 
+struct QwenQAffineNaxVariant {
+  int bm;
+  int bk;
+  int bn;
+  int wm;
+  int wn;
+};
+
 bool qwen_q_affine_bits_supported(int bits) {
   return bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
@@ -65,6 +76,12 @@ bool qwen_q_affine_packed_shape_matches(int packed_dim, int K, int bits) {
   return K > 0 && packed_dim > 0 &&
       static_cast<int64_t>(packed_dim) * 32 == static_cast<int64_t>(K) * bits;
 }
+
+constexpr const char* kNaxMetallibName = "omlx_qwen35_prefill_kernels_nax";
+
+// Set to false once loading the NAX metallib (or one of its pipelines) fails
+// so every later call degrades to the classic kernels without re-probing.
+std::atomic<bool> nax_qmm_runtime_ok{true};
 
 QwenQAffineVariant qwen_q_affine_variant(int variant) {
   switch (variant) {
@@ -91,6 +108,33 @@ QwenQAffineVariant qwen_q_affine_variant(int variant) {
     default: {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm variant " << variant << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+}
+
+// Must stay in sync with the instantiations in qwen35_qmm_nax.metal.
+// Variant 0 matches the tile MLX ships for affine_qmm_t_nax. BK stays at or
+// below the group size (64): QuantizedBlockLoader rejects larger columns.
+QwenQAffineNaxVariant qwen_q_affine_nax_variant(int variant) {
+  switch (variant) {
+    case 0:
+      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 2, 2};
+    case 1:
+      return {/* bm = */ 32, /* bk = */ 64, /* bn = */ 64, 2, 2};
+    case 2:
+      return {/* bm = */ 128, /* bk = */ 64, /* bn = */ 64, 2, 2};
+    case 3:
+      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 128, 2, 2};
+    case 4:
+      return {/* bm = */ 64, /* bk = */ 32, /* bn = */ 64, 2, 2};
+    case 5:
+      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 4, 1};
+    case 6:
+      return {/* bm = */ 64, /* bk = */ 64, /* bn = */ 64, 1, 4};
+    default: {
+      std::ostringstream msg;
+      msg << "Unsupported Qwen affine qmm NAX variant " << variant << ".";
       throw std::invalid_argument(msg.str());
     }
   }
@@ -310,14 +354,26 @@ class Qwen35Fa256AttentionPrimitive : public Primitive {
 
 class Qwen35QAffineQmmTPrimitive : public Primitive {
  public:
-  Qwen35QAffineQmmTPrimitive(Stream stream, int bits, int variant)
-      : Primitive(stream), bits_(bits), variant_(variant) {
+  Qwen35QAffineQmmTPrimitive(
+      Stream stream,
+      int bits,
+      int variant,
+      bool use_nax,
+      int nax_variant)
+      : Primitive(stream),
+        bits_(bits),
+        variant_(variant),
+        use_nax_(use_nax),
+        nax_variant_(nax_variant) {
     if (!qwen_q_affine_bits_supported(bits_)) {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm bits " << bits_ << ".";
       throw std::invalid_argument(msg.str());
     }
     (void)qwen_q_affine_variant(variant_);
+    if (use_nax_) {
+      (void)qwen_q_affine_nax_variant(nax_variant_);
+    }
   }
 
   static bool unsupported(
@@ -386,11 +442,65 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
 
     out.set_data(allocator::malloc(out.nbytes()));
 
-    const auto cfg = qwen_q_affine_variant(variant_);
     const int K = x.shape(-1);
     const int N = weight.shape(0);
     const int M = x.size() / K;
 
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto encode = [&](MTL::ComputePipelineState* kernel,
+                      int bm,
+                      int bn,
+                      int wm,
+                      int wn) {
+      compute_encoder.set_compute_pipeline_state(kernel);
+      compute_encoder.set_input_array(weight, 0);
+      compute_encoder.set_input_array(scales, 1);
+      compute_encoder.set_input_array(biases, 2);
+      compute_encoder.set_input_array(x, 3);
+      compute_encoder.set_output_array(out, 4);
+      compute_encoder.set_bytes(K, 5);
+      compute_encoder.set_bytes(N, 6);
+      compute_encoder.set_bytes(M, 7);
+
+      MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+      MTL::Size group_dims(32, wm, wn);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    };
+
+    if (use_nax_ && nax_qmm_runtime_ok.load(std::memory_order_relaxed)) {
+      const auto cfg = qwen_q_affine_nax_variant(nax_variant_);
+      std::string kname;
+      concatenate(
+          kname,
+          "qwen35_q",
+          bits_,
+          "_affine_qmm_t_nax_",
+          qwen_type_name(x.dtype()),
+          "_bm_",
+          cfg.bm,
+          "_bk_",
+          cfg.bk,
+          "_bn_",
+          cfg.bn,
+          "_wm_",
+          cfg.wm,
+          "_wn_",
+          cfg.wn);
+      try {
+        auto lib = d.get_library(kNaxMetallibName, current_binary_dir());
+        auto kernel = d.get_kernel(kname, lib);
+        encode(kernel, cfg.bm, cfg.bn, cfg.wm, cfg.wn);
+        return;
+      } catch (const std::exception&) {
+        // The metallib next to the extension predates the NAX kernels (or
+        // pipeline creation was rejected); disable NAX for the process and
+        // fall through to the classic kernel, which unsupported() already
+        // validated for these shapes.
+        nax_qmm_runtime_ok.store(false, std::memory_order_relaxed);
+      }
+    }
+
+    const auto cfg = qwen_q_affine_variant(variant_);
     std::string kname;
     concatenate(
         kname,
@@ -407,21 +517,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
 
     auto lib = d.get_library("omlx_qwen35_prefill_kernels", current_binary_dir());
     auto kernel = d.get_kernel(kname, lib);
-    auto& compute_encoder = metal::get_command_encoder(s);
-    compute_encoder.set_compute_pipeline_state(kernel);
-    compute_encoder.set_input_array(weight, 0);
-    compute_encoder.set_input_array(scales, 1);
-    compute_encoder.set_input_array(biases, 2);
-    compute_encoder.set_input_array(x, 3);
-    compute_encoder.set_output_array(out, 4);
-    compute_encoder.set_bytes(K, 5);
-    compute_encoder.set_bytes(N, 6);
-    compute_encoder.set_bytes(M, 7);
-
-    MTL::Size grid_dims(
-        (N + cfg.bn - 1) / cfg.bn, (M + cfg.bm - 1) / cfg.bm, 1);
-    MTL::Size group_dims(32, 2, 2);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    encode(kernel, cfg.bm, cfg.bn, 2, 2);
   }
 
   DEFINE_NAME(Qwen35QAffineQmmTPrimitive)
@@ -429,15 +525,18 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs =
         static_cast<const Qwen35QAffineQmmTPrimitive&>(other);
-    return bits_ == rhs.bits_ && variant_ == rhs.variant_;
+    return bits_ == rhs.bits_ && variant_ == rhs.variant_ &&
+        use_nax_ == rhs.use_nax_ && nax_variant_ == rhs.nax_variant_;
   }
   auto state() const {
-    return std::make_tuple(bits_, variant_);
+    return std::make_tuple(bits_, variant_, use_nax_, nax_variant_);
   }
 
  private:
   int bits_;
   int variant_;
+  bool use_nax_;
+  int nax_variant_;
 };
 
 class Qwen35MoeWeightedSumPrimitive : public Primitive {
@@ -553,6 +652,48 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
 
 } // namespace
 
+bool is_nax_available() {
+  // Mirror of mlx::core::metal::is_nax_available() (mlx v0.32.0 device.cpp),
+  // which libmlx does not export: macOS >= 26.2 and applegpu gen >= 17
+  // ('p'-suffix parts need gen >= 18).
+  static bool available = []() {
+    if (!metal::is_available()) {
+      return false;
+    }
+    bool os_ok = false;
+    if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+      os_ok = true;
+    }
+    if (!os_ok) {
+      return false;
+    }
+    auto& d = metal::device(Device::gpu);
+    const auto& arch = d.get_architecture();
+    if (arch.empty()) {
+      return false;
+    }
+    const char suffix = arch.back();
+    const int gen = d.get_architecture_gen();
+    return gen >= (suffix == 'p' ? 18 : 17);
+  }();
+  return available;
+}
+
+bool nax_qmm_kernels_built() {
+  static bool built = []() {
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(current_binary_dir()) /
+            (std::string(kNaxMetallibName) + ".metallib"),
+        ec);
+  }();
+  return built;
+}
+
+bool nax_qmm_runtime_active() {
+  return nax_qmm_runtime_ok.load(std::memory_order_relaxed);
+}
+
 array qwen35_fa256_attention(
     const array& q,
     const array& k,
@@ -606,6 +747,8 @@ array qwen35_q_affine_qmm_t(
     const array& biases,
     int bits,
     int variant,
+    bool use_nax,
+    int nax_variant,
     StreamOrDevice s) {
   (void)qwen_q_affine_variant(variant);
   if (!qwen_q_affine_bits_supported(bits)) {
@@ -664,13 +807,26 @@ array qwen35_q_affine_qmm_t(
         "[omlx_qwen35_prefill.qwen35_q_affine_qmm_t] unsupported shape.");
   }
 
+  // NAX candidacy: the classic variant above stays the validated fallback,
+  // so demote instead of throwing when the NAX tile does not fit or the
+  // runtime lacks tensor units / the NAX metallib.
+  bool nax = use_nax && is_nax_available() && nax_qmm_kernels_built() &&
+      nax_qmm_runtime_ok.load(std::memory_order_relaxed);
+  if (nax) {
+    const auto nax_cfg = qwen_q_affine_nax_variant(nax_variant);
+    if (K % nax_cfg.bk != 0 || N % nax_cfg.bn != 0) {
+      nax = false;
+    }
+  }
+
   Shape out_shape = x.shape();
   out_shape.back() = N;
   std::vector<array> inputs = {x, weight, scales, biases};
   return array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<Qwen35QAffineQmmTPrimitive>(stream, bits, variant),
+      std::make_shared<Qwen35QAffineQmmTPrimitive>(
+          stream, bits, variant, nax, nax_variant),
       std::move(inputs));
 }
 
@@ -680,8 +836,11 @@ array qwen35_q4_affine_qmm_t(
     const array& scales,
     const array& biases,
     int variant,
+    bool use_nax,
+    int nax_variant,
     StreamOrDevice s) {
-  return qwen35_q_affine_qmm_t(x, weight, scales, biases, 4, variant, s);
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 4, variant, use_nax, nax_variant, s);
 }
 
 array qwen35_q5_affine_qmm_t(
@@ -690,8 +849,11 @@ array qwen35_q5_affine_qmm_t(
     const array& scales,
     const array& biases,
     int variant,
+    bool use_nax,
+    int nax_variant,
     StreamOrDevice s) {
-  return qwen35_q_affine_qmm_t(x, weight, scales, biases, 5, variant, s);
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 5, variant, use_nax, nax_variant, s);
 }
 
 array qwen35_q6_affine_qmm_t(
@@ -700,8 +862,11 @@ array qwen35_q6_affine_qmm_t(
     const array& scales,
     const array& biases,
     int variant,
+    bool use_nax,
+    int nax_variant,
     StreamOrDevice s) {
-  return qwen35_q_affine_qmm_t(x, weight, scales, biases, 6, variant, s);
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 6, variant, use_nax, nax_variant, s);
 }
 
 array qwen35_q8_affine_qmm_t(
@@ -710,8 +875,11 @@ array qwen35_q8_affine_qmm_t(
     const array& scales,
     const array& biases,
     int variant,
+    bool use_nax,
+    int nax_variant,
     StreamOrDevice s) {
-  return qwen35_q_affine_qmm_t(x, weight, scales, biases, 8, variant, s);
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 8, variant, use_nax, nax_variant, s);
 }
 
 array qwen35_moe_weighted_sum(

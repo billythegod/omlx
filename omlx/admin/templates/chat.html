@@ -2495,9 +2495,12 @@
                         existing.name = m.name;
                     }
                 }
-                return Array.from(byId.values()).sort((a, b) =>
-                    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-                );
+                return Array.from(byId.values()).sort((a, b) => {
+                    // Favorites always sort first; names decide within each group.
+                    const favDiff = (b.is_favorite ? 1 : 0) - (a.is_favorite ? 1 : 0);
+                    if (favDiff !== 0) return favDiff;
+                    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+                });
             },
 
             resolvePreferredDefaultModel(defaultModel) {
@@ -3932,6 +3935,11 @@
             const modelsData = await modelsResponse.json();
             const allModels = modelsData.data || [];
 
+            // Favorite gateway ids from the admin list; used to sort favorites first
+            const favoriteIds = new Set(
+                (this._adminModelsList || []).filter(m => m.is_favorite).map(m => m.id)
+            );
+
             // Build available models with gateway id (directory name) as the value
             // Store alias for display (in case we want to show it later)
             this.availableModels = this.dedupeAvailableModels(
@@ -3942,7 +3950,8 @@
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
-                    owned_by: m.owned_by
+                    owned_by: m.owned_by,
+                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id)
                 }))
             );
 

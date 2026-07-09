@@ -3,7 +3,8 @@
 
 This patch is intentionally narrow:
   - Qwen3.5/3.6 dense VLM attention layout: q heads=24, kv heads=4, D=256
-  - causal prefill/chunked-prefill only (q_len > 1)
+  - causal prefill/chunked-prefill only (q_len >= 16; decode and MTP verify
+    stay on the stock path)
   - no array masks and no sinks
 
 The native op uses MLX's steel attention template through the oMLX custom
@@ -20,9 +21,18 @@ import sys
 
 import mlx.core as mx
 
+from omlx.custom_kernels.nax import is_nax_available
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+
+# Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
+# must not take the steel prefill kernel: it scans the full KV per call, so
+# at tiny q_len it is 3-16x slower than the stock fused/unfused path and
+# collapses long-context MTP throughput (issue #2127). Genuine prefill
+# chunks are always far above this floor.
+_MIN_ROUTE_Q_LEN = 16
 
 
 def _native_kernel():
@@ -40,13 +50,20 @@ def _has_quantized_cache(cache) -> bool:
 
 
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
+    # Query-shape gates first: this runs on every SDPA call of every decode
+    # step, so the common (decode / MTP verify) case must exit on the q_len
+    # check before touching Metal state or cache attributes (issue #2132).
+    # ``keys`` may be a TurboQuant state proxy without ``ndim``/``dtype``, so
+    # it must not be inspected before the quantized-cache check declines.
+    if queries.ndim != 4 or queries.shape[-2] < _MIN_ROUTE_Q_LEN:
+        return False
     if not mx.metal.is_available() or _has_quantized_cache(cache):
         return False
     if sinks is not None:
         return False
     if mask is not None and not (isinstance(mask, str) and mask == "causal"):
         return False
-    if queries.ndim != 4 or keys.ndim != 4:
+    if keys.ndim != 4:
         return False
     if queries.dtype not in (mx.float16, mx.bfloat16):
         return False
@@ -62,7 +79,6 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
         head_dim == 256
         and q_heads == 24
         and kv_heads == 4
-        and q_len > 1
         and kv_len >= min_kv_len
         and q_len <= kv_len
     )
@@ -72,7 +88,19 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("OMLX_FA256_STEEL", "1") == "0":
+    steel_env = os.environ.get("OMLX_FA256_STEEL", "").strip()
+    if steel_env == "0":
+        return False
+    if steel_env != "1" and is_nax_available():
+        # Auto: on NAX GPUs (M5 family) stock SDPA's head_dim-256 fallback
+        # runs its matmuls on the tensor units and beats this pre-NAX steel
+        # kernel, so routing it would regress prefill (M5 Max report:
+        # 4k pp 828 -> 400 tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the
+        # kernel on for benchmarking; a NAX port of this kernel is the
+        # tracked follow-up.
+        logger.info(
+            "Qwen FA-256 steel patch skipped: NAX GPU, stock SDPA is faster"
+        )
         return False
 
     kernel = _native_kernel()

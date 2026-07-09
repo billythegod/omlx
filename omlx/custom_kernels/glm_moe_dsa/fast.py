@@ -27,6 +27,37 @@ else:
     _IMPORT_ERROR = None
 
 
+def _verify_abi(ext, import_error):
+    """Disable the native symbols when the extension rejects mlx arrays.
+
+    An extension built with a nanobind whose ABI tag differs from the mlx
+    wheel's imports cleanly and lists every symbol, but its type casters
+    live in an isolated NB_DOMAIN, so every call raises ``TypeError:
+    incompatible function arguments`` (issue #2139). Probe once at import
+    and degrade with a single warning instead of failing per call; builds
+    predating the ``abi_probe`` binding are assumed compatible.
+    """
+    if ext is None:
+        return ext, import_error
+    probe = getattr(ext, "abi_probe", None)
+    if probe is None:
+        return ext, import_error
+    try:
+        probe(mx.zeros((1,)))
+    except TypeError as exc:
+        logger.warning(
+            "%s: native kernels disabled — the extension was built with a "
+            "nanobind ABI that does not match this mlx wheel; rebuild it "
+            "against the installed mlx (see pyproject build-system pins).",
+            __name__,
+        )
+        return None, _detach_import_error(exc)
+    return ext, import_error
+
+
+_ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
+
+
 NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
     "dsa_topk_indices",

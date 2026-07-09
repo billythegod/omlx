@@ -50,6 +50,9 @@ def _fresh_fa256_patch(monkeypatch):
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
+    # Pin the NAX auto-gate off so apply/route behavior stays identical on
+    # M5-family test machines; the NAX gating tests override this locally.
+    monkeypatch.setattr(patch, "is_nax_available", lambda: False)
     monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
     monkeypatch.delenv("OMLX_FA256_MIN_KV_LEN", raising=False)
     monkeypatch.delenv("OMLX_FA256_Q_BLOCK", raising=False)
@@ -68,6 +71,13 @@ def test_route_gate_is_qwen_fa256_only():
     assert not patch._should_route(q[:, :12], k, None, "causal", None, 2048)
     assert not patch._should_route(q, k[:, :2], None, "causal", None, 2048)
     assert not patch._should_route(q[:, :, :1], k, None, "causal", None, 2048)
+    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
+    # the steel prefill kernel is 3-16x slower at tiny q_len (issue #2127)
+    for q_len in (2, 4, 9, 15):
+        qv, kv, _ = _qkv(q_len, 16384)
+        assert not patch._should_route(qv, kv, None, "causal", None, 2048)
+    qv, kv, _ = _qkv(16, 16384)
+    assert patch._should_route(qv, kv, None, "causal", None, 2048)
     assert not patch._should_route(q, k, None, mx.zeros((128, 2048)), None, 2048)
     assert not patch._should_route(q, k, None, "causal", mx.zeros((4,)), 2048)
 
@@ -102,6 +112,34 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
         base.scaled_dot_product_attention(q_decode, k, v, None, scale, "causal")
         == "original"
     )
+
+
+def test_apply_skips_on_nax_gpu(monkeypatch):
+    # On NAX GPUs stock SDPA's unfused head_dim-256 prefill runs its matmuls
+    # on the tensor units and beats the pre-NAX steel kernel (M5 Max report:
+    # 4k pp 828 -> 400 tok/s), so the auto mode must not install the patch.
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    monkeypatch.setattr(patch, "is_nax_available", lambda: True)
+    assert patch.apply_qwen35_fa256_attention_patch() is False
+
+
+def test_apply_env_forces_steel_on_nax_gpu(monkeypatch):
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    _install_fake_vlm_base(monkeypatch)
+    monkeypatch.setattr(patch, "is_nax_available", lambda: True)
+    monkeypatch.setattr(patch, "_native_kernel", lambda: lambda *a, **k: "steel")
+    monkeypatch.setenv("OMLX_FA256_STEEL", "1")
+    assert patch.apply_qwen35_fa256_attention_patch() is True
+
+
+def test_apply_env_kill_switch_wins(monkeypatch):
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    monkeypatch.setattr(patch, "is_nax_available", lambda: False)
+    monkeypatch.setenv("OMLX_FA256_STEEL", "0")
+    assert patch.apply_qwen35_fa256_attention_patch() is False
 
 
 def test_qwen_native_symbols_are_not_registered_on_glm_extension():

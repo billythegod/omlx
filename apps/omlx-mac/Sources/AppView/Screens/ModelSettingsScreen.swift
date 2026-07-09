@@ -764,6 +764,17 @@ private struct AdvancedTab: View {
                 }))
                 .labelsHidden().toggleStyle(.switch)
             }
+            Row(label: String(localized: "settings.advanced.favorite.label",
+                              defaultValue: "Favorite",
+                              comment: "Row label for the favorite toggle"),
+                sublabel: String(localized: "settings.advanced.favorite.sub",
+                                 defaultValue: "List this model first in model lists",
+                                 comment: "Sublabel for the favorite toggle")) {
+                Toggle("", isOn: vm.bind($vm.isFavorite, save: {
+                    Task { await vm.save(.isFavorite, client: client) }
+                }))
+                .labelsHidden().toggleStyle(.switch)
+            }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in
