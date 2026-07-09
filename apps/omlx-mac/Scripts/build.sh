@@ -319,7 +319,10 @@ for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
     if so is None:
         failures.append(f"{name}: _ext extension missing")
         continue
-    spec = importlib.util.spec_from_file_location(f"omlx_abi_check_{name}", so)
+    # Extension modules must load under their compiled name (PyInit__ext);
+    # CPython keys the extension cache by (name, path), so loading three
+    # different .so files as "_ext" is fine.
+    spec = importlib.util.spec_from_file_location("_ext", so)
     ext = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(ext)
