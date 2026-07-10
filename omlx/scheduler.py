@@ -182,9 +182,10 @@ def _sync_and_clear_cache(stream=None):
     """
     with _mx_buffer_access_lock:
         # The engine stream may not have in-flight work on the current thread
-        # (e.g. external prefill submits to the default stream). On some MLX
-        # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
-        # thread" in that case; swallow it since there is nothing to drain.
+        # (for example, during teardown before that thread submits work). On
+        # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
+        # current thread" in that case; swallow it since there is nothing to
+        # drain.
         target = stream if stream is not None else _default_generation_stream
         try:
             mx.synchronize(target)
@@ -1653,6 +1654,7 @@ class Scheduler:
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
+        self._draft_paged_ssd_cache_manager: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
@@ -3077,8 +3079,18 @@ class Scheduler:
                     )
 
             _throttle_pre = get_phys_footprint()
-            self.model(input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs)
-            mx.eval([c.state for c in prompt_cache])
+            # External prefill bypasses BatchGenerator, so it must establish
+            # the per-engine stream context itself. Native lazy primitives
+            # otherwise bind to the worker's unrelated default stream and can
+            # fail at mx.eval with "There is no Stream(gpu, X) in current
+            # thread" (issue #2170).
+            with mx.stream(self._stream):
+                self.model(
+                    input_arr[:, :n_to_process],
+                    cache=prompt_cache,
+                    **model_kwargs,
+                )
+                mx.eval([c.state for c in prompt_cache])
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -4046,8 +4058,11 @@ class Scheduler:
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
         _throttle_pre = get_phys_footprint()
-        self.model(chunk, cache=state.cache)
-        mx.eval([c.state for c in state.cache])
+        # Chunked prefill also bypasses BatchGenerator and must establish the
+        # same per-engine stream context as the regular external prefill path.
+        with mx.stream(self._stream):
+            self.model(chunk, cache=state.cache)
+            mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
             n,
@@ -6389,12 +6404,21 @@ class Scheduler:
     ) -> None:
         """Set the draft model for SpecPrefill scoring.
 
-        Creates a separate BlockAwarePrefixCache for the draft model
-        using the existing paged SSD cache infrastructure. The model_name
-        in compute_block_hash() naturally isolates draft blocks from target.
+        Creates separate block and SSD cache managers for the draft model so
+        target TurboQuant signatures cannot invalidate draft cache blocks.
         """
+        if not self._close_specprefill_draft_cache_manager():
+            raise RuntimeError(
+                "Could not close the previous SpecPrefill draft SSD cache manager"
+            )
         self._specprefill_draft_model = draft_model
         self._draft_prefix_cache: Any | None = None
+        if not draft_model_name:
+            logger.info(
+                "SpecPrefill: draft model set without a stable model name "
+                "(no SSD cache)"
+            )
+            return
 
         if (
             self.paged_cache_manager is not None
@@ -6404,16 +6428,48 @@ class Scheduler:
                 from .cache.paged_cache import PagedCacheManager
                 from .cache.prefix_cache import BlockAwarePrefixCache
 
-                name = draft_model_name or "specprefill-draft"
+                name = draft_model_name
+                draft_cache_list = make_prompt_cache(draft_model)
+                draft_layer_cache_types = None
+                if HAS_CACHE_TYPE_HANDLERS and ModelCacheConfig is not None:
+                    try:
+                        draft_model_cache_config = ModelCacheConfig.from_cache_list(
+                            draft_cache_list,
+                            model_name=name,
+                        )
+                        draft_layer_cache_types = draft_model_cache_config.get_type_names()
+                    except Exception as e:
+                        logger.debug(
+                            "Could not infer SpecPrefill draft cache layout: %s", e
+                        )
                 draft_paged = PagedCacheManager(
                     block_size=self.config.paged_cache_block_size,
                     max_blocks=self.paged_cache_manager.max_blocks,
                     model_name=name,
                 )
+                draft_ssd = PagedSSDCacheManager(
+                    cache_dir=Path(self.config.paged_ssd_cache_dir),
+                    max_size_bytes=self.config.paged_ssd_cache_max_size,
+                    hot_cache_max_bytes=self.config.hot_cache_max_size,
+                    hot_cache_only=self.config.hot_cache_only,
+                    hot_cache_budget=self.config.hot_cache_budget,
+                    expected_model_name=name,
+                    expected_num_layers=len(draft_cache_list),
+                    expected_block_size=self.config.paged_cache_block_size,
+                    expected_block_size_tokens=self.config.paged_cache_block_size,
+                    expected_kv_bytes_per_token=getattr(
+                        self.paged_ssd_cache_manager,
+                        "_expected_kv_bytes_per_token",
+                        200_000,
+                    ),
+                    expected_layer_cache_types=draft_layer_cache_types,
+                )
+                self._draft_paged_ssd_cache_manager = draft_ssd
+                draft_paged.set_paged_ssd_cache_manager(draft_ssd)
                 self._draft_prefix_cache = BlockAwarePrefixCache(
                     model=draft_model,
                     paged_cache_manager=draft_paged,
-                    paged_ssd_cache_manager=self.paged_ssd_cache_manager,
+                    paged_ssd_cache_manager=draft_ssd,
                 )
                 self._draft_prefix_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
@@ -6422,10 +6478,31 @@ class Scheduler:
                     f"SpecPrefill: draft model set with SSD cache (model_name={name})"
                 )
             except Exception as e:
+                self._draft_prefix_cache = None
+                self._close_specprefill_draft_cache_manager()
                 logger.warning(f"SpecPrefill: draft SSD cache setup failed: {e}")
                 logger.info("SpecPrefill: draft model set (no SSD cache)")
         else:
             logger.info("SpecPrefill: draft model set (no SSD cache)")
+
+    def _close_specprefill_draft_cache_manager(self) -> bool:
+        manager = self._draft_paged_ssd_cache_manager
+        if manager is None:
+            return True
+        try:
+            manager.close()
+        except Exception as e:
+            logger.warning("SpecPrefill draft SSD cache shutdown error: %s", e)
+            return False
+        writer_thread = getattr(manager, "_writer_thread", None)
+        if writer_thread is not None and writer_thread.is_alive():
+            logger.warning(
+                "SpecPrefill draft SSD cache writer remains active after shutdown"
+            )
+            return False
+
+        self._draft_paged_ssd_cache_manager = None
+        return True
 
     def set_vlm_mtp_drafter(
         self,
@@ -6842,13 +6919,16 @@ class Scheduler:
             )
 
             t0 = time.monotonic()
-            importance, used_cache = score_tokens(
-                self._specprefill_draft_model,
-                tokens_to_score,
-                prefill_step_size=self.config.prefill_step_size,
-                existing_cache=draft_cache,
-                progress_callback=_score_progress,
-            )
+            # Draft scoring bypasses BatchGenerator, so keep its lazy model
+            # work and evals on this engine's worker-local stream.
+            with mx.stream(self._stream):
+                importance, used_cache = score_tokens(
+                    self._specprefill_draft_model,
+                    tokens_to_score,
+                    prefill_step_size=self.config.prefill_step_size,
+                    existing_cache=draft_cache,
+                    progress_callback=_score_progress,
+                )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
 
@@ -8182,8 +8262,9 @@ class Scheduler:
                                 detail="system prompt prefill",
                                 extra=spec_sparse_extra,
                             )
-                            self.model(sys_arr[:step][None], cache=sp_cache)
-                            mx.eval([c.state for c in sp_cache])
+                            with mx.stream(self._stream):
+                                self.model(sys_arr[:step][None], cache=sp_cache)
+                                mx.eval([c.state for c in sp_cache])
                             sys_processed += step
                             _check_specprefill_abort(sys_processed)
                             tracker.update(
@@ -8216,8 +8297,9 @@ class Scheduler:
                                 detail="system prompt prefill",
                                 extra=spec_sparse_extra,
                             )
-                            self.model(sys_arr[None], cache=sp_cache)
-                            mx.eval([c.state for c in sp_cache])
+                            with mx.stream(self._stream):
+                                self.model(sys_arr[None], cache=sp_cache)
+                                mx.eval([c.state for c in sp_cache])
                             sys_processed += final_sys
                             _check_specprefill_abort(sys_processed)
                             tracker.update(
@@ -8272,15 +8354,17 @@ class Scheduler:
                             },
                         )
 
-                    sparse_prefill(
-                        self.model,
-                        conv_tokens,
-                        selected,
-                        sp_cache,
-                        step_size=self.config.prefill_step_size,
-                        position_offset=pos_offset,
-                        progress_callback=_sparse_progress,
-                    )
+                    # Sparse target prefill also runs its own model/eval loop.
+                    with mx.stream(self._stream):
+                        sparse_prefill(
+                            self.model,
+                            conv_tokens,
+                            selected,
+                            sp_cache,
+                            step_size=self.config.prefill_step_size,
+                            position_offset=pos_offset,
+                            progress_callback=_sparse_progress,
+                        )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
                     # adjustment = conv_len - selected_len'. Subtract 1 to account for the
                     # extra token BatchGenerator will process.
@@ -10016,7 +10100,10 @@ class Scheduler:
                 self._boundary_snapshot_store.shutdown()
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
+        self._close_specprefill_draft_cache_manager()
         self.paged_cache_manager = None
+        self._draft_prefix_cache = None
+        self._specprefill_draft_model = None
         self.block_aware_cache = None
         self.memory_monitor = None
         self._boundary_snapshot_store = None
@@ -10084,6 +10171,9 @@ class Scheduler:
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
             self._boundary_snapshot_store = None
+        self._close_specprefill_draft_cache_manager()
+        self._draft_prefix_cache = None
+        self._specprefill_draft_model = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
