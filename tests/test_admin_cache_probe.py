@@ -8,10 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from omlx.cache.paged_cache import compute_block_hash
-import omlx.server  # noqa: F401 — triggers set_admin_getters
 import omlx.admin.routes as admin_routes
-
+import omlx.server  # noqa: F401 — triggers set_admin_getters
+from omlx.cache.paged_cache import compute_block_hash
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,6 +101,61 @@ def _pool_with(entries):
 # ---------------------------------------------------------------------------
 # Error / edge-case tests
 # ---------------------------------------------------------------------------
+
+
+class TestCacheProbeToolCallNormalization:
+    """Verify cache probing mirrors chat-path tool argument normalization."""
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected"),
+        [
+            ('{"city":"Seoul"}', {"city": "Seoul"}),
+            ("   ", {}),
+        ],
+    )
+    def test_normalizes_arguments_before_rendering(self, arguments, expected):
+        messages = [
+            {"role": "user", "content": "Check the weather."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        ]
+        request = _make_request(messages=messages)
+        tokenizer = _make_tokenizer([1, 2, 3, 4])
+        scheduler = _make_scheduler()
+        entry = _make_engine_entry(tokenizer, scheduler)
+        rendered_messages = None
+
+        def render(normalized, tools, **kwargs):
+            nonlocal rendered_messages
+            rendered_messages = normalized
+            return "rendered prompt"
+
+        entry.engine._apply_chat_template = render
+        pool = _pool_with({MODEL_ID: entry})
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+            asyncio.run(admin_routes.probe_cache(request, is_admin=True))
+
+        normalized_arguments = rendered_messages[1]["tool_calls"][0]["function"][
+            "arguments"
+        ]
+        assert normalized_arguments == expected
+        assert (
+            request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
+        )
 
 
 class TestCacheProbeErrors:
