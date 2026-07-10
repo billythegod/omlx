@@ -36,7 +36,7 @@ class Omlx < Formula
   resource "en-core-web-sm" do
     url "https://github.com/explosion/spacy-models/releases/download/" \
         "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-    sha256 "dcdeadfa184723be5501429dd4446856302c5275c22b55356f06ac576088f93a"
+    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
   end
 
   service do
