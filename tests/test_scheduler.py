@@ -1739,8 +1739,9 @@ class TestSyncAndClearCache:
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
         raises 'There is no Stream(gpu, 0) in current thread' when called
         from an executor thread that has not submitted work to that stream
-        (e.g. during _do_external_prefill). The helper must swallow that
-        RuntimeError and still drain the default stream + clear the cache.
+        (e.g. during teardown before the thread submits work). The helper must
+        swallow that RuntimeError and still drain the default stream + clear
+        the cache.
         """
         from omlx import scheduler as sched_mod
 
