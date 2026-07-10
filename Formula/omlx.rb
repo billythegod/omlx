@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.5.0rc1.tar.gz"
-  sha256 "dcdeadfa184723be5501429dd4446856302c5275c22b55356f06ac576088f93a"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.5.0.tar.gz"
+  sha256 "644422d3ac79cc82f170eb942b18469528ea15f7433fb155bf6393da51ff06cb"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -36,7 +36,7 @@ class Omlx < Formula
   resource "en-core-web-sm" do
     url "https://github.com/explosion/spacy-models/releases/download/" \
         "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+    sha256 "644422d3ac79cc82f170eb942b18469528ea15f7433fb155bf6393da51ff06cb"
   end
 
   service do
