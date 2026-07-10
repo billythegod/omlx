@@ -2,7 +2,8 @@
 """Route Qwen3.5/3.6 head_dim=256 prefill attention to a steel FA kernel.
 
 This patch is intentionally narrow:
-  - Qwen3.5/3.6 dense VLM attention layout: q heads=24, kv heads=4, D=256
+  - Qwen3.5/3.6 head_dim=256 GQA attention (dense 24/4, MoE 16/2, and any
+    other q%kv==0 layout; gqa_factor is a runtime kernel param)
   - causal prefill/chunked-prefill only (q_len >= 16; decode and MTP verify
     stay on the stock path)
   - no array masks and no sinks
@@ -75,10 +76,15 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
     q_len = queries.shape[-2]
     kv_len = keys.shape[-2]
     head_dim = queries.shape[-1]
+    # Any D=256 GQA layout, not just the dense 24/4 one: the steel kernel
+    # takes gqa_factor as a runtime param, and the 16/2 MoE models
+    # (Qwen3.6-35B-A3B etc.) otherwise fall into the tiled sdpa256 prefill
+    # path, which is ~2x slower than even the stock unfused fallback at
+    # long context (issue #2155).
     return (
         head_dim == 256
-        and q_heads == 24
-        and kv_heads == 4
+        and kv_heads > 0
+        and q_heads % kv_heads == 0
         and kv_len >= min_kv_len
         and q_len <= kv_len
     )

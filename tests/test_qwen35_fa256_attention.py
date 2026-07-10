@@ -68,8 +68,14 @@ def test_route_gate_is_qwen_fa256_only():
     q, k, _ = _qkv(128, 2048)
     assert patch._should_route(q, k, None, "causal", None, min_kv_len=2048)
     assert patch._should_route(q, k, None, None, None, min_kv_len=2048)
-    assert not patch._should_route(q[:, :12], k, None, "causal", None, 2048)
-    assert not patch._should_route(q, k[:, :2], None, "causal", None, 2048)
+    # any q%kv==0 GQA layout routes (issue #2155): the MoE 16/2 layout is
+    # the case the relaxation exists for
+    assert patch._should_route(q[:, :12], k, None, "causal", None, 2048)
+    assert patch._should_route(q, k[:, :2], None, "causal", None, 2048)
+    assert patch._should_route(q[:, :16], k[:, :2], None, "causal", None, 2048)
+    # non-divisible head counts stay on the stock path
+    assert not patch._should_route(q[:, :10], k, None, "causal", None, 2048)
+    assert not patch._should_route(q[:, :14], k[:, :3], None, "causal", None, 2048)
     assert not patch._should_route(q[:, :, :1], k, None, "causal", None, 2048)
     # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
     # the steel prefill kernel is 3-16x slower at tiny q_len (issue #2127)
