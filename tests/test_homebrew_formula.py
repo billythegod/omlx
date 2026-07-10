@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Regression tests for the Homebrew formula's macOS 27 beta workarounds.
+"""Regression tests for the Homebrew formula and its release automation.
+
+The release workflow must update only the formula's top-level source URL and
+checksum. Resource blocks have independent checksums that must survive version
+bumps (issues #2151 and #2173).
 
 macOS 27 betas broke `brew install omlx` in several ways (issue #2110):
 
@@ -17,8 +20,8 @@ macOS 27 betas broke `brew install omlx` in several ways (issue #2110):
   so a prebuilt wheel could clobber a source-built package, and pip's
   wheel cache could resurrect a dylib built before the strip guards.
 
-The formula is Ruby, so these are text-level assertions that the guards
-stay present in Formula/omlx.rb.
+The formula and workflow use Ruby and shell syntax, so these are text-level
+assertions that the guards stay present.
 """
 
 from pathlib import Path
@@ -26,13 +29,43 @@ from pathlib import Path
 import pytest
 
 FORMULA_PATH = Path(__file__).resolve().parents[1] / "Formula" / "omlx.rb"
+WORKFLOW_PATH = (
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "update-formula.yml"
+)
 
 MACOS_27_GUARD = 'MacOS.version >= "27"'
+SPACY_MODEL_SHA256 = "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
 
 
 @pytest.fixture(scope="module")
 def formula() -> str:
     return FORMULA_PATH.read_text()
+
+
+@pytest.fixture(scope="module")
+def formula_update_workflow() -> str:
+    return WORKFLOW_PATH.read_text()
+
+
+class TestFormulaReleaseUpdate:
+    def test_source_sha_update_is_scoped_to_top_level(self, formula_update_workflow):
+        """Release bumps must not replace checksums inside resource blocks."""
+        sha_update = next(
+            line.strip()
+            for line in formula_update_workflow.splitlines()
+            if line.lstrip().startswith("sed -i") and "steps.sha.outputs.sha256" in line
+        )
+
+        assert "s|^  sha256" in sha_update
+        assert '"$|  sha256' in sha_update
+
+    def test_spacy_model_checksum_is_independent(self, formula):
+        """The bundled spaCy wheel checksum must survive source version bumps."""
+        resource_start = formula.index('resource "en-core-web-sm" do')
+        resource_end = formula.index("\n  end", resource_start)
+        resource_block = formula[resource_start:resource_end]
+
+        assert f'sha256 "{SPACY_MODEL_SHA256}"' in resource_block
 
 
 class TestMacOS27Workarounds:
@@ -83,7 +116,7 @@ class TestSharedPipFlags:
 class TestCustomKernelBuild:
     def test_cmake_pinned_to_venv_python(self, formula):
         """CMake must not discover a stray system Python for kernel builds."""
-        assert '-DPython_EXECUTABLE=#{libexec}/bin/python' in formula
+        assert "-DPython_EXECUTABLE=#{libexec}/bin/python" in formula
 
     def test_kernel_verification_not_shadowed_by_buildpath(self, formula):
         """Import check must run outside buildpath's raw omlx/ source tree."""
