@@ -1305,66 +1305,182 @@ def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
 class _DepthController:
     """Adaptive draft-depth selection.
 
-    Pure host-side bookkeeping — no extra GPU syncs. Tracks EMA conditional
-    acceptance per depth position and EMA cycle wall-time per depth used,
-    then picks the depth with the best expected tokens/sec:
+    Pure host-side bookkeeping — no extra GPU syncs. Tracks an EMA of
+    conditional acceptance per depth position and a wall-time EMA of cycle
+    cost per depth used, then picks the depth with the best expected tokens
+    per unit time:
 
         score(d) = (1 + p1 + p1*p2 + ... ) / t_est(d)
 
-    Re-evaluated every ADAPT_INTERVAL cycles with 3% switch hysteresis.
-    Deep positions go stale once the controller settles shallow, so every
-    PROBE_INTERVAL cycles it runs a short probe burst at max depth to
-    refresh their estimates. Content-adaptive by construction: prose/chat
-    settles at depth 1, code/predictable text climbs to 2-3.
+    Everything the decision uses is measured on this machine, on this model,
+    under the current load — no hand-tuned per-chip or per-model value:
+
+    - Cost: a warmup sweep runs each depth once so every ``t[d]`` starts from
+      a real cycle; the marginal cost of an extra verify row is the measured
+      slope between depths (``_marginal_est``), so a fine-grained MoE on a
+      bandwidth-limited chip learns its true (large) marginal within the first
+      few cycles. ``MARGINAL_MS`` is only the pre-measurement fallback.
+    - Drift: the cost EMA horizon is wall-clock (``TAU_MS``), not a cycle
+      count, so context growth, thermal throttling and external GPU contention
+      are tracked at constant real-time responsiveness however long a cycle
+      is; a one-off slow cycle is damped (``SPIKE_RATIO``).
+    - Staleness: only the depth currently run gets fresh measurements, and a
+      fresh-vs-stale cost comparison is systematically biased — e.g. a depth
+      whose t was measured during the slow post-prefill cycles looks expensive
+      forever, so the controller locks into its rival (measured as a depth-2
+      lock costing prose ~2-4%). Probes are therefore BIDIRECTIONAL and
+      staleness-directed: on a wall-clock cadence, re-run the best rival depth
+      (shallower or deeper) when its score is within ``PROBE_MARGIN`` of the
+      current choice, and periodically the most-stale depth, so every t[d] has
+      bounded age. On heavy models a fixed wall-clock cadence would spend a
+      large share of cycles probing, so probing is duty-bounded to
+      ~``PROBE_DUTY`` of cycles — a scale-free ratio, not a per-model tuning.
+
+    Content-adaptive by construction: prose/chat settles at depth 1,
+    code/predictable text climbs. Rejected alternatives (interleaved
+    in-process A/B, rotated order, paired per rep, on Qwen3.6-35B-A3B +
+    GLM-5.2, M3 Ultra): a fixed shallow-bias constant (won earlier separate-
+    process comparisons only by masking the staleness lock; this design beats
+    it on 3 of 4 model x content cells and ties the 4th), a pure realized
+    tok/s bandit (exploration tax), a live per-cycle learned correction
+    (decision churn), a frozen cross-generation correction (content
+    oscillation), and a base x shape cost decomposition (unidentifiable while
+    one depth runs for long stretches).
     """
 
-    ALPHA = 0.08  # EMA weight (~12-cycle memory)
-    ADAPT_INTERVAL = 16
-    PROBE_INTERVAL = 96
-    PROBE_LEN = 6
-    # Prior cost of one extra verify token. 7 ms matches dense backbones
-    # (measured 6-10 ms); fine-grained MoE models override it per model —
-    # each extra verify row pulls a nearly disjoint routed-expert set, so
-    # the marginal row costs a large fraction of a full step and a dense
-    # prior makes the controller over-draft on low-acceptance content
-    # until the EMA catches up.
+    ALPHA = 0.08  # acceptance EMA weight (token domain, content-driven)
+    TAU_MS = 400.0  # cost EMA horizon in wall-clock ms (load/thermal/context)
+    PROBE_PERIOD_MS = 1000.0  # min wall-time between probes (light models)
+    PROBE_PERIOD_MAX_MS = 5000.0  # staleness-exploration cadence floor
+    PROBE_LEN = 4
+    PROBE_DUTY = 0.15  # probes never consume more than ~this share of cycles
+    PROBE_MARGIN = 1.15  # a rival within this score ratio is worth re-measuring
+    SPIKE_RATIO = 2.0  # a cycle above this * the EMA is treated as an outlier
+    SPIKE_DAMP = 0.25  # ...and folded in at this fraction of the normal weight
+    # Fallback prior for one extra verify token's cost, used only until two
+    # depths have actually been measured; after that the marginal is the
+    # measured slope between depths. 7 ms matches dense backbones (6-10 ms).
     MARGINAL_MS = 7.0
-    HYSTERESIS = 1.03
+    HYSTERESIS = 1.03  # switch depth only for a >3% score gain
 
     def __init__(self, max_depth: int, marginal_ms: Optional[float] = None):
         if marginal_ms:
             self.MARGINAL_MS = float(marginal_ms)
         self.max_depth = max(1, int(max_depth))
-        self.cur = self.max_depth  # start deep so deep stats populate early
+        self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         self.p = [0.6] * self.max_depth
         self.t: Dict[int, float] = {}
+        self.t_age: Dict[int, float] = {}  # ms since each depth was measured
         self.cycles = 0
         self.probe_left = 0
+        self._ms_probe = 0.0  # wall-time since any probe burst
+        self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
+        # Measure each depth once (max..1) before the score gate takes over, so
+        # t[] and the marginal estimate are data-driven within max_depth cycles.
+        self._warmup: List[int] = list(range(self.max_depth, 0, -1))
 
     def observe(self, used: int, accepted: int, cycle_ms: float) -> None:
-        a = self.ALPHA
         self.cycles += 1
+        used = max(1, min(int(used), self.max_depth))
+        accepted = max(0, min(int(accepted), used))
+        # Acceptance: token-domain EMA (a property of model/content, not load).
+        a = self.ALPHA
         for j in range(used):
             hit = 1.0 if j < accepted else 0.0
             self.p[j] = (1.0 - a) * self.p[j] + a * hit
             if j >= accepted:
                 break
-        prev = self.t.get(used)
-        self.t[used] = cycle_ms if prev is None else (1.0 - a) * prev + a * cycle_ms
+        # Cost: wall-time-domain EMA with a one-off-spike guard, plus per-depth
+        # ages so probes can target the estimate that is most stale.
+        cycle_ms = max(0.0, float(cycle_ms))
+        self._update_time(used, cycle_ms)
+        for d in list(self.t_age):
+            self.t_age[d] += cycle_ms
+        self.t_age[used] = 0.0
+        self._ms_probe += cycle_ms
+        self._ms_explore += cycle_ms
+
+        # Warmup sweep: keep walking max..1 until every depth is measured once.
+        if self._warmup:
+            self._warmup.pop(0)
+            if self._warmup:
+                self.cur = self._warmup[0]
+                return
+            self.cur = self._best()
+            self._ms_probe = 0.0
+            return
+
+        # Finishing a probe burst.
         if self.probe_left > 0:
             self.probe_left -= 1
             if self.probe_left == 0:
                 self.cur = self._best()
+                self._ms_probe = 0.0
             return
-        if self.cycles % self.ADAPT_INTERVAL == 0:
-            self.cur = self._best()
-        if (
-            self.max_depth > 1
-            and self.cur < self.max_depth
-            and self.cycles % self.PROBE_INTERVAL == 0
-        ):
-            self.cur = self.max_depth
-            self.probe_left = self.PROBE_LEN
+
+        # Re-decide every cycle (cheap); HYSTERESIS in _best prevents thrash.
+        self.cur = self._best()
+
+        # Probe scheduling: bounded-staleness re-measurement in either
+        # direction, at a duty-bounded wall-clock cadence.
+        if self.max_depth > 1:
+            period = max(
+                self.PROBE_PERIOD_MS,
+                self.PROBE_LEN * cycle_ms / self.PROBE_DUTY,
+            )
+            if self._ms_probe >= period:
+                explore_due = self._ms_explore >= max(
+                    self.PROBE_PERIOD_MAX_MS, 2.0 * period
+                )
+                target = (
+                    self._most_stale() if explore_due else self._best_rival()
+                )
+                if target is not None:
+                    self.cur = target
+                    self.probe_left = self.PROBE_LEN
+                    self._ms_probe = 0.0
+                    if explore_due:
+                        self._ms_explore = 0.0
+
+    def _time_alpha(self, cycle_ms: float) -> float:
+        # EMA weight for a cycle of this wall-time: the memory horizon is
+        # ~TAU_MS regardless of cycle duration, so responsiveness is constant
+        # in real time whether a cycle is 8 ms (short) or 80 ms (128k context).
+        return 1.0 - math.exp(-max(0.0, float(cycle_ms)) / self.TAU_MS)
+
+    def _update_time(self, used: int, cycle_ms: float) -> None:
+        cycle_ms = max(0.0, float(cycle_ms))
+        prev = self.t.get(used)
+        if prev is None:
+            self.t[used] = cycle_ms
+            return
+        # Deliberately a per-cycle EMA, NOT an irregular-sampling EMA weighted
+        # by staleness age. Age-weighting (nearly replacing a stale estimate at
+        # the first probe cycle) is the textbook form, but it was measured
+        # WORSE here: single-cycle noise is ~±10%, so replacing an estimate
+        # from a 4-cycle probe burst injects that noise straight into the depth
+        # decision every probe (~1s), and prose re-over-drafted (-1.6%). The
+        # slow EMA is a variance shield; stale errors are corrected by probe
+        # REPETITION instead (each ~1s rival probe moves the estimate ~10% of
+        # the gap, converging within a few seconds).
+        a = self._time_alpha(cycle_ms)
+        if cycle_ms > self.SPIKE_RATIO * prev:
+            a *= self.SPIKE_DAMP  # a one-off spike moves the estimate slowly
+        self.t[used] = (1.0 - a) * prev + a * cycle_ms
+
+    def _marginal_est(self) -> float:
+        # Measured cost of one extra verify row: the slope between the cheapest
+        # and priciest measured depths. Falls back to the prior until two
+        # depths exist. This is what self-calibrates the controller to the real
+        # (model x chip x context) marginal instead of a hardcoded value.
+        if len(self.t) >= 2:
+            depths = sorted(self.t)
+            lo, hi = depths[0], depths[-1]
+            if hi > lo:
+                slope = (self.t[hi] - self.t[lo]) / (hi - lo)
+                if slope > 0.0:
+                    return slope
+        return self.MARGINAL_MS
 
     def _t_est(self, d: int) -> float:
         if d in self.t:
@@ -1372,7 +1488,7 @@ class _DepthController:
         if not self.t:
             return 30.0 + self.MARGINAL_MS * d
         ref = min(self.t, key=lambda x: abs(x - d))
-        return self.t[ref] + self.MARGINAL_MS * (d - ref)
+        return self.t[ref] + self._marginal_est() * (d - ref)
 
     def _score(self, d: int) -> float:
         expected = 1.0
@@ -1382,14 +1498,52 @@ class _DepthController:
             expected += run
         return expected / max(1e-6, self._t_est(d))
 
-    def _best(self) -> int:
-        cur_score = self._score(self.cur)
-        best_d, best_score = self.cur, cur_score
+    def _best_rival(self) -> Optional[int]:
+        # The highest-scoring depth other than cur, if within PROBE_MARGIN —
+        # i.e. a depth whose (possibly stale) estimate could flip the choice.
+        # Bidirectional on purpose: re-measuring a SHALLOWER rival is what
+        # breaks the depth-2 lock (a stale-high t[1] hides depth 1's true
+        # advantage and nothing else would ever refresh it).
+        best = self._score(self.cur)
+        if best <= 0.0:
+            return self._most_stale()
+        rival = None
+        rival_score = 0.0
         for d in range(1, self.max_depth + 1):
+            if d == self.cur:
+                continue
             s = self._score(d)
-            if s > best_score:
-                best_d, best_score = d, s
-        if best_d != self.cur and best_score < cur_score * self.HYSTERESIS:
+            if s > rival_score:
+                rival, rival_score = d, s
+        if rival is not None and rival_score >= best / self.PROBE_MARGIN:
+            return rival
+        return None
+
+    def _most_stale(self) -> Optional[int]:
+        # The depth whose cost estimate has gone longest unmeasured (never
+        # measured counts as infinitely stale). Keeps every t[d] fresh enough
+        # that fresh-vs-stale comparison bias stays bounded.
+        cand = None
+        worst = -1.0
+        for d in range(1, self.max_depth + 1):
+            if d == self.cur:
+                continue
+            age = self.t_age.get(d)
+            age = float("inf") if age is None else age
+            if age > worst:
+                cand, worst = d, age
+        return cand
+
+    def _best(self) -> int:
+        # argmax of measured score with switch hysteresis; the shallow-to-deep
+        # scan with strict '>' keeps the lower depth on an exact tie.
+        scores = [self._score(d) for d in range(1, self.max_depth + 1)]
+        best_i = 0
+        for i in range(1, self.max_depth):
+            if scores[i] > scores[best_i]:
+                best_i = i
+        best_d = best_i + 1
+        if best_d != self.cur and scores[best_i] < scores[self.cur - 1] * self.HYSTERESIS:
             return self.cur
         return best_d
 
