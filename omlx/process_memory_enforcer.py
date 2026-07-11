@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from .settings import get_system_memory
+from . import settings as _settings
 from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
@@ -194,9 +194,13 @@ def _wired_limit_suggestion_bytes(desired_bytes: int) -> int:
     Only shapes the suggested sysctl value in logs and the admin banner;
     the enforcement path still honors whatever the kernel sysctl allows,
     including user-set values above this recommendation.
+
+    Resolved through the settings module at call time so tests that patch
+    omlx.settings.get_system_memory control this the same way they control
+    the static ceiling.
     """
     try:
-        total = int(get_system_memory())
+        total = int(_settings.get_system_memory())
     except Exception:  # noqa: BLE001
         return desired_bytes
     if total <= 0:
@@ -251,7 +255,7 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
         return 0, None
 
     try:
-        _total = int(get_system_memory())
+        _total = int(_settings.get_system_memory())
     except Exception:  # noqa: BLE001
         _total = 0
     if _total > 0:

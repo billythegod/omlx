@@ -1220,7 +1220,6 @@ class TestMetalWiredLimit:
         with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
             with (
                 patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
-                patch.object(pme, "get_system_memory", return_value=512 * 1024**3),
                 patch(
                     "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
                     return_value=128 * 1024**3,  # Apple default below static ceiling
@@ -2438,7 +2437,7 @@ class TestWiredLimitSuggestionClamp:
     """The recommended iogpu.wired_limit_mb must leave the OS headroom (#2184)."""
 
     def _with_total(self, total):
-        return patch.object(pme, "get_system_memory", return_value=total)
+        return patch("omlx.settings.get_system_memory", return_value=total)
 
     def test_suggestion_below_reserve_unchanged(self):
         total = 512 * 1024**3
