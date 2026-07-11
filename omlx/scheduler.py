@@ -50,6 +50,7 @@ from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import PrefillMemoryExceededError, is_cache_corruption_error
+from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -1651,6 +1652,11 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
+        # Let the sdpa256 head_dim-256 prefill route ask for live guard
+        # headroom so it only takes the slow O(L) tiled pass when the faster
+        # unfused fallback would not fit (issue #2204). Weakly held; harmless
+        # when the patch is never applied.
+        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
@@ -3335,6 +3341,26 @@ class Scheduler:
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
+
+    def _sdpa256_unfused_headroom(self) -> int:
+        """Live headroom (bytes) for one unfused SDPA transient, under the
+        same target the adaptive prefill throttle enforces (hard ceiling x
+        headroom safety, clamped by the abort cap). Negative when no ceiling
+        is active (enforcer not propagated yet / guard disabled), which tells
+        the sdpa256 route to keep its memory-safe tiled default. Called from
+        the route gate on the MLX step thread mid-prefill, where refreshing
+        the active-memory sample is safe (issue #2204)."""
+        hard_cap = self._memory_hard_limit_bytes
+        if hard_cap <= 0:
+            return -1
+        headroom_safety = getattr(
+            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
+        )
+        target = int(hard_cap * headroom_safety)
+        abort_cap = self._prefill_abort_cap()
+        if abort_cap > 0:
+            target = min(target, abort_cap)
+        return target - self._current_usage_bytes()
 
     _MAX_PREFILL_EVICTION_RETRIES = 1
 
