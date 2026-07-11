@@ -3019,7 +3019,12 @@ class Scheduler:
         last_token = tokens[-1:]
         total_length = len(tokens)
 
-        input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
+        # Build the input row on the engine stream: the chunk forwards below
+        # run inside mx.stream(self._stream), and a worker-default-stream
+        # view would split the chunk eval graph across two streams (see the
+        # loop comment below).
+        with mx.stream(self._stream):
+            input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
         uid = self.request_id_to_uid.get(request.request_id)
 
@@ -3070,27 +3075,36 @@ class Scheduler:
                 request_id=request.request_id,
             )
 
-            model_kwargs: dict[str, Any] = {}
-            if embeds_array is not None and embeds_array.shape[1] > 0:
-                model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
-                if extra_kwargs:
-                    model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
-                        extra_kwargs, n_to_process
-                    )
-
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
             # fail at mx.eval with "There is no Stream(gpu, X) in current
-            # thread" (issue #2170).
+            # thread" (issue #2170). The chunk views (input slices, VLM embed
+            # slices, and the advance views for the next chunk) stay inside
+            # the same context: a worker-default-stream view splits the chunk
+            # eval graph across two streams and adds a per-chunk cross-stream
+            # fence, the synchronization pattern implicated in the #2197 and
+            # #2183 engine hangs on macOS 26.
             with mx.stream(self._stream):
+                model_kwargs: dict[str, Any] = {}
+                if embeds_array is not None and embeds_array.shape[1] > 0:
+                    model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
+                    if extra_kwargs:
+                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                            extra_kwargs, n_to_process
+                        )
                 self.model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
                     **model_kwargs,
                 )
                 mx.eval([c.state for c in prompt_cache])
+                input_arr = input_arr[:, n_to_process:]
+                if embeds_array is not None:
+                    embeds_array = embeds_array[:, n_to_process:]
+                    if extra_kwargs:
+                        extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -3100,11 +3114,6 @@ class Scheduler:
                 loop_label="external",
             )
 
-            input_arr = input_arr[:, n_to_process:]
-            if embeds_array is not None:
-                embeds_array = embeds_array[:, n_to_process:]
-                if extra_kwargs:
-                    extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             processed_tokens += n_to_process
 
             # Progress callback
@@ -3985,7 +3994,10 @@ class Scheduler:
 
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
-        input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
+        # Build the input row on the engine stream so chunk eval graphs stay
+        # single-stream (see _do_external_prefill, #2197/#2183).
+        with mx.stream(self._stream):
+            input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
 
         return _PrefillState(
             request=request,
@@ -4055,12 +4067,14 @@ class Scheduler:
             request_id=state.request.request_id,
         )
 
-        chunk = state.tokens_remaining[:, :n]
-        state.tokens_remaining = state.tokens_remaining[:, n:]
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
+        # The chunk views stay inside it for the same reason (single-stream
+        # chunk eval graph, #2197/#2183).
         with mx.stream(self._stream):
+            chunk = state.tokens_remaining[:, :n]
+            state.tokens_remaining = state.tokens_remaining[:, n:]
             self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
@@ -6929,7 +6943,9 @@ class Scheduler:
                     existing_cache=draft_cache,
                     progress_callback=_score_progress,
                 )
-            selected = select_chunks(importance, keep_pct=keep_pct)
+                # select_chunks consumes the lazy importance scores; keep its
+                # ops on the same stream (#2197, #2183).
+                selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
 
             n_selected = selected.shape[0]
@@ -8265,6 +8281,10 @@ class Scheduler:
                             with mx.stream(self._stream):
                                 self.model(sys_arr[:step][None], cache=sp_cache)
                                 mx.eval([c.state for c in sp_cache])
+                                # Advance view stays on the engine stream so
+                                # the next chunk's eval graph is single-stream
+                                # (#2197, #2183).
+                                sys_arr = sys_arr[step:]
                             sys_processed += step
                             _check_specprefill_abort(sys_processed)
                             tracker.update(
@@ -8276,7 +8296,6 @@ class Scheduler:
                                 detail="system prompt prefill",
                                 extra=spec_sparse_extra,
                             )
-                            sys_arr = sys_arr[step:]
                             # Use _sync_and_clear_cache() instead of bare
                             # mx.clear_cache() to flush the engine stream
                             # before releasing Metal buffers.  A bare call here
@@ -8450,12 +8469,16 @@ class Scheduler:
                         self._cleanup_prefill_abort_request(request)
                         continue
                     except _PrefillEvictionNeeded as e:
-                        self._release_paged_cache_for_request(request.request_id)
-                        self._pause_for_prefill_eviction(
-                            request,
-                            e.request,
-                            reset_chunked_state=True,
-                        )
+                        # Raised by the adaptive throttle before the first
+                        # chunk's forward pass, so a reconstructed prefix
+                        # (prompt_cache / block_table / cached_tokens) is
+                        # still valid. Keep it attached across the pause:
+                        # if no idle model gets evicted, the retry prefills
+                        # only the uncached suffix under the adaptive
+                        # throttle instead of recomputing the whole prompt
+                        # cold (#2180). Mirrors the in-flight pause in
+                        # _advance_chunked_prefills, which also keeps state.
+                        self._pause_for_prefill_eviction(request, e.request)
                         break
                     except PrefillMemoryExceededError as e:
                         logger.error(
@@ -9698,25 +9721,18 @@ class Scheduler:
         self,
         request: "Request",
         eviction: PrefillEvictionRequest,
-        *,
-        reset_chunked_state: bool = False,
     ) -> None:
-        """Hold a request until EngineCore can evict idle models asynchronously."""
+        """Hold a request until EngineCore can evict idle models asynchronously.
+
+        The request's prefix-cache state (prompt_cache, block_table,
+        cached_tokens, remaining_tokens) is deliberately left untouched so
+        a reconstructed prefix survives the pause and the retry prefills
+        only the uncached suffix instead of recomputing the prompt cold
+        (#2180).
+        """
         self._pending_prefill_eviction_request = eviction
         request.status = RequestStatus.WAITING
         request.batch_uid = None
-        if reset_chunked_state:
-            self._prefill_states.pop(request.request_id, None)
-            try:
-                self.prefilling.remove(request)
-            except ValueError:
-                pass
-            request.prompt_cache = None
-            request.cached_tokens = 0
-            request.remaining_tokens = request.prompt_token_ids
-            request.block_table = None
-            request.shared_prefix_blocks = 0
-            get_prefill_tracker().remove(request.request_id)
         self.waiting.appendleft(request)
         logger.info(
             "Paused request %s for prefill LRU eviction (reason=%s)",
