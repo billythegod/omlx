@@ -1368,6 +1368,7 @@ class SchedulerConfig:
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
+    model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
@@ -1648,7 +1649,7 @@ class Scheduler:
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
         if config is not None and config.model_name:
-            _tracker_model_id = os.path.basename(config.model_name.rstrip("/"))
+            _tracker_model_id = config.model_name
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
@@ -2508,7 +2509,7 @@ class Scheduler:
             # Always create a fresh detokenizer - no pooling to prevent state contamination
             detok = create_streaming_detokenizer(
                 self.tokenizer,
-                model_path=self.config.model_name,
+                model_path=self.config.model_path,
             )
             if detok is None:
                 # Fallback: return None, we'll use decode([token])
@@ -2625,8 +2626,7 @@ class Scheduler:
         prefill progress.  Only touches CPU counters — zero GPU overhead.
         """
         tracker = get_prefill_tracker()
-        # model_name is a full path; use basename to match engine_pool model_id.
-        model_id = os.path.basename(self.config.model_name.rstrip("/"))
+        model_id = self.config.model_name
         for uid, processed, total in updates:
             request_id = self.uid_to_request_id.get(uid)
             if request_id is None:
@@ -4136,7 +4136,7 @@ class Scheduler:
             state.tokens_processed,
             state.total_length - 1,
             (
-                os.path.basename(self.config.model_name.rstrip("/"))
+                self.config.model_name
                 if self.config.model_name
                 else ""
             ),
@@ -4803,7 +4803,7 @@ class Scheduler:
         # Try reading the .jinja file from model directory
         import os
 
-        model_path = getattr(self.config, "model_name", None) or ""
+        model_path = getattr(self.config, "model_path", None) or ""
         jinja_path = os.path.join(model_path, "chat_template.jinja")
         if os.path.isfile(jinja_path):
             try:
@@ -6898,7 +6898,7 @@ class Scheduler:
             plan=plan,
             draft_model=self._specprefill_draft_model,
             draft_prefix_cache=self._draft_prefix_cache,
-            model_id=os.path.basename(self.config.model_name.rstrip("/")),
+            model_id=self.config.model_name,
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
             extract_cache_states=self._extract_cache_states,
@@ -8097,7 +8097,7 @@ class Scheduler:
             #   First gen token: pos = (N'+1) + (M - N' - 1) = M
             if request.specprefill_indices is not None:
                 tracker = get_prefill_tracker()
-                model_id = os.path.basename(self.config.model_name.rstrip("/"))
+                model_id = self.config.model_name
                 total_pp = 0
                 try:
                     sys_count = getattr(request, "_specprefill_system_tokens", 0)
