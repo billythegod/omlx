@@ -3,7 +3,9 @@
 
 When TurboQuantKVCache is detected, routes attention to:
   - Decode (L=1): cache.decode_attention() — Metal kernel, no dequant
-  - Decode-shaped multi-row (1 < L <= 15, causal; MTP verify): the L rows
+  - Decode-shaped multi-row (1 < L <= 15, causal; MTP verify): a fused
+    2-pass kernel that unpacks each KV token once and scores all L rows
+    against it (MSE codecs, issue #2215); outside its envelope the L rows
     are folded into the GQA repeat dimension so the codecs' decode kernels
     apply, with the causal tail mask injected between key scoring and the
     value weighted sum — one lazy pass over the KV, no dequantize
@@ -12,6 +14,7 @@ When TurboQuantKVCache is detected, routes attention to:
 """
 
 import logging
+from functools import cache
 from typing import Optional
 
 import mlx.core as mx
@@ -31,6 +34,258 @@ _DECODE_MULTIROW_MAX_Q_LEN = 15
 _MAX_FOLDED_REPEATS = 24
 # Softmax-denominator floor, matching turboquant's quantized_attention.
 _STATS_EPS = 1e-6
+# Fused multi-row verify kernel envelope. Register arrays scale with QRows
+# (q + o accumulators per row), so cap the rows; the adaptive MTP controller
+# tops out at depth 3 (L=4). Below the token floor the fold path is already
+# sub-0.2ms and the 2-pass block split has too few tokens per block.
+_FUSED_MULTIROW_MAX_Q_ROWS = 4
+_FUSED_MULTIROW_MIN_TOKENS = 2048
+
+
+@cache
+def _fused_mse_multirow_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
+    """Pass 1 of the fused multi-row MSE verify attention.
+
+    Derived from turboquant's ``_fused_mse_decode_2pass_1_kernel`` with one
+    structural change: each simdgroup unpacks a token's K/V codebook entries
+    once and reuses them across all QRows query rows (per-row online softmax
+    stats, causal tail applied inline). The upstream decode kernels re-unpack
+    the KV per query row, so MTP verify paid the unpack ALU L times over
+    (issue #2215).
+    """
+    from mlx_vlm import turboquant as _tq
+
+    if not _tq._metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0:
+        return None
+
+    elems_per_lane = dim // 32
+    k_misaligned = (elems_per_lane * key_bits) % 8 != 0
+    v_misaligned = (elems_per_lane * val_bits) % 8 != 0
+    k_exprs = _tq._gen_unrolled_extract(
+        key_bits, elems_per_lane, "key_codebook", "k_bit_off" if k_misaligned else ""
+    )
+    v_exprs = _tq._gen_unrolled_extract(
+        val_bits, elems_per_lane, "val_codebook", "v_bit_off" if v_misaligned else ""
+    )
+    v_exprs = [e.replace("kb[", "vb[") for e in v_exprs]
+    k_lines = "\n            ".join(
+        f"k_el[{i}] = {expr};" for i, expr in enumerate(k_exprs)
+    )
+    v_lines = "\n            ".join(
+        f"v_el[{i}] = {expr};" for i, expr in enumerate(v_exprs)
+    )
+
+    source = f"""
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        typedef float U;
+
+        // Thread identity — matches turboquant's mse_sdpa_2pass_1 layout
+        auto kv_head_idx = threadgroup_position_in_grid.x;
+        auto batch_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+        auto simd_lid = thread_index_in_simdgroup;
+        auto gqa_idx = thread_position_in_threadgroup.y;
+
+        auto token_count = key_norms_shape[2];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = batch_idx * kv_heads + kv_head_idx;
+        auto bqh = batch_idx * kv_heads * RepeatCount
+            + kv_head_idx * RepeatCount + gqa_idx;
+
+        auto k_nm = key_norms + bh * token_count;
+        auto k_pk = key_packed + bh * token_count * KPackedWidth;
+        auto v_nm = val_norms + bh * token_count;
+        auto v_pk = val_packed + bh * token_count * VPackedWidth;
+
+        // All QRows pre-rotated queries for this (kv_head, repeat) pair
+        thread U q[QRows][qk_per_thread];
+        for (int r = 0; r < QRows; r++) {{
+            auto qr = queries + (bqh * QRows + r) * Dim
+                + simd_lid * qk_per_thread;
+            for (int i = 0; i < qk_per_thread; i++)
+                q[r][i] = static_cast<U>(qr[i]);
+        }}
+
+        thread U o[QRows][v_per_thread] = {{}};
+        U max_score[QRows];
+        U sum_exp_score[QRows];
+        for (int r = 0; r < QRows; r++) {{
+            max_score[r] = -INFINITY;
+            sum_exp_score[r] = 0;
+        }}
+
+        // Byte/bit offset for this lane's first element
+        int k_bit_start = simd_lid * qk_per_thread * {key_bits};
+        int v_bit_start = simd_lid * v_per_thread * {val_bits};
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if k_misaligned else ""}
+        {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
+
+        // KV loop: unpack each token once, score all QRows rows against it
+        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+            U kn = static_cast<U>(k_nm[t]);
+            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)
+                + k_byte_base;
+            U k_el[qk_per_thread];
+            {k_lines}
+
+            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth)
+                + v_byte_base;
+            U vn = static_cast<U>(v_nm[t]);
+            U v_el[v_per_thread];
+            {v_lines}
+
+            // Row r sits at global position token_count - QRows + r; token
+            // t is invisible to rows r < t - (token_count - QRows).
+            int first_row = t - (int)token_count + QRows;
+            for (int r = 0; r < QRows; r++) {{
+                U dot = 0;
+                for (int i = 0; i < qk_per_thread; i++)
+                    dot += q[r][i] * k_el[i];
+                U score = simd_sum(dot) * kn;
+                if (r >= first_row) {{
+                    U new_max = max(max_score[r], score);
+                    U factor = fast::exp(max_score[r] - new_max);
+                    U exp_score = fast::exp(score - new_max);
+                    max_score[r] = new_max;
+                    sum_exp_score[r] = sum_exp_score[r] * factor + exp_score;
+                    for (int i = 0; i < v_per_thread; i++)
+                        o[r][i] = o[r][i] * factor + exp_score * v_el[i] * vn;
+                }}
+            }}
+        }}
+
+        // Write per-row partial results for this block
+        for (int r = 0; r < QRows; r++) {{
+            auto row_out = bqh * QRows + r;
+            if (simd_lid == 0) {{
+                out_sums[row_out * Blocks + block_idx] = sum_exp_score[r];
+                out_maxs[row_out * Blocks + block_idx] = max_score[r];
+            }}
+            for (int i = 0; i < v_per_thread; i++)
+                out_acc[(row_out * Blocks + block_idx) * Dim
+                    + simd_lid * v_per_thread + i] = static_cast<U>(o[r][i]);
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"omlx_tq_mse_multirow_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+    )
+
+
+def _fused_multirow_mse_attention(
+    real_cache, queries, keys_state, values_state, scale, total
+):
+    """Run MTP verify attention through the fused multi-row kernel.
+
+    Returns None when the states/codecs are outside the kernel envelope
+    (non-MSE codecs, fractional bits, mismatched dims); the caller falls
+    back to the fold / one-shot paths.
+    """
+    from mlx_vlm import turboquant as _tq
+
+    key_codec = getattr(real_cache, "key_codec", None)
+    value_codec = getattr(real_cache, "value_codec", None)
+    if not (
+        isinstance(key_codec, _tq._TurboQuantMSECodec)
+        and isinstance(value_codec, _tq._TurboQuantMSECodec)
+    ):
+        return None
+    if not (
+        isinstance(keys_state, _tq.TurboQuantMSEState)
+        and isinstance(values_state, _tq.TurboQuantMSEState)
+    ):
+        return None
+    if key_codec.bits != int(key_codec.bits) or value_codec.bits != int(
+        value_codec.bits
+    ):
+        return None
+
+    B, n_q_heads, L, D = queries.shape
+    if key_codec.dim != D or value_codec.dim != D:
+        return None
+    if keys_state.norms.shape[0] != B:
+        return None
+    n_kv_heads = keys_state.norms.shape[1]
+    n_repeats = n_q_heads // n_kv_heads
+
+    pass1 = _fused_mse_multirow_2pass1_kernel(
+        int(key_codec.bits), int(value_codec.bits), D
+    )
+    pass2 = _tq._fused_mse_decode_2pass_2_kernel()
+    if pass1 is None or pass2 is None:
+        return None
+
+    grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+    q_rot = key_codec.prepare_queries(grouped)
+    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats * L, D)
+
+    # Same block split table as turboquant's 2-pass decode dispatch.
+    if total <= 8192:
+        num_blocks = 64
+    elif total <= 32768:
+        num_blocks = 128
+    elif total <= 65536:
+        num_blocks = 256
+    else:
+        num_blocks = 512
+
+    n_rows = B * n_q_heads * L
+    out_acc, out_sums, out_maxs = pass1(
+        inputs=[
+            q_rot_flat,
+            keys_state.norms,
+            keys_state.indices,
+            key_codec.codebook,
+            values_state.norms,
+            values_state.indices,
+            value_codec.codebook,
+        ],
+        template=[
+            ("Dim", D),
+            ("RepeatCount", n_repeats),
+            ("QRows", L),
+            ("Blocks", num_blocks),
+            ("KPackedWidth", keys_state.indices.shape[-1]),
+            ("VPackedWidth", values_state.indices.shape[-1]),
+        ],
+        grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
+        threadgroup=(32, n_repeats, 1),
+        output_shapes=[
+            (n_rows * num_blocks, D),
+            (n_rows * num_blocks,),
+            (n_rows * num_blocks,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    out = pass2(
+        inputs=[out_acc, out_sums, out_maxs],
+        template=[("Dim", D), ("Blocks", num_blocks)],
+        grid=(n_rows * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(n_rows, D)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+    out_rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+    output = value_codec._rotate_inverse(out_rotated)
+    return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
 
 def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scale):
@@ -67,11 +322,13 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
 
     MTP verify would otherwise fall into the prefill fallbacks, which
     re-dequantize or chunk-scan the whole cache with per-chunk eval syncs
-    on every verify cycle (issue #2127 class). Folding the L rows into the
-    repeat dimension keeps the L==1 decode kernels applicable (repeat
-    count is a kernel template parameter); the causal tail mask is applied
-    on the raw scores before the value weighted sum. Returns None when the
-    states don't fit; the caller falls back to the generic paths.
+    on every verify cycle (issue #2127 class). MSE-codec states take the
+    fused multi-row kernel (one KV unpack shared across the L rows, issue
+    #2215); other codecs fold the L rows into the repeat dimension so the
+    L==1 decode kernels stay applicable (repeat count is a kernel template
+    parameter), with the causal tail mask applied on the raw scores before
+    the value weighted sum. Returns None when the states don't fit; the
+    caller falls back to the generic paths.
     """
     from mlx_vlm.turboquant import TurboQuantSplitState
 
@@ -89,6 +346,19 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     total = _state_length(keys_state)
     if total < L:
         return None
+    if L <= _FUSED_MULTIROW_MAX_Q_ROWS and total > _FUSED_MULTIROW_MIN_TOKENS:
+        try:
+            result = _fused_multirow_mse_attention(
+                real_cache, queries, keys_state, values_state, scale, total
+            )
+        except Exception:
+            logger.debug(
+                "TurboQuant fused multi-row kernel failed; using fold path",
+                exc_info=True,
+            )
+            result = None
+        if result is not None:
+            return result
     if n_repeats * L > _MAX_FOLDED_REPEATS:
         return _decode_multirow_quantized_attention(
             real_cache, queries, keys, values, scale

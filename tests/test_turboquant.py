@@ -565,6 +565,105 @@ def test_decode_multirow_matches_dequantize_reference(q_len):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
+@pytest.mark.parametrize("q_len", [2, 3, 4])
+def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
+    """Above the token floor, MSE-codec MTP verify takes the fused multi-row
+    kernel (one KV unpack shared across rows, issue #2215). Its output must
+    match the dequantize+SDPA reference with the causal tail mask, and the
+    dispatcher must route to it bit-exactly."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 1, 16, 2, 256
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    fused = tq_attention._fused_multirow_mse_attention(
+        tq, queries, tq._unwrap(ks), tq._unwrap(vs), scale, T
+    )
+    assert fused is not None
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+    routed = tq_attention._decode_multirow_attention(tq, queries, ks, vs, scale)
+    routed_diff = mx.abs(routed.astype(mx.float32) - fused.astype(mx.float32))
+    assert routed_diff.max().item() == 0.0
+
+
+@pytest.mark.parametrize("bits", [2.5, 3.5, 8])
+def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits):
+    """Fractional turboquant_kv_bits split into different K/V integer bit
+    widths (2.5 -> K=2/V=3); the fused kernel templates the two widths
+    independently and must stay parity-correct across them."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D = 1, 16, 2, 256
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, 3, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    fused = tq_attention._fused_multirow_mse_attention(
+        tq, queries, tq._unwrap(ks), tq._unwrap(vs), scale, T
+    )
+    assert fused is not None
+
+    dk, dv = tq.dequantize()
+    causal = mx.arange(T)[None, :] <= mx.arange(T - 3, T)[:, None]
+    ref = mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+    assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def test_fused_multirow_kernel_respects_token_floor(monkeypatch):
+    """Below the token floor the dispatcher must not call the fused helper
+    (the fold path is already cheap there and the 2-pass block split needs
+    enough tokens per block)."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(0)
+    B, n_q, n_kv, D, T = 1, 16, 2, 256, 512
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, 3, D)).astype(mx.float16)
+
+    def fail_fused(*args, **kwargs):
+        raise AssertionError("fused kernel must not run below the token floor")
+
+    monkeypatch.setattr(
+        tq_attention, "_fused_multirow_mse_attention", fail_fused
+    )
+    out = tq_attention._decode_multirow_attention(tq, queries, ks, vs, D**-0.5)
+    assert out is not None
+    assert out.shape == (B, n_q, 3, D)
+
+
 def test_attention_patch_routes_decode_multirow_causal(monkeypatch):
     """A decode-shaped multi-row causal call (MTP verify) must take the
     multirow decode route — never prefill_attention / dequantize (issue
