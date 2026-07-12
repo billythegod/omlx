@@ -103,8 +103,8 @@ class TestToolCallParsing:
         assert stream_token is None
         assert visible_token is None
 
-    def test_get_tool_calls_requires_commentary_channel(self):
-        """Only commentary messages with function recipients become tool calls."""
+    def test_get_tool_calls_channel_rules(self):
+        """Commentary always counts; analysis counts only with JSON arguments."""
         parser = object.__new__(HarmonyStreamingParser)
         parser._parser = SimpleNamespace(
             messages=[
@@ -112,6 +112,11 @@ class TestToolCallParsing:
                     channel="analysis",
                     recipient="functions.Read",
                     content=[SimpleNamespace(text="analysis-noise")],
+                ),
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
                 ),
                 SimpleNamespace(
                     channel="commentary",
@@ -127,7 +132,8 @@ class TestToolCallParsing:
         )
 
         assert parser.get_tool_calls() == [
-            {"name": "Read", "arguments": '{"path":"ok.py"}'}
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
         ]
 
 
@@ -388,13 +394,18 @@ class TestParseToolCallsFromTokens:
         assert "thinking" in analysis_text
         assert tool_calls == []
 
-    def test_requires_commentary_channel_for_function_recipient(self, monkeypatch):
-        """Mixed messages keep only commentary function recipients as tool calls."""
+    def test_channel_rules_for_function_recipient(self, monkeypatch):
+        """Commentary and JSON-argument analysis recipients become tool calls."""
         messages = [
             SimpleNamespace(
                 channel="analysis",
                 recipient="functions.Read",
                 content=[SimpleNamespace(text="analysis-noise")],
+            ),
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
             ),
             SimpleNamespace(
                 channel="commentary",
@@ -432,4 +443,38 @@ class TestParseToolCallsFromTokens:
 
         assert analysis_text == "analysis-noise"
         assert output_text == "final-noise"
-        assert tool_calls == [{"name": "Read", "arguments": '{"path":"ok.py"}'}]
+        assert tool_calls == [
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
+        ]
+
+    def test_analysis_channel_tool_call_with_recipient(self, encoding):
+        """Analysis-channel tool calls with explicit recipients are honored (#2216)."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>Now need files.<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            '<|message|>{"filePath": "/tmp/x.py", "offset": 1}<|call|>',
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == [
+            {"name": "read", "arguments": '{"filePath": "/tmp/x.py", "offset": 1}'}
+        ]
+        assert "Now need files." in analysis_text
+        assert "filePath" not in analysis_text
+
+    def test_analysis_recipient_with_prose_stays_reasoning(self, encoding):
+        """Analysis messages addressed to a tool without JSON args stay reasoning."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>ok<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            "<|message|>maybe I should read the file<|call|>",
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == []
+        assert "maybe I should read the file" in analysis_text
