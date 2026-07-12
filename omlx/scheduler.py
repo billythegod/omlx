@@ -1877,6 +1877,7 @@ class Scheduler:
                     self.config.model_name,
                     self.tokenizer,
                     model_config,
+                    model_path=self.config.model_path,
                 )
                 if self._output_parser_factory is not None:
                     self._output_parser_kind = self._output_parser_factory.kind
