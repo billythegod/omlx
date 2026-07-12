@@ -153,7 +153,12 @@ class DFlashEngine(BaseEngine):
         self._draft_quant_group_size = draft_quant_group_size
         self._model_settings = model_settings
         self._fallback_engine_type = fallback_engine_type
-        self._scheduler_config = scheduler_config
+        # Snapshot the scheduler config now: the engine pool mutates the
+        # shared instance (model_name/model_path) on every model load, and
+        # the fallback engine may start long after this engine was built.
+        self._scheduler_config = (
+            copy.copy(scheduler_config) if scheduler_config else scheduler_config
+        )
         self._omlx_ssd_cache_dir = (
             Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
         )

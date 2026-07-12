@@ -754,8 +754,8 @@ final class ModelSettingsScreenVM {
         }
         if vlmMtpEnabled {
             return String(localized: "settings.mtp.conflict.vlm_mtp",
-                          defaultValue: "Disable VLM MTP before enabling Native MTP.",
-                          comment: "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on")
+                          defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
     }
@@ -776,8 +776,8 @@ final class ModelSettingsScreenVM {
         }
         if mtpEnabled {
             return String(localized: "settings.vlm_mtp.conflict.mtp",
-                          defaultValue: "Disable Native MTP before enabling VLM MTP.",
-                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on")
+                          defaultValue: "Disable Lightning MTP before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because Lightning MTP is on")
         }
         if turboquantKvEnabled {
             return String(localized: "settings.vlm_mtp.conflict.turboquant",
