@@ -292,11 +292,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     @state.setter
     def state(self, value):
         TurboQuantKVCache.state.fset(self, value)
-        # Restored states (SSD cache, extract/merge round-trips) are packed
-        # at their exact written width — sync the physical end for the B>1
-        # bookkeeping paths.
-        if self.keys is not None and not isinstance(self.offset, int):
-            self._phys_end = _state_length(self.keys)
+        # The parent fset resets to int-offset (B=1) bookkeeping, where the
+        # parent's offset is the write cursor (and trim() may move it back).
+        # Drop any stale batch-mode value so _ensure_array_offset re-derives
+        # _phys_end from that cursor at the B>1 switch.
+        self._phys_end = 0
 
     # ---- make_mask override (batch-aware) ----------------------------------
 

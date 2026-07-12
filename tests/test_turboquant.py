@@ -1124,3 +1124,24 @@ def test_batch_tq_append_growth_keeps_content_and_geometry():
     assert err < 0.2, f"row0 content shifted/corrupted after growth ({err:.3f})"
     err_new = mx.abs(dk[0, :, 48, :].astype(mx.float32) - nk[0, :, 0, :].astype(mx.float32)).max().item()
     assert err_new < 0.2, f"appended token not at written end ({err_new:.3f})"
+
+
+def test_batch_tq_state_restore_resets_phys_end():
+    """A state restore hands the cache back to the parent's int-offset (B=1)
+    bookkeeping, where the offset is the write cursor. A stale batch-mode
+    _phys_end must not survive the restore: _ensure_array_offset takes the
+    max of both, so a leftover value from a longer previous batch would win
+    over the restored cursor and leave a gap of unwritten columns."""
+    batch, _ = _make_ragged_batch()  # B=2, written end 48
+
+    single = TurboQuantKVCache(bits=8.0)
+    k = mx.random.normal((1, 2, 20, 32)).astype(mx.float16)
+    single.update_and_fetch(k, k)
+    batch.state = single.state  # restore a 20-token state onto the object
+
+    assert isinstance(batch.offset, int) and batch.offset == 20
+    batch._ensure_array_offset()
+    assert batch._phys_end == 20, (
+        f"stale batch-mode _phys_end leaked through restore "
+        f"({batch._phys_end} != 20)"
+    )
