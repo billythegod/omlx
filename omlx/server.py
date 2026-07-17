@@ -3043,6 +3043,10 @@ async def create_completion(
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
 
+            # First prompt's first-token timestamp only: later prompts start
+            # after earlier generations, so their first_token_at would count
+            # prior generation time as prefill.
+            first_token_at = None
             for i, prompt in enumerate(prompts):
                 output = await engine.generate(
                     prompt=prompt,
@@ -3060,6 +3064,8 @@ async def create_completion(
                     seed=request.seed,
                     **gen_kwargs,
                 )
+                if i == 0:
+                    first_token_at = getattr(output, "first_token_at", None)
 
                 choices.append(
                     CompletionChoice(
@@ -3078,7 +3084,6 @@ async def create_completion(
                 f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
-            first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
                 (first_token_at - start_time)
                 if first_token_at is not None
