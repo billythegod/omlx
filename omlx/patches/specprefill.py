@@ -914,9 +914,9 @@ def cleanup_rope(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
             continue
-        rope = attn.rope
-        if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+        genuine = _unwrap_rope(attn.rope)
+        if genuine is not attn.rope:
+            attn.rope = genuine
 
 
 # ===========================================================================

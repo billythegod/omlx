@@ -496,6 +496,28 @@ class TestRoPEWrappers:
         cleanup_rope(model)
         assert layer.self_attn.rope is original_rope
 
+    def test_cleanup_rope_unwraps_nested(self):
+        from unittest.mock import MagicMock
+
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            cleanup_rope,
+        )
+
+        original_rope = MagicMock()
+        nested = _OffsetAdjustedRoPE(
+            _OffsetAdjustedRoPE(original_rope, adjustment=3), adjustment=5
+        )
+
+        model = MagicMock()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = nested
+        model.layers = [layer]
+
+        cleanup_rope(model)
+        assert layer.self_attn.rope is original_rope
+
 
 class TestModelSettings:
     """Tests for SpecPrefill fields in ModelSettings."""
@@ -647,10 +669,8 @@ class TestRoPEReWrap:
         positions = mx.arange(16)
         assert _unwrap_rope(genuine) is genuine
         assert _unwrap_rope(_OffsetAdjustedRoPE(genuine, 5)) is genuine
-        assert (
-            _unwrap_rope(_PositionMappedRoPE(_OffsetAdjustedRoPE(genuine, 5), positions))
-            is genuine
-        )
+        nested = _PositionMappedRoPE(_OffsetAdjustedRoPE(genuine, 5), positions)
+        assert _unwrap_rope(nested) is genuine
 
     def test_rewrap_leftover_does_not_crash(self):
         from omlx.patches.specprefill import (
@@ -663,3 +683,76 @@ class TestRoPEReWrap:
         # Previously raised AttributeError on original_rope.dims (#766)
         pm = _PositionMappedRoPE(leftover, mx.arange(16))
         assert pm._dims == 128
+
+
+class TestTargetPrefillLeftoverCleanup:
+    """run_specprefill_target_prefill restores RoPE at entry (#766 follow-up).
+
+    A stale _OffsetAdjustedRoPE left by an aborted specprefill request must be
+    removed before the system prompt prefill runs, otherwise system KV is
+    written at offset-shifted positions.
+    """
+
+    def test_leftover_unwrapped_before_prefill(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import omlx.patches.specprefill as patches
+        import omlx.specprefill.target as target_mod
+        from omlx.specprefill.planning import SpecPrefillTargetPlan
+
+        class FakeRoPE:
+            dims = 64
+            base = 10000.0
+            scale = 1.0
+
+            def __call__(self, x, offset=0):
+                return x
+
+        genuine = FakeRoPE()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = patches._OffsetAdjustedRoPE(genuine, adjustment=7)
+        model = MagicMock()
+        model.layers = [layer]
+
+        seen = {}
+
+        def fake_sparse_prefill(m, tokens, selected, cache, **kwargs):
+            seen["rope"] = layer.self_attn.rope
+            return mx.zeros((1, 1))
+
+        monkeypatch.setattr(patches, "sparse_prefill", fake_sparse_prefill)
+        monkeypatch.setattr(target_mod, "make_prompt_cache", lambda m: [])
+
+        plan = SpecPrefillTargetPlan(
+            system_token_count=0,
+            conversation_tokens=list(range(8)),
+            conversation_token_count=8,
+            generation_kickoff_index=7,
+            remove_kickoff_index=False,
+            sparse_selected_token_count=4,
+            total_tracker_prefill_count=4,
+            position_offset=0,
+        )
+        request = MagicMock()
+        request.num_prompt_tokens = 8
+        request.cached_tokens = 0
+
+        target_mod.run_specprefill_target_prefill(
+            target_model=model,
+            request=request,
+            plan=plan,
+            all_tokens=list(range(8)),
+            selected_indices=mx.array([0, 2, 4, 7]),
+            prefill_step_size=4,
+            stream=mx.cpu,
+            check_abort=lambda n: None,
+            report_system_progress=lambda p, t: None,
+            report_sparse_progress=lambda p, t: None,
+            sync_and_clear_cache=lambda: None,
+            log=MagicMock(),
+        )
+
+        # Entry cleanup must restore the genuine rope before prefill runs
+        assert seen["rope"] is genuine
+        assert layer.self_attn.rope is genuine

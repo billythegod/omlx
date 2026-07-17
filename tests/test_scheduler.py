@@ -967,6 +967,37 @@ class TestSchedulerAbortRequest:
         assert request not in scheduler.waiting
         assert "test-001" in scheduler.finished_req_ids
 
+    def test_abort_active_specprefill_restores_rope(self, mock_model, mock_tokenizer):
+        """Aborting the active specprefill request restores RoPE (#766).
+
+        Aborted requests never flow through _cleanup_finished, so the abort
+        path itself must clear the wrapper and the active id, otherwise the
+        specprefill guard defers all other requests forever.
+        """
+        from omlx.patches.specprefill import _OffsetAdjustedRoPE
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        original_rope = MagicMock()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = _OffsetAdjustedRoPE(original_rope, adjustment=50)
+        mock_model.layers = [layer]
+
+        request = Request(
+            request_id="test-001",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+        scheduler._specprefill_active_request_id = "test-001"
+
+        scheduler.abort_request("test-001")
+        scheduler._process_pending_aborts()
+
+        assert scheduler._specprefill_active_request_id is None
+        assert layer.self_attn.rope is original_rope
+
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
