@@ -3000,3 +3000,518 @@ class TestCanonicalLayerCacheTypes:
         # TurboQuant must remain distinct from plain KVCache.
         assert "TurboQuantKVCache" in result
         assert result != ["ArraysCache", "KVCache", "KVCache"]
+
+
+class TestTurboQuantMixedPayloadReconstruction:
+    """Payload-driven reconstruction of TurboQuant prefix-cache chains.
+
+    A block chain can mix payload formats: blocks stored while TurboQuant KV
+    conversion was active carry tagged ``('__turboquant_v2__', (ks, vs))``
+    NamedTuple states, while blocks stored without conversion (chains
+    written by versions that skipped it on chunked-prefill completion, or
+    stored under a different TQ setting) carry plain dense
+    ``(keys, values)`` tensors in the SAME chain via dedup.
+
+    The per-block ``layer_cache_types`` mismatch check truncates such chains
+    when every block's type metadata is present and accurate (covered by
+    ``TestTurboQuantFormatMismatchRecovery``), but block metadata is
+    optional at load time: metadata files can be missing or corrupt, the
+    ``layer_cache_types`` JSON can fail to round-trip, and a chain whose
+    first block lacks types gets typed from a later block. These tests model
+    such metadata-blind chains (mixed payloads with absent
+    ``layer_cache_types``), where the payload itself is the only ground
+    truth. Typing the whole chain from chain-level metadata fed dense arrays
+    into TurboQuant ``_concat_state`` and crashed with
+    ``AttributeError: 'array' object has no attribute 'norms'``, rejecting
+    the entire cache hit (full re-prefill on long-context hybrid models).
+    """
+
+    BLOCK = 4
+    HEADS = 2
+    HDIM = 64
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def tq_mod(self):
+        """Import mlx_vlm.turboquant or skip."""
+        return pytest.importorskip("mlx_vlm.turboquant")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_cache(self, num_layers=1):
+        """Build a prefix cache with a mocked SSD manager."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        paged_cache = PagedCacheManager(
+            block_size=self.BLOCK,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=num_layers),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        return cache, paged_cache, mock_ssd
+
+    def _alloc_block_table(self, paged_cache, n_blocks):
+        """Allocate n hashed blocks and a block table referencing them."""
+        blocks = []
+        for i in range(n_blocks):
+            b = paged_cache.allocate_block()
+            b.block_hash = f"hash{i}".encode()
+            b.token_count = self.BLOCK
+            b.ref_count = 2  # Simulate fetch_cache having incremented ref
+            blocks.append(b)
+        return BlockTable(
+            request_id="req-001",
+            block_ids=[b.block_id for b in blocks],
+            num_tokens=n_blocks * self.BLOCK,
+        )
+
+    @staticmethod
+    def _unwrap(state):
+        """Unwrap a _QuantizedStateProxy to the raw NamedTuple state."""
+        return state._state if hasattr(state, "_state") else state
+
+    def _tq_quantize(self, mx, tq_mod, keys, values, bits=4.0, seed=0):
+        """Quantize (keys, values) with a real TurboQuantKVCache.
+
+        Returns (tq_cache, ks_state, vs_state, ref_keys, ref_values) where
+        ref_* is the full-state dequantized reference.
+        """
+        tq = tq_mod.TurboQuantKVCache(bits=bits, seed=seed)
+        tq.update_and_fetch(keys, values)
+        ks = self._unwrap(tq.keys)
+        vs = self._unwrap(tq.values)
+        ref_keys, ref_values = tq.dequantize(ks, vs)
+        mx.eval(ref_keys, ref_values)
+        return tq, ks, vs, ref_keys, ref_values
+
+    def _tq_block_payload(self, tq_mod, ks, vs, block_idx):
+        """Build one block's tagged TurboQuant payload by state slicing."""
+        start = block_idx * self.BLOCK
+        end = start + self.BLOCK
+        return (
+            "__turboquant_v2__",
+            (
+                tq_mod._slice_state_range(ks, start, end),
+                tq_mod._slice_state_range(vs, start, end),
+            ),
+        )
+
+    def _metadata(self, layer_cache_types, layer_meta_states, num_layers):
+        return {
+            "model_name": "test-model",
+            "num_layers": num_layers,
+            "block_size": self.BLOCK,
+            "layer_cache_types": layer_cache_types,
+            "layer_meta_states": layer_meta_states,
+        }
+
+    # ------------------------------------------------------------------
+    # Mixed-format chains (the issue regression)
+    # ------------------------------------------------------------------
+
+    def test_mixed_chain_tq_head_plain_tail_reconstructs(self, mx, tq_mod):
+        """Chain typed TurboQuant (first block) with a plain dense tail block.
+
+        Regression for the multi-turn pattern: turn 1 stores TQ-converted
+        blocks; a later turn appends a plain dense block to the same chain.
+        The tail block's layer_cache_types is absent (block metadata is
+        optional at load time), so the type-mismatch truncation cannot see
+        the format change. Reconstruction must dequantize the TQ blocks per
+        block and pass the dense block through instead of rejecting the hit.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        # Blocks 0-1: TurboQuant-converted store (8 tokens quantized)
+        full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        tq, ks, vs, ref_keys, ref_values = self._tq_quantize(
+            mx, tq_mod, full_keys, full_values
+        )
+
+        # Block 2: plain dense store (skipped TQ conversion), stored
+        # without layer_cache_types metadata.
+        plain_k = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+        plain_v = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+
+        tq_metadata = self._metadata(["TurboQuantKVCache"], [tq.meta_state], 1)
+        plain_metadata = self._metadata(None, [()], 1)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], tq_metadata),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], tq_metadata),
+            ([(plain_k, plain_v)], plain_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None, "mixed TQ+plain chain must reconstruct"
+        assert len(result) == 1
+        layer0 = result[0]
+        assert isinstance(layer0, KVCache)
+        assert layer0.offset == 3 * self.BLOCK
+        assert layer0.keys.shape == (1, self.HEADS, 3 * self.BLOCK, self.HDIM)
+
+        # TQ blocks: per-block dequantize must equal the full-state
+        # dequantize reference (TQ states are per-token).
+        assert mx.allclose(
+            layer0.keys[:, :, : 2 * self.BLOCK, :], ref_keys, atol=1e-5
+        )
+        assert mx.allclose(
+            layer0.values[:, :, : 2 * self.BLOCK, :], ref_values, atol=1e-5
+        )
+        # Plain block: passed through unmodified (promoted dtype only).
+        assert mx.allclose(
+            layer0.keys[:, :, 2 * self.BLOCK :, :],
+            plain_k.astype(layer0.keys.dtype),
+            atol=1e-3,
+        )
+        assert mx.allclose(
+            layer0.values[:, :, 2 * self.BLOCK :, :],
+            plain_v.astype(layer0.values.dtype),
+            atol=1e-3,
+        )
+
+    def test_mixed_chain_plain_head_tq_tail_reconstructs(self, mx, tq_mod):
+        """Chain typed KVCache (first block dense) with TQ-tagged tail blocks.
+
+        The reverse mixing direction: the chain-level type from the first
+        block routes through the standard KVCache branch. The TQ tail
+        blocks carry no layer_cache_types metadata (only their per-block
+        meta_states), so the type-mismatch truncation cannot see them; the
+        payload scan must route the layer into the TurboQuant branch, which
+        decodes tagged blocks with their own per-block meta instead of
+        unpacking the tag string as a tensor.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        # Block 0: plain dense store
+        plain_k = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+        plain_v = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+
+        # Blocks 1-2: TurboQuant-converted store, stored without
+        # layer_cache_types metadata.
+        full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        tq, ks, vs, ref_keys, ref_values = self._tq_quantize(
+            mx, tq_mod, full_keys, full_values
+        )
+
+        plain_metadata = self._metadata(["KVCache"], [()], 1)
+        tq_metadata = self._metadata(None, [tq.meta_state], 1)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([(plain_k, plain_v)], plain_metadata),
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], tq_metadata),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], tq_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None, "mixed plain+TQ chain must reconstruct"
+        assert len(result) == 1
+        layer0 = result[0]
+        assert isinstance(layer0, KVCache)
+        assert layer0.offset == 3 * self.BLOCK
+        assert layer0.keys.shape == (1, self.HEADS, 3 * self.BLOCK, self.HDIM)
+
+        assert mx.allclose(
+            layer0.keys[:, :, : self.BLOCK, :],
+            plain_k.astype(layer0.keys.dtype),
+            atol=1e-3,
+        )
+        assert mx.allclose(
+            layer0.keys[:, :, self.BLOCK :, :], ref_keys, atol=1e-5
+        )
+        assert mx.allclose(
+            layer0.values[:, :, self.BLOCK :, :], ref_values, atol=1e-5
+        )
+
+    def test_mixed_chain_hybrid_model_with_arrays_cache_layer(self, mx, tq_mod):
+        """Hybrid (Qwen3.5-style) layout: TQ attention layer + ArraysCache GDN
+        layer, with a plain dense block (no layer_cache_types metadata)
+        appended to the TQ chain."""
+        from mlx_lm.models.cache import KVCache
+
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=2)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        tq, ks, vs, _, _ = self._tq_quantize(mx, tq_mod, full_keys, full_values)
+
+        plain_k = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+        plain_v = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        # ArraysCache (GDN) real state lives in the last stored block.
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 16, 16))
+
+        tq_metadata = self._metadata(
+            ["TurboQuantKVCache", "ArraysCache"], [tq.meta_state, ()], 2
+        )
+        plain_metadata = self._metadata(None, [(), ()], 2)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0), placeholder], tq_metadata),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1), placeholder], tq_metadata),
+            ([(plain_k, plain_v), (conv_state, ssm_state)], plain_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None, "hybrid mixed chain must reconstruct"
+        assert len(result) == 2
+        assert isinstance(result[0], KVCache)
+        assert result[0].offset == 3 * self.BLOCK
+        # GDN layer reconstructed from the last block's real state.
+        assert not isinstance(result[1], KVCache)
+
+    # ------------------------------------------------------------------
+    # Homogeneous chains: zero behavior change
+    # ------------------------------------------------------------------
+
+    def test_all_tq_chain_reconstructs_unchanged(self, mx, tq_mod):
+        """Uniform TQ chain stays quantized (single-run fast path).
+
+        A homogeneous TQ chain is a single run, so it is restored as a
+        quantized ``TurboQuantKVCache`` (upstream #1842: restored
+        long-context prefixes stay quantized and avoid full-state
+        materialization) rather than being dequantized into a dense
+        ``KVCache``. The dequantized state must still match the full-state
+        reference (TQ states are per-token, so per-block concat equals the
+        full-state concat).
+        """
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        full_keys = mx.random.normal((1, self.HEADS, 3 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, 3 * self.BLOCK, self.HDIM))
+        tq, ks, vs, ref_keys, ref_values = self._tq_quantize(
+            mx, tq_mod, full_keys, full_values
+        )
+
+        tq_metadata = self._metadata(["TurboQuantKVCache"], [tq.meta_state], 1)
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, i)], tq_metadata)
+            for i in range(3)
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        layer0 = result[0]
+        assert isinstance(layer0, tq_mod.TurboQuantKVCache)
+        assert layer0.offset == 3 * self.BLOCK
+        rebuilt_keys, rebuilt_values = layer0.dequantize()
+        assert mx.allclose(rebuilt_keys, ref_keys, atol=1e-5)
+        assert mx.allclose(rebuilt_values, ref_values, atol=1e-5)
+
+    def test_all_plain_chain_reconstructs_unchanged(self, mx):
+        """Uniform dense chain keeps exact values and stored dtype."""
+        from mlx_lm.models.cache import KVCache
+
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        slices = [
+            (
+                mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+                    mx.float16
+                ),
+                mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+                    mx.float16
+                ),
+            )
+            for _ in range(3)
+        ]
+
+        plain_metadata = self._metadata(["KVCache"], [()], 1)
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([s], plain_metadata) for s in slices
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        layer0 = result[0]
+        assert isinstance(layer0, KVCache)
+        assert layer0.offset == 3 * self.BLOCK
+        assert layer0.keys.dtype == mx.float16
+        expected_keys = mx.concatenate([k for k, _ in slices], axis=2)
+        expected_values = mx.concatenate([v for _, v in slices], axis=2)
+        assert mx.array_equal(layer0.keys, expected_keys)
+        assert mx.array_equal(layer0.values, expected_values)
+
+    # ------------------------------------------------------------------
+    # Corrupt / placeholder payloads: clean rejection
+    # ------------------------------------------------------------------
+
+    def test_tq_chain_placeholder_block_rejected(self, mx, tq_mod):
+        """A (1,) empty-slice placeholder in a TQ-typed chain rejects the hit
+        cleanly (None) instead of corrupting the concatenated KV."""
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 2)
+
+        full_keys = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM))
+        tq, ks, vs, _, _ = self._tq_quantize(mx, tq_mod, full_keys, full_values)
+
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        tq_metadata = self._metadata(["TurboQuantKVCache"], [tq.meta_state], 1)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], tq_metadata),
+            ([placeholder], tq_metadata),
+        ]
+
+        assert cache.reconstruct_cache(block_table) is None
+
+    def test_plain_chain_tq_placeholder_block_rejected(self, mx):
+        """A (1,) placeholder from a TQ-regime store inside a KVCache-typed
+        chain rejects the hit cleanly (None)."""
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 2)
+
+        plain_k = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+        plain_v = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+            mx.float16
+        )
+        placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+        plain_metadata = self._metadata(["KVCache"], [()], 1)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([(plain_k, plain_v)], plain_metadata),
+            ([placeholder], plain_metadata),
+        ]
+
+        assert cache.reconstruct_cache(block_table) is None
+
+    def test_tq_chain_corrupt_payload_rejected(self, mx, tq_mod):
+        """A payload that is neither tagged, placeholder, nor dense 4D KV
+        rejects the hit cleanly (None) instead of producing wrong KV."""
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 2)
+
+        full_keys = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM))
+        full_values = mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM))
+        tq, ks, vs, _, _ = self._tq_quantize(mx, tq_mod, full_keys, full_values)
+
+        corrupt = (mx.zeros((2, 2)), mx.zeros((2, 2)))  # 2D, not a KV slice
+        tq_metadata = self._metadata(["TurboQuantKVCache"], [tq.meta_state], 1)
+
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], tq_metadata),
+            ([corrupt], tq_metadata),
+        ]
+
+        assert cache.reconstruct_cache(block_table) is None
+
+    def test_tq_chain_absent_meta_uses_configured_bits(self, mx, tq_mod):
+        """Uniform TQ chain whose (bits, seed) metadata never round-tripped.
+
+        Block 0's metadata carries no layer_meta_states (the JSON failed to
+        round-trip); block 1 loads with no metadata at all. Neither
+        per-block nor chain-level meta can resolve (bits, seed). The
+        server-configured TurboQuant KV bit depth is authoritative for
+        admitted blocks (cache eligibility already keys on it), so
+        reconstruction must rebuild the codec at that depth — 8 bits here —
+        rather than the historical bits=4.0 guess, which dequantized 8-bit
+        states into plausible-but-wrong tensors: silent output corruption
+        after a cache hit instead of a loud failure.
+        """
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        mock_ssd._expected_turboquant_kv_bits = 8.0
+        block_table = self._alloc_block_table(paged_cache, 2)
+
+        full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal(
+            (1, self.HEADS, 2 * self.BLOCK, self.HDIM)
+        )
+        tq, ks, vs, ref_keys, ref_values = self._tq_quantize(
+            mx, tq_mod, full_keys, full_values, bits=8.0
+        )
+
+        no_meta_states = self._metadata(["TurboQuantKVCache"], None, 1)
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], no_meta_states),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], None),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None, "configured bit depth must resolve the codec"
+        assert len(result) == 1
+        layer0 = result[0]
+        assert layer0.offset == 2 * self.BLOCK
+        got_keys, got_values = layer0.dequantize(
+            self._unwrap(layer0.keys), self._unwrap(layer0.values)
+        )
+        assert mx.allclose(got_keys, ref_keys, atol=1e-5)
+        assert mx.allclose(got_values, ref_values, atol=1e-5)
+
+    def test_tq_chain_unresolvable_params_rejected(self, mx, tq_mod):
+        """No meta anywhere and no configured bit depth: reject, don't guess.
+
+        Historically this path silently rebuilt the codec at bits=4.0. For a
+        chain stored at any other depth that dequantizes to wrong-width
+        tensors and the request degenerates after the cache hit (upstream
+        issue: `!!!!` output after prefix-cache restores). A rejected hit
+        merely re-prefills — strictly safer than plausible-but-wrong KV.
+        """
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        mock_ssd._expected_turboquant_kv_bits = None
+        block_table = self._alloc_block_table(paged_cache, 2)
+
+        full_keys = mx.random.normal((1, self.HEADS, 2 * self.BLOCK, self.HDIM))
+        full_values = mx.random.normal(
+            (1, self.HEADS, 2 * self.BLOCK, self.HDIM)
+        )
+        tq, ks, vs, _, _ = self._tq_quantize(
+            mx, tq_mod, full_keys, full_values, bits=8.0
+        )
+
+        no_meta_states = self._metadata(["TurboQuantKVCache"], None, 1)
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([self._tq_block_payload(tq_mod, ks, vs, 0)], no_meta_states),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], None),
+        ]
+
+        assert cache.reconstruct_cache(block_table) is None
