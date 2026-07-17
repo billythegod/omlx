@@ -780,7 +780,7 @@ class HFDownloader:
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
-                model_info = None
+                st_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -799,6 +799,12 @@ class HFDownloader:
                             "original/**",
                             "consolidated.*.pth",
                         ]
+                        # Computed inside this try so malformed metadata
+                        # (non-int counts) degrades to no estimate instead
+                        # of failing the download from the dry-run handler.
+                        st_estimate = _calc_safetensors_disk_size(
+                            model_info.safetensors
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
@@ -816,6 +822,7 @@ class HFDownloader:
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                size_estimated = False
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -827,14 +834,9 @@ class HFDownloader:
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
-                    if (
-                        model_info is not None
-                        and model_info.safetensors
-                        and model_info.safetensors.get("parameters")
-                    ):
-                        task.total_size = _calc_safetensors_disk_size(
-                            model_info.safetensors
-                        )
+                    if st_estimate:
+                        task.total_size = st_estimate
+                        size_estimated = True
                         detail = "Estimated total size from safetensors metadata."
                     else:
                         detail = "Progress estimation will be unavailable."
@@ -866,9 +868,12 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
-                task.downloaded_size = task.total_size or self._get_dir_size(
-                    target_dir
-                )
+                if size_estimated or not task.total_size:
+                    # The estimate was only a progress denominator; report
+                    # the measured on-disk size once the download is done.
+                    task.downloaded_size = self._get_dir_size(target_dir)
+                else:
+                    task.downloaded_size = task.total_size
                 task.completed_at = time.time()
 
                 logger.info(
