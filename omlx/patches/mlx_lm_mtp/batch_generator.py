@@ -426,7 +426,15 @@ def _maybe_clear_multirow_marker(gen_batch: Any) -> None:
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) != 1:
         return
-    for cache in getattr(gen_batch, "prompt_cache", None) or []:
+    # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left padding on
+    # their sub-caches, not on the container — recurse instead of skipping.
+    pending = list(getattr(gen_batch, "prompt_cache", None) or [])
+    while pending:
+        cache = pending.pop()
+        sub_caches = getattr(cache, "caches", None)
+        if sub_caches is not None:
+            pending.extend(sub_caches)
+            continue
         left_padding = getattr(cache, "left_padding", None)
         if left_padding is None:
             continue

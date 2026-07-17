@@ -1183,6 +1183,47 @@ class TestBatchGeneratorDispatch:
         batch_generator._maybe_clear_multirow_marker(multirow)
         assert multirow._omlx_mtp_saw_standard_multirow_decode is True
 
+    def test_singleton_recovery_checks_cachelist_sub_caches(self):
+        # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left
+        # padding on their sub-caches, not on the container. The compactness
+        # check must recurse into ``.caches`` instead of skipping the layer,
+        # or the marker clears without verifying anything.
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        class _CacheList:
+            def __init__(self, *caches):
+                self.caches = caches
+
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(SimpleNamespace(left_padding=_Padding([3])))
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        compact = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(
+                    SimpleNamespace(left_padding=_Padding([0])),
+                    SimpleNamespace(left_padding=_Padding([0])),
+                )
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(compact)
+        assert compact._omlx_mtp_saw_standard_multirow_decode is False
+
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
             _MtpState,
