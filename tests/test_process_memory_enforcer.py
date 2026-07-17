@@ -730,6 +730,53 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_metal_cap_bytes == metal_b
         assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
 
+    async def test_propagates_hot_cache_used_for_usage_side_exclusion(
+        self, mock_engine_pool
+    ):
+        """Targets whose usage read is raw phys_footprint (the DFlash primary
+        guard) need the used-bytes counterpart of the reservation, or the
+        hot cache is charged twice: once in the reserved ceiling, once in
+        phys. The enforcer propagates the exact used figure each tick."""
+        metal_b = 16 * 1024**3
+        hot_used_b = 3 * 1024**3
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: hot_used_b + 512 * 1024**2
+        enforcer._hot_cache_used_bytes = lambda: hot_used_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == hot_used_b
+
+    async def test_propagated_hot_cache_used_clamped_to_reservation(
+        self, mock_engine_pool
+    ):
+        """A transient overshoot (live hot-cache bytes past max_bytes) must not
+        exclude more usage than the reservation removed from the ceiling —
+        that would net-weaken the guard exactly under pressure."""
+        metal_b = 16 * 1024**3
+        reserved_b = 3 * 1024**3  # capped at max_bytes
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: reserved_b
+        enforcer._hot_cache_used_bytes = lambda: 5 * 1024**3  # overshoot
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == reserved_b
+
 
 class TestPrefillMemoryGuardToggle:
     """Tests for prefill_memory_guard setter and Metal limit management."""
