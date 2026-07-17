@@ -1946,6 +1946,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Reconstruct caches for each layer
             reconstructed_caches = []
+            healed_tq_layers = 0
 
             for layer_idx in range(num_layers):
                 # Determine cache type for this layer
@@ -2253,10 +2254,12 @@ class BlockAwarePrefixCache(CacheManager):
                     # prefixes stay quantized, avoiding full-state
                     # materialization). Mixed chains (plain dense blocks, or
                     # runs with differing (bits, seed)) are dequantized per run
-                    # and merged into a dense KVCache; mx.concatenate promotes
-                    # any dense blocks to the dequantized float32, matching the
-                    # dtype the TQ reconstruction path has always emitted. The
-                    # healed request trades TurboQuant's memory savings for
+                    # and merged into a dense KVCache, cast back to the dense
+                    # blocks' stored dtype: dequantize() emits float32, and an
+                    # uncast fp32 layer would silently promote the whole merged
+                    # batch cache (2x KV memory) on servers where the TurboQuant
+                    # requantize epilogue does not run (TQ disabled, skip_last).
+                    # The healed request trades TurboQuant's memory savings for
                     # that one restored prefix.
                     try:
                         from mlx_lm.models.cache import KVCache
@@ -2321,10 +2324,13 @@ class BlockAwarePrefixCache(CacheManager):
 
                         key_parts = []
                         value_parts = []
+                        dense_dtype = None
                         for group in groups:
                             if group[0] == "plain":
                                 key_parts.append(group[1])
                                 value_parts.append(group[2])
+                                if dense_dtype is None:
+                                    dense_dtype = group[1].dtype
                                 continue
                             tq_bits, tq_seed = group[2]
                             dq = self._dequantize_tq_run(
@@ -2337,11 +2343,25 @@ class BlockAwarePrefixCache(CacheManager):
 
                         keys = mx.concatenate(key_parts, axis=2)
                         values = mx.concatenate(value_parts, axis=2)
+                        if dense_dtype is not None and keys.dtype != dense_dtype:
+                            keys = keys.astype(dense_dtype)
+                            values = values.astype(dense_dtype)
                         cache = KVCache()
                         cache.keys = keys
                         cache.values = values
                         cache.offset = keys.shape[2]
                         reconstructed_caches.append(cache)
+                        healed_tq_layers += 1
+                        if healed_tq_layers == 1:
+                            n_tq = sum(1 for g in groups if g[0] == "tq")
+                            n_plain = len(groups) - n_tq
+                            logger.info(
+                                f"Healed mixed-format TQ chain: layer "
+                                f"{layer_idx} has {n_tq} quantized run(s) and "
+                                f"{n_plain} dense block group(s); restoring "
+                                f"affected layers as dense KVCache "
+                                f"(dtype={keys.dtype})"
+                            )
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"
@@ -2647,7 +2667,9 @@ class BlockAwarePrefixCache(CacheManager):
             self.paged_ssd_cache, "_expected_turboquant_kv_bits", None
         )
         if isinstance(expected_bits, (int, float)):
-            return float(expected_bits), 0
+            from mlx_vlm.turboquant import DEFAULT_TURBOQUANT_SEED
+
+            return float(expected_bits), int(DEFAULT_TURBOQUANT_SEED)
         return None
 
     def _dequantize_tq_run(
@@ -2672,14 +2694,11 @@ class BlockAwarePrefixCache(CacheManager):
         """
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        from ..turboquant_kv import _concat_state, _rebuild_codecs
+        from ..turboquant_kv import _concat_state_token_axis, _rebuild_codecs
 
         try:
-            cat_ks = None
-            cat_vs = None
-            for ks, vs in run_states:
-                cat_ks = _concat_state(cat_ks, ks)
-                cat_vs = _concat_state(cat_vs, vs)
+            cat_ks = _concat_state_token_axis([ks for ks, _ in run_states])
+            cat_vs = _concat_state_token_axis([vs for _, vs in run_states])
             tq = TurboQuantKVCache(bits=bits, seed=seed)
             _rebuild_codecs(tq, cat_ks, cat_vs)
             return tq.dequantize(cat_ks, cat_vs)

@@ -3174,14 +3174,19 @@ class TestTurboQuantMixedPayloadReconstruction:
         assert isinstance(layer0, KVCache)
         assert layer0.offset == 3 * self.BLOCK
         assert layer0.keys.shape == (1, self.HEADS, 3 * self.BLOCK, self.HDIM)
+        # Healed layer is cast back to the dense blocks' stored dtype so an
+        # fp32 layer never leaks into batch merge on non-requantizing servers.
+        assert layer0.keys.dtype == mx.float16
+        assert layer0.values.dtype == mx.float16
 
         # TQ blocks: per-block dequantize must equal the full-state
-        # dequantize reference (TQ states are per-token).
+        # dequantize reference (TQ states are per-token; fp16 tolerance
+        # since the healed layer is cast to the dense blocks' dtype).
         assert mx.allclose(
-            layer0.keys[:, :, : 2 * self.BLOCK, :], ref_keys, atol=1e-5
+            layer0.keys[:, :, : 2 * self.BLOCK, :], ref_keys, atol=1e-3
         )
         assert mx.allclose(
-            layer0.values[:, :, : 2 * self.BLOCK, :], ref_values, atol=1e-5
+            layer0.values[:, :, : 2 * self.BLOCK, :], ref_values, atol=1e-3
         )
         # Plain block: passed through unmodified (promoted dtype only).
         assert mx.allclose(
@@ -3244,6 +3249,8 @@ class TestTurboQuantMixedPayloadReconstruction:
         assert isinstance(layer0, KVCache)
         assert layer0.offset == 3 * self.BLOCK
         assert layer0.keys.shape == (1, self.HEADS, 3 * self.BLOCK, self.HDIM)
+        assert layer0.keys.dtype == mx.float16
+        assert layer0.values.dtype == mx.float16
 
         assert mx.allclose(
             layer0.keys[:, :, : self.BLOCK, :],
@@ -3251,10 +3258,10 @@ class TestTurboQuantMixedPayloadReconstruction:
             atol=1e-3,
         )
         assert mx.allclose(
-            layer0.keys[:, :, self.BLOCK :, :], ref_keys, atol=1e-5
+            layer0.keys[:, :, self.BLOCK :, :], ref_keys, atol=1e-3
         )
         assert mx.allclose(
-            layer0.values[:, :, self.BLOCK :, :], ref_values, atol=1e-5
+            layer0.values[:, :, self.BLOCK :, :], ref_values, atol=1e-3
         )
 
     def test_mixed_chain_hybrid_model_with_arrays_cache_layer(self, mx, tq_mod):
@@ -3299,6 +3306,7 @@ class TestTurboQuantMixedPayloadReconstruction:
         assert len(result) == 2
         assert isinstance(result[0], KVCache)
         assert result[0].offset == 3 * self.BLOCK
+        assert result[0].keys.dtype == mx.float16
         # GDN layer reconstructed from the last block's real state.
         assert not isinstance(result[1], KVCache)
 
