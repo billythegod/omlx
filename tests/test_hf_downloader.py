@@ -729,6 +729,77 @@ class TestHFDownloader:
 
             await downloader.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_falls_back_to_safetensors_size(self, model_dir):
+        """When dry_run raises, total_size is estimated from safetensors metadata."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-fallback", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        # 7B BF16 model: 7_000_000_000 params * 2 bytes = 14_000_000_000 bytes
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"BF16": 7_000_000_000},
+            "total": 7_000_000_000,
+        }
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+            # actual download succeeds immediately (no-op)
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        # Fallback estimate: 7B BF16 params * 2 bytes/param = 14 GB
+        assert task.total_size == 14_000_000_000
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_no_safetensors_leaves_total_size_zero(self, model_dir):
+        """When dry_run raises and model_info has no safetensors, total_size stays 0."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-no-st", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = None
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        # The download itself must still proceed and complete; only the
+        # progress denominator is unavailable. Pinning status/error here
+        # keeps this test from passing vacuously if the fallback handler
+        # ever raised (which would set FAILED while total_size stays 0).
+        assert task.total_size == 0
+        assert task.status == DownloadStatus.COMPLETED
+        assert task.error == ""
+
 
 # =============================================================================
 # API Routes Tests

@@ -780,6 +780,7 @@ class HFDownloader:
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
+                model_info = None
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -826,9 +827,19 @@ class HFDownloader:
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
+                    if (
+                        model_info is not None
+                        and model_info.safetensors
+                        and model_info.safetensors.get("parameters")
+                    ):
+                        task.total_size = _calc_safetensors_disk_size(
+                            model_info.safetensors
+                        )
+                        detail = "Estimated total size from safetensors metadata."
+                    else:
+                        detail = "Progress estimation will be unavailable."
                     logger.warning(
-                        f"Dry run failed for {task.repo_id}: {e}. "
-                        "Progress estimation will be unavailable."
+                        f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
                 # Start progress polling
