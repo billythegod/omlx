@@ -37,6 +37,15 @@ _queue_running: bool = False
 _current_run_id: Optional[str] = None
 _current_model: Optional[str] = None
 _engine_pool_ref: Any = None
+# Chain-ownership token. A "chain" is one start_next_from_queue call plus
+# the _continue_queue tail it spawns. Each chain captures the token current
+# at its start; cancel_queue and start_next_from_queue bump it. A chain
+# whose token is stale (e.g. it was soft-cancelled and only noticed at its
+# next checkpoint, after the user already started a new chain) must not pop
+# the queue or mutate _queue_running/_current_run_id — otherwise it starts
+# a run concurrently with the live chain, whose Phase 1 "unload all models"
+# rips the engine out from under the active run.
+_chain_id: int = 0
 
 VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
@@ -221,6 +230,7 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
     This is synchronous so the caller gets the bench_id immediately.
     """
     global _queue_running, _current_run_id, _current_model, _engine_pool_ref
+    global _chain_id
 
     _engine_pool_ref = engine_pool
 
@@ -233,6 +243,10 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
     request = _queue.pop(0)
     _queue_running = True
     _current_model = request.model_id
+    # This chain takes ownership of the queue; any earlier chain still
+    # draining a soft-cancelled run bails at its next _continue_queue call.
+    _chain_id += 1
+    my_chain = _chain_id
 
     cleanup_old_runs()
     run = create_run(request)
@@ -249,15 +263,24 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
         except Exception as e:
             logger.error(f"Queue: error running {request.model_id}: {e}")
         # Auto-continue with next in queue
-        await _continue_queue(engine_pool)
+        await _continue_queue(engine_pool, my_chain)
 
     run.task = asyncio.create_task(_run_and_continue())
     return run.bench_id
 
 
-async def _continue_queue(engine_pool: Any) -> None:
-    """Continue processing the queue after a run completes."""
+async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
+    """Continue processing the queue after a run completes.
+
+    `chain_id` is the ownership token captured when this chain started.
+    A stale chain (orphaned by cancel_queue, with a new chain started by
+    the user since) returns without popping the queue or touching the
+    gate, so it cannot start a run concurrently with the live chain.
+    """
     global _queue_running, _current_run_id, _current_model
+
+    if chain_id != _chain_id:
+        return
 
     if not _queue:
         _queue_running = False
@@ -271,6 +294,10 @@ async def _continue_queue(engine_pool: Any) -> None:
     cleanup_old_runs()
     run = create_run(request)
     _current_run_id = run.bench_id
+    # Queue-continued runs execute inside this chain's own task; record it
+    # so cancel_queue can hard-cancel them instead of waiting for the next
+    # on_progress checkpoint (up to a full generation batch away).
+    run.task = asyncio.current_task()
 
     logger.info(
         f"Queue: continuing with {request.model_id} "
@@ -282,14 +309,18 @@ async def _continue_queue(engine_pool: Any) -> None:
     except Exception as e:
         logger.error(f"Queue: error running {request.model_id}: {e}")
 
-    await _continue_queue(engine_pool)
+    await _continue_queue(engine_pool, chain_id)
 
 
 async def cancel_queue() -> None:
     """Cancel the current run and clear the queue."""
-    global _queue_running, _current_run_id, _current_model
+    global _queue_running, _current_run_id, _current_model, _chain_id
 
     _queue.clear()
+    # Orphan the live chain before releasing the gate: if the cancelled run
+    # only notices at its next checkpoint, its trailing _continue_queue must
+    # not race whatever chain the user starts after this cancel.
+    _chain_id += 1
 
     if _current_run_id:
         run = get_run(_current_run_id)

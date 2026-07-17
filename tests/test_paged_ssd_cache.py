@@ -1062,6 +1062,98 @@ class TestPagedSSDCacheManagerWithMLX:
         assert manager.has_block(h1)
         assert manager.has_block(h2)
 
+    def _write_corrupt_json_fixture_block(
+        self,
+        cache_dir: Path,
+        mx,
+        block_hash: bytes,
+        *,
+        corrupt_field: str,
+    ) -> Path:
+        """Drop a versioned block whose type metadata JSON is corrupt."""
+        from omlx.cache.paged_ssd_cache import _CACHE_FORMAT_VERSION
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        block_hash_hex = block_hash.hex()
+        sub_dir = cache_dir / block_hash_hex[0]
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        file_path = sub_dir / f"{block_hash_hex}.safetensors"
+
+        metadata = {
+            "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+            "block_hash": block_hash_hex,
+            "token_count": "32",
+            "num_layers": "1",
+            "model_name": "m",
+            "block_size": "256",
+            "layer_cache_types": json.dumps(["KVCache"]),
+            "layer_meta_states": json.dumps([[]]),
+            "created_at": "0",
+        }
+        # Simulate a torn write: the field exists but is not valid JSON.
+        metadata[corrupt_field] = '["KVCache"'
+
+        mx.save_safetensors(
+            str(file_path),
+            {
+                "layer_0_keys": mx.zeros((1, 8, 32, 64)),
+                "layer_0_values": mx.zeros((1, 8, 32, 64)),
+            },
+            metadata=metadata,
+        )
+        return file_path
+
+    def test_scan_rejects_corrupt_layer_cache_types_json(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """A block whose layer_cache_types JSON is present but unparseable is
+        corruption, not a legacy block: indexing it with the field silently
+        dropped makes reconstruction guess layer types for its tensors.
+        The scan must skip the block so the hash misses and the chain
+        re-stores it on the next request."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        corrupt_hash = b"\x70" + b"\x00" * 31
+        healthy_hash = b"\x71" + b"\x00" * 31
+        corrupt_path = self._write_corrupt_json_fixture_block(
+            cache_dir, mx, corrupt_hash, corrupt_field="layer_cache_types"
+        )
+        self._write_versioned_fixture_block(
+            cache_dir, mx, healthy_hash, num_layers=1, model_name="m"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert not manager.has_block(corrupt_hash)
+        assert manager.has_block(healthy_hash)
+        # Scan-time skips stay non-destructive (shared cache directories).
+        assert corrupt_path.exists()
+
+    def test_scan_rejects_corrupt_layer_meta_states_json(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Same rule for layer_meta_states: present-but-unparseable means the
+        block would be served without per-layer meta (offsets, TQ bits) and
+        downstream reconstruction would have to guess them."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        corrupt_hash = b"\x72" + b"\x00" * 31
+        self._write_corrupt_json_fixture_block(
+            cache_dir, mx, corrupt_hash, corrupt_field="layer_meta_states"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert not manager.has_block(corrupt_hash)
+
     def test_scan_logs_skipped_incompatible_count(
         self, tmp_path: Path, mock_mlx, caplog
     ):

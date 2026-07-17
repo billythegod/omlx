@@ -1645,18 +1645,34 @@ class PagedSSDCacheManager(CacheManager):
             layer_cache_types = None
             layer_meta_states = None
 
+            # A present-but-unparseable field is corruption (torn write,
+            # damaged file), not a legacy block: indexing the block with the
+            # field silently dropped would make reconstruction guess layer
+            # types or per-layer meta for its tensors. Treat the block as
+            # unusable; the hash then misses and the next request re-stores
+            # it. Absent fields (legacy blocks) still pass through.
             if "layer_cache_types" in metadata and metadata["layer_cache_types"]:
                 try:
                     layer_cache_types = json.loads(metadata["layer_cache_types"])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_cache_types metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             if "layer_meta_states" in metadata and metadata["layer_meta_states"]:
                 try:
                     raw_meta_states = json.loads(metadata["layer_meta_states"])
                     layer_meta_states = [tuple(m) if m else () for m in raw_meta_states]
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning(
+                        "Corrupt layer_meta_states metadata JSON in cache "
+                        "file %s; treating the block as unusable.",
+                        file_path,
+                    )
+                    return None
 
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),

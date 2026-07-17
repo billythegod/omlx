@@ -53,6 +53,7 @@ final class ModelsScreenSortingTests: XCTestCase {
             actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
+            isFavorite: nil,
             engineType: nil,
             modelType: nil,
             configModelType: nil,

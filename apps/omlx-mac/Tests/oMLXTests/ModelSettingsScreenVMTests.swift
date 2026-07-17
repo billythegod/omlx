@@ -55,6 +55,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
+            isFavorite: nil,
             engineType: nil,
             modelType: nil,
             configModelType: configModelType,

@@ -68,7 +68,10 @@ dependencies = [
     # See pmarreck/omlx#1 for full repro and root cause.
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
+    # The admin downloader calls snapshot_download(dry_run=True); dry_run
+    # was added in huggingface_hub 1.0.0. Declare the floor directly
+    # instead of leaning on transformers' transitive hub requirement.
+    "huggingface-hub>=1.0.0",
     "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",

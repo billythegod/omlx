@@ -93,12 +93,21 @@ class _DFlashPrefillGuard:
         # Written by ProcessMemoryEnforcer._propagate_memory_limit each tick.
         self._prefill_memory_guard: bool = False
         self._memory_hard_limit_bytes: int = 0
+        self._memory_hot_cache_used_bytes: int = 0
 
     def record_mlx_active_memory(self, active_bytes: int) -> None:
         self._last_mlx_active_memory_bytes = max(0, int(active_bytes))
 
     def _current_usage_bytes(self) -> int:
-        return max(self._last_mlx_active_memory_bytes, get_phys_footprint())
+        # The enforcer already subtracts a hot-cache reservation from the
+        # ``_memory_hard_limit_bytes`` it propagates here, so serialized
+        # hot-cache CPU bytes must not ALSO be counted in usage via
+        # phys_footprint — that charges them twice and over-rejects by the
+        # hot-cache size. Mirrors ``Scheduler._current_usage_bytes``.
+        phys = max(
+            0, get_phys_footprint() - max(0, int(self._memory_hot_cache_used_bytes))
+        )
+        return max(self._last_mlx_active_memory_bytes, phys)
 
     def preflight_or_raise(
         self,

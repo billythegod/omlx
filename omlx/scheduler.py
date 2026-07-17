@@ -7230,6 +7230,12 @@ class Scheduler:
         if request_id in self.running:
             del self.running[request_id]
 
+        # Restore RoPE if this was the active specprefill request. Aborted
+        # requests never flow through _cleanup_finished, so without this the
+        # wrapper leaks and the specprefill guard defers all other requests
+        # forever (#766).
+        self._cleanup_specprefill(request_id)
+
         # Release blocks for eviction (same as _cleanup_finished)
         if self.paged_cache_manager is not None:
             block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -8004,11 +8010,12 @@ class Scheduler:
             # affects the entire model). Also block scheduling if another
             # specprefill request is already running (offset RoPE active).
             request_is_specprefill = request.specprefill_indices is not None
-            if (
-                self._specprefill_active_request_id is not None
-                and not request_is_specprefill
-            ):
-                # A specprefill request is running — defer all others until it finishes
+            if self._specprefill_active_request_id is not None:
+                # A specprefill request is decoding with its offset RoPE
+                # installed on the shared model. Defer everything, including
+                # other specprefill requests: admitting a second one here
+                # would replace the live wrapper and corrupt the remaining
+                # decode of the active request (#766).
                 self.waiting.appendleft(request)
                 break
             if batch_specprefill_status is None:

@@ -1009,6 +1009,14 @@ class ProcessMemoryEnforcer:
         hot_cache_reserved = (
             self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
         )
+        # Clamp to the reservation: the usage-side exclusion must never exceed
+        # what the ceiling actually gave up, or a transient hot-cache overshoot
+        # past max_bytes would net-weaken the guard exactly under pressure.
+        hot_cache_used = (
+            min(self._hot_cache_used_bytes(), hot_cache_reserved)
+            if hot_cache_reserved > 0
+            else 0
+        )
         scheduler_ceiling = self._scheduler_limit_bytes(
             ceiling, reserved=hot_cache_reserved
         )
@@ -1077,6 +1085,12 @@ class ProcessMemoryEnforcer:
             scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Usage-side counterpart of the reservation above: targets whose
+            # usage read is raw phys_footprint (the DFlash primary guard)
+            # subtract this so serialized hot-cache CPU bytes are not charged
+            # both here and in the reserved ceiling. The Scheduler reads its
+            # own live counter instead and ignores this attr.
+            scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs
