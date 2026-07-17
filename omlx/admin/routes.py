@@ -99,6 +99,7 @@ class CacheProbeRequest(BaseModel):
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    thinking_budget: int | None = None
 
 
 class ModelSettingsRequest(BaseModel):
@@ -4960,7 +4961,11 @@ def _normalize_probe_tool_calls(messages: list[dict]) -> list[dict]:
     return normalized
 
 
-def _probe_chat_template_kwargs(request: "CacheProbeRequest") -> dict | None:
+def _probe_chat_template_kwargs(
+    request: "CacheProbeRequest",
+    *,
+    preserve_thinking_default: bool | None = None,
+) -> dict | None:
     """Chat-template kwargs the scheduler would actually prefill this with.
 
     The probe answers "is this prompt cached", so it has to render byte-for
@@ -4989,7 +4994,15 @@ def _probe_chat_template_kwargs(request: "CacheProbeRequest") -> dict | None:
                 exc_info=True,
             )
             settings = None
-    return merge_chat_template_kwargs(settings, request.chat_template_kwargs) or None
+    return (
+        merge_chat_template_kwargs(
+            settings,
+            request.chat_template_kwargs,
+            thinking_budget=request.thinking_budget,
+            preserve_thinking_default=preserve_thinking_default,
+        )
+        or None
+    )
 
 
 @router.post("/api/cache/probe")
@@ -5074,7 +5087,12 @@ async def probe_cache(
             prompt = engine._apply_chat_template(
                 messages,
                 template_tools,
-                chat_template_kwargs=_probe_chat_template_kwargs(request),
+                chat_template_kwargs=_probe_chat_template_kwargs(
+                    request,
+                    preserve_thinking_default=getattr(
+                        entry, "preserve_thinking_default", None
+                    ),
+                ),
             )
         else:
             prompt = tokenizer.apply_chat_template(

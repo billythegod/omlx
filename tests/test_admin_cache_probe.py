@@ -462,14 +462,22 @@ class TestCacheProbeChatTemplateKwargs:
     """
 
     @staticmethod
-    def _rendered_kwargs(settings, request_kwargs=None, lookup_raises=False):
+    def _rendered_kwargs(
+        settings,
+        request_kwargs=None,
+        lookup_raises=False,
+        thinking_budget=None,
+        preserve_thinking_default=None,
+    ):
         """Run probe_cache and return the kwargs handed to the template."""
         request = admin_routes.CacheProbeRequest(
             model_id=MODEL_ID,
             messages=[{"role": "user", "content": "hello"}],
             chat_template_kwargs=request_kwargs,
+            thinking_budget=thinking_budget,
         )
         entry = _make_engine_entry(_make_tokenizer([1, 2, 3, 4]), _make_scheduler())
+        entry.preserve_thinking_default = preserve_thinking_default
         seen = {}
 
         def render(messages, tools, **kwargs):
@@ -488,7 +496,9 @@ class TestCacheProbeChatTemplateKwargs:
 
         with (
             patch.object(
-                admin_routes, "_get_engine_pool", return_value=_pool_with({MODEL_ID: entry})
+                admin_routes,
+                "_get_engine_pool",
+                return_value=_pool_with({MODEL_ID: entry}),
             ),
             patch.object(admin_routes, "_get_settings_manager", return_value=manager),
         ):
@@ -510,6 +520,39 @@ class TestCacheProbeChatTemplateKwargs:
         settings = ModelSettings()
         settings.preserve_thinking = True
         assert self._rendered_kwargs(settings) == {"preserve_thinking": True}
+
+    def test_model_thinking_budget_enables_thinking(self):
+        settings = ModelSettings(
+            thinking_budget_enabled=True,
+            thinking_budget_tokens=1024,
+        )
+        assert self._rendered_kwargs(settings) == {"enable_thinking": True}
+
+    def test_request_thinking_budget_enables_thinking(self):
+        assert self._rendered_kwargs(None, thinking_budget=1024) == {
+            "enable_thinking": True
+        }
+
+    def test_explicit_thinking_toggle_wins_over_budget(self):
+        settings = ModelSettings(
+            enable_thinking=False,
+            thinking_budget_enabled=True,
+            thinking_budget_tokens=1024,
+        )
+        assert self._rendered_kwargs(settings) == {"enable_thinking": False}
+
+    def test_model_preserve_thinking_default_reaches_the_template(self):
+        assert self._rendered_kwargs(None, preserve_thinking_default=True) == {
+            "preserve_thinking": True
+        }
+
+    def test_explicit_preserve_thinking_wins_over_model_default(self):
+        rendered = self._rendered_kwargs(
+            None,
+            {"preserve_thinking": False},
+            preserve_thinking_default=True,
+        )
+        assert rendered == {"preserve_thinking": False}
 
     def test_request_kwargs_override_model_settings(self):
         settings = ModelSettings()

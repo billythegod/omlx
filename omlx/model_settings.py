@@ -1206,19 +1206,18 @@ def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
 def merge_chat_template_kwargs(
     settings: "ModelSettings | None",
     request_ct_kwargs: "dict[str, Any] | None" = None,
+    *,
+    thinking_budget: "int | None" = None,
+    preserve_thinking_default: "bool | None" = None,
 ) -> "dict[str, Any]":
-    """Resolve the chat_template_kwargs a prompt should be rendered with.
+    """Resolve the effective chat_template_kwargs for prompt rendering.
 
     Precedence, lowest to highest:
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
-
-    Anything that renders a prompt for a model must go through here. The
-    chat completions path and the admin cache probe previously each spelled
-    this out; the probe's copy omitted the model settings entirely, so it
-    hashed a prompt the scheduler never prefills — every block of every
-    probe came back cold for any model with a thinking toggle set.
+      4. thinking budget activation when ``enable_thinking`` is still unset
+      5. the model's preserve-thinking default when it is supported and unset
     """
     merged: dict[str, Any] = {}
     forced_keys = forced_ct_keys(settings)
@@ -1237,5 +1236,22 @@ def merge_chat_template_kwargs(
         for key, value in request_ct_kwargs.items():
             if key not in forced_keys:
                 merged[key] = value
+
+    if (
+        thinking_budget is None
+        and settings is not None
+        and settings.thinking_budget_enabled
+        and settings.thinking_budget_tokens
+    ):
+        thinking_budget = settings.thinking_budget_tokens
+    if thinking_budget is not None and "enable_thinking" not in merged:
+        merged["enable_thinking"] = True
+
+    if (
+        preserve_thinking_default is True
+        and merged.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged
+    ):
+        merged["preserve_thinking"] = True
 
     return merged
