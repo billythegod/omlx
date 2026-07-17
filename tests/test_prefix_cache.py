@@ -3455,8 +3455,8 @@ class TestTurboQuantMixedPayloadReconstruction:
     def test_tq_chain_absent_meta_uses_configured_bits(self, mx, tq_mod):
         """Uniform TQ chain whose (bits, seed) metadata never round-tripped.
 
-        Block 0's metadata carries no layer_meta_states (the JSON failed to
-        round-trip); block 1 loads with no metadata at all. Neither
+        Both blocks' metadata carry no layer_meta_states (the JSON failed
+        to round-trip on save). Neither
         per-block nor chain-level meta can resolve (bits, seed). The
         server-configured TurboQuant KV bit depth is authoritative for
         admitted blocks (cache eligibility already keys on it), so
@@ -3480,7 +3480,7 @@ class TestTurboQuantMixedPayloadReconstruction:
         no_meta_states = self._metadata(["TurboQuantKVCache"], None, 1)
         mock_ssd.load_block_with_metadata.side_effect = [
             ([self._tq_block_payload(tq_mod, ks, vs, 0)], no_meta_states),
-            ([self._tq_block_payload(tq_mod, ks, vs, 1)], None),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], no_meta_states),
         ]
 
         result = cache.reconstruct_cache(block_table)
@@ -3519,7 +3519,150 @@ class TestTurboQuantMixedPayloadReconstruction:
         no_meta_states = self._metadata(["TurboQuantKVCache"], None, 1)
         mock_ssd.load_block_with_metadata.side_effect = [
             ([self._tq_block_payload(tq_mod, ks, vs, 0)], no_meta_states),
-            ([self._tq_block_payload(tq_mod, ks, vs, 1)], None),
+            ([self._tq_block_payload(tq_mod, ks, vs, 1)], no_meta_states),
         ]
 
         assert cache.reconstruct_cache(block_table) is None
+
+
+class TestReconstructionSilentFallbackHardening:
+    """Guessed-default fallbacks in reconstruction reject instead of guessing.
+
+    Follow-up to the PR #2272 direction (payload over guesswork): a cache hit
+    is an optimization, so any ambiguity about reconstruction inputs must
+    resolve to re-prefill (block drop / chain truncation / loud rejection),
+    never to a plausible-but-wrong default.
+    """
+
+    BLOCK = 4
+    HEADS = 2
+    HDIM = 64
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def _make_cache(self, num_layers=1):
+        """Build a prefix cache with a mocked SSD manager."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        paged_cache = PagedCacheManager(
+            block_size=self.BLOCK,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=num_layers),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        return cache, paged_cache, mock_ssd
+
+    def _alloc_block_table(self, paged_cache, n_blocks):
+        """Allocate n hashed blocks and a block table referencing them."""
+        blocks = []
+        for i in range(n_blocks):
+            b = paged_cache.allocate_block()
+            b.block_hash = f"hash{i}".encode()
+            b.token_count = self.BLOCK
+            b.ref_count = 2
+            blocks.append(b)
+        return BlockTable(
+            request_id="req-001",
+            block_ids=[b.block_id for b in blocks],
+            num_tokens=n_blocks * self.BLOCK,
+        )
+
+    def _plain_slice(self, mx):
+        return (
+            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+                mx.float16
+            ),
+            mx.random.normal((1, self.HEADS, self.BLOCK, self.HDIM)).astype(
+                mx.float16
+            ),
+        )
+
+    def _metadata(self, num_layers=1):
+        return {
+            "model_name": "test-model",
+            "num_layers": num_layers,
+            "block_size": self.BLOCK,
+            "layer_cache_types": ["KVCache"] * num_layers,
+            "layer_meta_states": [()] * num_layers,
+        }
+
+    def test_metadata_less_block_truncates_chain(self, mx):
+        """A block that loads with data but no metadata truncates the chain.
+
+        Continuing past it kept the first/last meta_state trackers stale
+        (pairing a later block's tensors with an earlier block's meta) and
+        skipped every per-block validation gate (model_name, num_layers,
+        block_size, layer types). Treat it like a load failure: keep the
+        valid prefix, drop the untrusted tail.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        cache, paged_cache, mock_ssd = self._make_cache(num_layers=1)
+        block_table = self._alloc_block_table(paged_cache, 3)
+
+        slices = [self._plain_slice(mx) for _ in range(3)]
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([slices[0]], self._metadata()),
+            ([slices[1]], self._metadata()),
+            ([slices[2]], None),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None, "valid prefix must survive truncation"
+        layer0 = result[0]
+        assert isinstance(layer0, KVCache)
+        assert layer0.offset == 2 * self.BLOCK
+        assert block_table.num_tokens == 2 * self.BLOCK
+        expected_keys = mx.concatenate([k for k, _ in slices[:2]], axis=2)
+        assert mx.array_equal(layer0.keys, expected_keys)
+
+    def test_fallback_reconstruct_refuses_non_kvcache_types(self, mx):
+        """Handler-declared failure for a stateful cache type must reject.
+
+        _fallback_reconstruct_layer rebuilds a plain KVCache, which is the
+        wrong cache class for rotating/arrays/composite layers: a rotating
+        buffer restored as KVCache carries wrong positions and merge-unsafe
+        state. Only KVCache-typed layers may take the fallback.
+        """
+        cache, _, _ = self._make_cache(num_layers=1)
+        layer_states = [
+            {
+                "keys": mx.zeros((1, self.HEADS, self.BLOCK, self.HDIM)),
+                "values": mx.zeros((1, self.HEADS, self.BLOCK, self.HDIM)),
+            }
+        ]
+
+        for type_name in ("RotatingKVCache", "ArraysCache", "CacheList"):
+            assert (
+                cache._fallback_reconstruct_layer(layer_states, type_name) is None
+            ), f"{type_name} must not fall back to a plain KVCache rebuild"
+
+    def test_fallback_reconstruct_still_serves_kvcache(self, mx):
+        """The fallback keeps working for the type it can actually rebuild."""
+        cache, _, _ = self._make_cache(num_layers=1)
+        layer_states = [
+            {
+                "keys": mx.zeros((1, self.HEADS, self.BLOCK, self.HDIM)),
+                "values": mx.zeros((1, self.HEADS, self.BLOCK, self.HDIM)),
+            }
+        ]
+
+        rebuilt = cache._fallback_reconstruct_layer(layer_states, "KVCache")
+
+        assert rebuilt is not None
+        assert rebuilt.offset == self.BLOCK

@@ -1857,11 +1857,22 @@ class BlockAwarePrefixCache(CacheManager):
                     last_block_meta_states = block_layer_meta_states
                     all_block_meta_states.append(block_layer_meta_states)
                 else:
-                    # A block can load with data but no metadata at all. Keep
-                    # all_block_meta_states index-aligned with all_block_data
-                    # so per-block (bits, seed) resolution never reads a
-                    # neighbor block's meta.
-                    all_block_meta_states.append(None)
+                    # A block that loads with data but no metadata at all
+                    # cannot be trusted: it skipped every per-block validation
+                    # gate above (model_name, num_layers, block_size, layer
+                    # types), and continuing would leave the first/last
+                    # meta_state trackers stale (pairing this block's tensors
+                    # with an earlier block's meta). Truncate the chain here
+                    # and use the valid prefix, like the load-failure path.
+                    logger.warning(
+                        f"Block {block_id} loaded without metadata. "
+                        f"Truncating cached prefix before this block "
+                        f"({valid_block_count} valid blocks)."
+                    )
+                    self._forget_incompatible_ssd_block(
+                        block.block_hash, block.block_id
+                    )
+                    break
 
                 # Validate loaded data (pass cache types for hybrid models)
                 if not self._validate_block_cache_data(block_data, layer_cache_types):
@@ -2725,6 +2736,18 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             Reconstructed cache object or None
         """
+        # The fallback rebuilds a plain KVCache, which is the wrong cache
+        # class for every other type: a rotating buffer or recurrent state
+        # restored as KVCache carries wrong positions and merge-unsafe
+        # state. When a non-KVCache handler declares failure, reject the
+        # cached prefix instead of papering over it with a guessed rebuild.
+        if cache_type_name != "KVCache":
+            logger.warning(
+                f"Handler reconstruction failed for {cache_type_name}; "
+                f"rejecting the cached prefix instead of rebuilding it as "
+                f"a plain KVCache."
+            )
+            return None
         try:
             # Collect keys and values
             layer_keys = [s["keys"] for s in layer_states if s.get("keys") is not None]
