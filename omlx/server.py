@@ -6746,13 +6746,11 @@ Examples:
     # Multi-model serving
     python -m omlx.server --model-dir /path/to/models
 
-    # With pinned models
-    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
-
     # With MCP tools
     python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
-Note: Use the omlx CLI for full feature support.
+Note: Use the omlx CLI for full feature support. Pinned models, default
+model and sampling defaults are managed via the admin page.
         """,
     )
     parser.add_argument(
@@ -6760,18 +6758,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--pin",
-        type=str,
-        default=None,
-        help="Comma-separated model names to keep always loaded",
-    )
-    parser.add_argument(
-        "--default-model",
-        type=str,
-        default=None,
-        help="Default model when not specified in request",
     )
     parser.add_argument(
         "--host",
@@ -6790,12 +6776,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation",
     )
 
     args = parser.parse_args()
