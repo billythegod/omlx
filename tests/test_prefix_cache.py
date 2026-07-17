@@ -3180,13 +3180,14 @@ class TestTurboQuantMixedPayloadReconstruction:
         assert layer0.values.dtype == mx.float16
 
         # TQ blocks: per-block dequantize must equal the full-state
-        # dequantize reference (TQ states are per-token; fp16 tolerance
-        # since the healed layer is cast to the dense blocks' dtype).
-        assert mx.allclose(
-            layer0.keys[:, :, : 2 * self.BLOCK, :], ref_keys, atol=1e-3
+        # dequantize reference rounded to the healed layer's dense dtype.
+        assert mx.array_equal(
+            layer0.keys[:, :, : 2 * self.BLOCK, :],
+            ref_keys.astype(layer0.keys.dtype),
         )
-        assert mx.allclose(
-            layer0.values[:, :, : 2 * self.BLOCK, :], ref_values, atol=1e-3
+        assert mx.array_equal(
+            layer0.values[:, :, : 2 * self.BLOCK, :],
+            ref_values.astype(layer0.values.dtype),
         )
         # Plain block: passed through unmodified (promoted dtype only).
         assert mx.allclose(
@@ -3257,11 +3258,13 @@ class TestTurboQuantMixedPayloadReconstruction:
             plain_k.astype(layer0.keys.dtype),
             atol=1e-3,
         )
-        assert mx.allclose(
-            layer0.keys[:, :, self.BLOCK :, :], ref_keys, atol=1e-3
+        assert mx.array_equal(
+            layer0.keys[:, :, self.BLOCK :, :],
+            ref_keys.astype(layer0.keys.dtype),
         )
-        assert mx.allclose(
-            layer0.values[:, :, self.BLOCK :, :], ref_values, atol=1e-3
+        assert mx.array_equal(
+            layer0.values[:, :, self.BLOCK :, :],
+            ref_values.astype(layer0.values.dtype),
         )
 
     def test_mixed_chain_hybrid_model_with_arrays_cache_layer(self, mx, tq_mod):
