@@ -7,6 +7,7 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import errno
+import gc
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import queue
 import shutil
 import threading
 import time
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,9 +28,9 @@ from omlx.cache.paged_ssd_cache import (
     SharedHotCacheBudget,
     _block_turboquant_bits,
     _cache_compat_signature,
-    _signature_turboquant_bits,
     _extract_tensor_bytes,
     _restore_tensor_from_bytes,
+    _signature_turboquant_bits,
     _write_safetensors_no_mx,
     parse_size,
 )
@@ -42,6 +44,20 @@ def _has_mlx() -> bool:
         return True
     except ImportError:
         return False
+
+
+@pytest.fixture
+def cyclic_gc_disabled():
+    """Disable cyclic GC while preserving normal reference counting."""
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.collect()
+        if was_enabled:
+            gc.enable()
 
 
 class TestParseSize:
@@ -632,6 +648,65 @@ class TestPagedSSDCacheManager:
         # Should return 0 when under limit
         freed = manager.enforce_size_limit()
         assert freed == 0
+
+
+class TestNStateReferenceCycles:
+    """Regression tests for n-state helper closure retention."""
+
+    def test_reconstruct_releases_arrays_without_cyclic_gc(self, cyclic_gc_disabled):
+        """The read helper must not retain its per-call arrays dictionary."""
+
+        class Sentinel:
+            pass
+
+        sentinel = Sentinel()
+        sentinel_ref = weakref.ref(sentinel)
+        arrays = {"layer_0_state_0": sentinel}
+        metadata = {"layer_0_state_count": "1"}
+        manager = object.__new__(PagedSSDCacheManager)
+
+        reconstructed = manager._reconstruct_cache_data(
+            arrays,
+            metadata,
+            num_layers=1,
+            layer_cache_types=["ArraysCache"],
+        )
+        assert reconstructed is not None
+
+        del reconstructed
+        del arrays
+        del sentinel
+
+        assert sentinel_ref() is None
+
+    def test_save_releases_arrays_without_cyclic_gc(
+        self, tmp_path: Path, cyclic_gc_disabled
+    ):
+        """The write helper must not retain serialized MLX arrays."""
+        mx = pytest.importorskip("mlx.core")
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**2,
+        )
+
+        try:
+            payload = mx.zeros((1, 1, 1, 1))
+            payload_ref = weakref.ref(payload)
+            cache_data = [("__nstate__", "ArraysCache", [payload])]
+
+            assert manager.save_block(
+                block_hash=b"nstate_cycle_release",
+                cache_data=cache_data,
+                token_count=1,
+                layer_cache_types=["ArraysCache"],
+            )
+
+            del cache_data
+            del payload
+
+            assert payload_ref() is None
+        finally:
+            manager.close()
 
 
 class TestPagedSSDCacheManagerWithMLX:
@@ -3900,10 +3975,7 @@ class TestTurboquantBitsSignature:
         )
         # Batch-form class name counts too.
         assert (
-            _block_turboquant_bits(
-                ["BatchTurboQuantKVCache"], [(256, 6.0, 0)]
-            )
-            == 6.0
+            _block_turboquant_bits(["BatchTurboQuantKVCache"], [(256, 6.0, 0)]) == 6.0
         )
         # Non-TurboQuant layouts and absent meta yield None.
         assert _block_turboquant_bits(["KVCache"], [(256,)]) is None
