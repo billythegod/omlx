@@ -53,17 +53,13 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
 }
 
 extension ModelDTO {
+    /// Single size figure for compact UI: the observed footprint once the
+    /// model has settled, the estimate while loading or before one exists.
     var sizeLabel: String {
         if isLoading {
             return estimatedSizeFormatted ?? ""
         }
-        if let actual = actualSizeFormatted {
-            if let est = estimatedSizeFormatted, est != actual {
-                return "~\(actual) obs / \(est) est"
-            }
-            return "~\(actual) obs"
-        }
-        return estimatedSizeFormatted ?? ""
+        return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
     }
 }
 

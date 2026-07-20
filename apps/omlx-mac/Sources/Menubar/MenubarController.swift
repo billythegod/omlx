@@ -70,6 +70,11 @@ final class MenubarController: NSObject {
     private var modelsSubmenu: NSMenu!
     private var models: [ModelDTO] = []
     private var unloadingIDs: Set<String> = []
+    private var loadingIDs: Set<String> = []
+    /// False until the first successful model-list fetch after a server start,
+    /// so the empty submenu can say "Loading…" instead of "No models available"
+    /// while the initial fetch is still in flight.
+    private var modelsFetched = false
     private var modelsFetchTask: Task<Void, Never>?
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
@@ -727,6 +732,8 @@ final class MenubarController: NSObject {
             modelsFetchTask = nil
             models = []
             unloadingIDs.removeAll()
+            loadingIDs.removeAll()
+            modelsFetched = false
         default:
             break
         }
@@ -931,101 +938,114 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
 
         if models.isEmpty {
-            modelsSubmenu.addItem(disabled(String(localized: "menubar.models.empty",
-                                                  defaultValue: "No models available",
-                                                  comment: "Disabled placeholder in the Models submenu when no models are discovered")))
+            let placeholder = modelsFetched
+                ? String(localized: "menubar.models.empty",
+                         defaultValue: "No models available",
+                         comment: "Disabled placeholder in the Models submenu when no models are discovered")
+                : String(localized: "menubar.models.fetching",
+                         defaultValue: "Loading…",
+                         comment: "Disabled placeholder in the Models submenu while the model list is being fetched")
+            modelsSubmenu.addItem(disabled(placeholder))
             return
         }
 
-        for m in sortModelsByName(models) {
-            let parentItem: NSMenuItem
-            if m.loaded {
-                let attrTitle = NSMutableAttributedString()
-                let titleFont = NSFont.menuFont(ofSize: 0)
-                let sizeFont = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
-                attrTitle.append(NSAttributedString(
-                    string: MenubarController.modelMenuTitle(for: m),
-                    attributes: [.font: titleFont]
-                ))
-                if !m.sizeLabel.isEmpty {
-                    let paraStyle = NSMutableParagraphStyle()
-                    paraStyle.lineSpacing = 1
-                    attrTitle.append(NSAttributedString(
-                        string: "\n\(m.sizeLabel)",
-                        attributes: [
-                            .font: sizeFont,
-                            .foregroundColor: NSColor.secondaryLabelColor,
-                            .paragraphStyle: paraStyle,
-                        ]
-                    ))
-                }
-                parentItem = NSMenuItem()
-                parentItem.attributedTitle = attrTitle
-            } else {
-                parentItem = NSMenuItem(title: MenubarController.modelMenuTitle(for: m), action: nil, keyEquivalent: "")
-            }
-            parentItem.isEnabled = true
+        // Loaded/loading models first — they are what the menu exists for —
+        // then the rest of the library, both alphabetical.
+        let (active, available) = MenubarController.partitionForMenu(models)
+        for m in active { modelsSubmenu.addItem(modelItem(for: m)) }
+        if !active.isEmpty, !available.isEmpty { modelsSubmenu.addItem(.separator()) }
+        for m in available { modelsSubmenu.addItem(modelItem(for: m)) }
+    }
 
-            let sub = NSMenu()
-            sub.autoenablesItems = false
-
-            let toggleItem = NSMenuItem()
-            toggleItem.representedObject = m.id
-            switch MenubarController.toggleState(for: m, unloading: unloadingIDs) {
-            case .unloading:
-                toggleItem.title = String(localized: "menubar.models.unloading",
-                                          defaultValue: "Unloading model…",
-                                          comment: "Disabled menu item while a model unload is in progress")
-                toggleItem.isEnabled = false
-            case .loading:
-                toggleItem.title = String(localized: "menubar.models.loading",
-                                          defaultValue: "Loading model…",
-                                          comment: "Disabled menu item while a model load is in progress")
-                toggleItem.isEnabled = false
-            case .unload:
-                toggleItem.title = String(localized: "menubar.models.unload",
-                                          defaultValue: "Unload model",
-                                          comment: "Menu item to unload a currently loaded model")
-                toggleItem.action = #selector(unloadModelAction(_:))
-                toggleItem.target = self
-                toggleItem.isEnabled = true
-            case .load:
-                toggleItem.title = String(localized: "menubar.models.load",
-                                          defaultValue: "Load model",
-                                          comment: "Menu item to load a model")
-                toggleItem.action = #selector(loadModelAction(_:))
-                toggleItem.target = self
-                toggleItem.isEnabled = true
-            }
-            sub.addItem(toggleItem)
-
-            let settingsItem = NSMenuItem(
-                title: String(localized: "menubar.models.settings",
-                              defaultValue: "Model Settings…",
-                              comment: "Menu item that opens the in-app per-model settings pane"),
-                action: #selector(openModelSettingsAction(_:)),
-                keyEquivalent: ""
-            )
-            settingsItem.target = self
-            settingsItem.representedObject = m.id
-            settingsItem.isEnabled = true
-            sub.addItem(settingsItem)
-
-            let copyItem = NSMenuItem(
-                title: String(localized: "menubar.models.copy_name",
-                              defaultValue: "Copy name",
-                              comment: "Menu item that copies the model id to the clipboard"),
-                action: #selector(copyModelNameAction(_:)),
-                keyEquivalent: ""
-            )
-            copyItem.target = self
-            copyItem.representedObject = m.id
-            copyItem.isEnabled = true
-            sub.addItem(copyItem)
-
-            parentItem.submenu = sub
-            modelsSubmenu.addItem(parentItem)
+    private func modelItem(for m: ModelDTO) -> NSMenuItem {
+        let title = MenubarController.modelMenuTitle(for: m)
+        let parentItem: NSMenuItem
+        if m.loaded, !m.sizeLabel.isEmpty {
+            let attrTitle = NSMutableAttributedString()
+            let titleFont = NSFont.menuFont(ofSize: 0)
+            let sizeFont = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
+            attrTitle.append(NSAttributedString(
+                string: title,
+                attributes: [.font: titleFont]
+            ))
+            let paraStyle = NSMutableParagraphStyle()
+            paraStyle.lineSpacing = 1
+            attrTitle.append(NSAttributedString(
+                string: "\n\(m.sizeLabel)",
+                attributes: [
+                    .font: sizeFont,
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: paraStyle,
+                ]
+            ))
+            parentItem = NSMenuItem()
+            parentItem.attributedTitle = attrTitle
+        } else {
+            parentItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         }
+        // Native checkmark marks loaded models; the raw id lives in the
+        // tooltip since the title shows the (possibly aliased) display name.
+        parentItem.state = m.loaded ? .on : .off
+        parentItem.toolTip = m.id
+        parentItem.isEnabled = true
+
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        let toggleItem: NSMenuItem
+        switch MenubarController.toggleState(for: m, unloading: unloadingIDs, loading: loadingIDs) {
+        case .unloading:
+            toggleItem = item(String(localized: "menubar.models.unloading",
+                                     defaultValue: "Unloading model…",
+                                     comment: "Disabled menu item while a model unload is in progress"),
+                              action: nil,
+                              symbol: "hourglass")
+            toggleItem.isEnabled = false
+        case .loading:
+            toggleItem = item(String(localized: "menubar.models.loading",
+                                     defaultValue: "Loading model…",
+                                     comment: "Disabled menu item while a model load is in progress"),
+                              action: nil,
+                              symbol: "hourglass")
+            toggleItem.isEnabled = false
+        case .unload:
+            toggleItem = item(String(localized: "menubar.models.unload",
+                                     defaultValue: "Unload model",
+                                     comment: "Menu item to unload a currently loaded model"),
+                              action: #selector(unloadModelAction(_:)),
+                              symbol: "eject")
+            toggleItem.isEnabled = true
+        case .load:
+            toggleItem = item(String(localized: "menubar.models.load",
+                                     defaultValue: "Load model",
+                                     comment: "Menu item to load a model"),
+                              action: #selector(loadModelAction(_:)),
+                              symbol: "play.circle")
+            toggleItem.isEnabled = true
+        }
+        toggleItem.representedObject = m.id
+        sub.addItem(toggleItem)
+
+        let settingsItem = item(String(localized: "menubar.models.settings",
+                                       defaultValue: "Model Settings…",
+                                       comment: "Menu item that opens the in-app per-model settings pane"),
+                                action: #selector(openModelSettingsAction(_:)),
+                                symbol: "gearshape")
+        settingsItem.representedObject = m.id
+        settingsItem.isEnabled = true
+        sub.addItem(settingsItem)
+
+        let copyItem = item(String(localized: "menubar.models.copy_name",
+                                   defaultValue: "Copy name",
+                                   comment: "Menu item that copies the model id to the clipboard"),
+                            action: #selector(copyModelNameAction(_:)),
+                            symbol: "doc.on.doc")
+        copyItem.representedObject = m.id
+        copyItem.isEnabled = true
+        sub.addItem(copyItem)
+
+        parentItem.submenu = sub
+        return parentItem
     }
 
     /// Supersedes any in-flight model-list fetch with a fresh one. Keeping a
@@ -1042,7 +1062,9 @@ final class MenubarController: NSObject {
         guard let resp = try? await client.listModels() else { return }
         guard !Task.isCancelled else { return }
         models = resp.models
+        modelsFetched = true
         unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
+        loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
         rebuildModelsSubmenu()
     }
 
@@ -1050,9 +1072,17 @@ final class MenubarController: NSObject {
 
     @objc private func loadModelAction(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
+        loadingIDs.insert(id)
+        rebuildModelsSubmenu()
         // The load POST runs in its own task so it isn't cancelled when the menu
         // closes; only the trailing list refresh routes through the scheduler.
-        Task { try? await client?.loadModel(id: id); scheduleModelsRefresh() }
+        Task {
+            // A failed load must drop the pending id so the entry falls back
+            // to "Load model" instead of sticking on the in-progress state.
+            do { _ = try await client?.loadModel(id: id) }
+            catch { loadingIDs.remove(id) }
+            scheduleModelsRefresh()
+        }
     }
 
     @objc private func unloadModelAction(_ sender: NSMenuItem) {
@@ -1087,9 +1117,13 @@ final class MenubarController: NSObject {
     /// a live `NSStatusBar` (which instantiating the controller requires).
     enum ModelToggleState: Equatable { case unloading, loading, unload, load }
 
-    nonisolated static func toggleState(for model: ModelDTO, unloading: Set<String>) -> ModelToggleState {
+    nonisolated static func toggleState(
+        for model: ModelDTO,
+        unloading: Set<String>,
+        loading: Set<String>
+    ) -> ModelToggleState {
         if unloading.contains(model.id) { return .unloading }
-        if model.isLoading { return .loading }
+        if model.isLoading || loading.contains(model.id) { return .loading }
         if model.loaded { return .unload }
         return .load
     }
@@ -1100,9 +1134,27 @@ final class MenubarController: NSObject {
         unloading.filter { id in models.first(where: { $0.id == id })?.loaded == true }
     }
 
-    /// Plain menu label for a model: the id, prefixed with ✅ when loaded.
+    /// Keeps only the pending-load ids the server hasn't picked up yet — i.e.
+    /// drops an id once its model reports `isLoading` or `loaded` (or vanishes).
+    nonisolated static func reconcileLoading(_ loading: Set<String>, against models: [ModelDTO]) -> Set<String> {
+        loading.filter { id in
+            guard let m = models.first(where: { $0.id == id }) else { return false }
+            return !m.loaded && !m.isLoading
+        }
+    }
+
+    /// Splits models into active (loaded or loading) and the rest of the
+    /// library, each sorted like the Models screen.
+    nonisolated static func partitionForMenu(_ models: [ModelDTO]) -> (active: [ModelDTO], available: [ModelDTO]) {
+        (
+            active: sortModelsByName(models.filter { $0.loaded || $0.isLoading }),
+            available: sortModelsByName(models.filter { !$0.loaded && !$0.isLoading })
+        )
+    }
+
+    /// Menu label for a model: the same display title the Models screen shows.
     nonisolated static func modelMenuTitle(for model: ModelDTO) -> String {
-        model.loaded ? "✅ \(model.id)" : model.id
+        model.displayTitle
     }
 
     // MARK: - Helpers

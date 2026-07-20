@@ -34,23 +34,14 @@ struct AppView: View {
         // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
-        .onChange(of: services.requestedSection) { _, requested in
+        .onChange(of: services.requestedSection, initial: true) { _, requested in
             // A screen asked us to navigate elsewhere (e.g. "Edit on
             // Server →" from the per-model Profiles tab). Clear the
             // request after applying so the same section can be requested
-            // twice in a row.
+            // twice in a row. `initial: true` also applies a request set
+            // before the window first mounted (e.g. "Model Settings…" from
+            // the menubar while AppView had never been opened).
             if let requested {
-                if requested != .models { services.modelDetailID = nil }
-                selection = requested
-                services.requestedSection = nil
-            }
-        }
-        .onAppear {
-            // Apply any pending requestedSection set before the window
-            // first mounted (e.g. "Model Settings…" from the menubar
-            // while AppView had never been opened). onChange does not
-            // fire for values already set at mount time.
-            if let requested = services.requestedSection {
                 if requested != .models { services.modelDetailID = nil }
                 selection = requested
                 services.requestedSection = nil

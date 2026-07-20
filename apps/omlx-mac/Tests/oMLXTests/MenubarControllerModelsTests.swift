@@ -8,7 +8,7 @@ final class MenubarControllerModelsTests: XCTestCase {
     func testToggleStateUnloadingTakesPrecedenceOverLoaded() {
         let model = makeModel("a", loaded: true)
         XCTAssertEqual(
-            MenubarController.toggleState(for: model, unloading: ["a"]),
+            MenubarController.toggleState(for: model, unloading: ["a"], loading: []),
             .unloading
         )
     }
@@ -16,7 +16,7 @@ final class MenubarControllerModelsTests: XCTestCase {
     func testToggleStateUnloadingTakesPrecedenceOverLoading() {
         let model = makeModel("a", isLoading: true)
         XCTAssertEqual(
-            MenubarController.toggleState(for: model, unloading: ["a"]),
+            MenubarController.toggleState(for: model, unloading: ["a"], loading: ["a"]),
             .unloading
         )
     }
@@ -24,7 +24,15 @@ final class MenubarControllerModelsTests: XCTestCase {
     func testToggleStateLoadingWhenModelIsLoading() {
         let model = makeModel("a", isLoading: true)
         XCTAssertEqual(
-            MenubarController.toggleState(for: model, unloading: []),
+            MenubarController.toggleState(for: model, unloading: [], loading: []),
+            .loading
+        )
+    }
+
+    func testToggleStateLoadingWhenLoadIsPendingLocally() {
+        let model = makeModel("a")
+        XCTAssertEqual(
+            MenubarController.toggleState(for: model, unloading: [], loading: ["a"]),
             .loading
         )
     }
@@ -32,7 +40,7 @@ final class MenubarControllerModelsTests: XCTestCase {
     func testToggleStateUnloadWhenLoaded() {
         let model = makeModel("a", loaded: true)
         XCTAssertEqual(
-            MenubarController.toggleState(for: model, unloading: []),
+            MenubarController.toggleState(for: model, unloading: [], loading: []),
             .unload
         )
     }
@@ -40,7 +48,7 @@ final class MenubarControllerModelsTests: XCTestCase {
     func testToggleStateLoadWhenIdle() {
         let model = makeModel("a")
         XCTAssertEqual(
-            MenubarController.toggleState(for: model, unloading: []),
+            MenubarController.toggleState(for: model, unloading: [], loading: []),
             .load
         )
     }
@@ -71,18 +79,65 @@ final class MenubarControllerModelsTests: XCTestCase {
         )
     }
 
-    // MARK: - modelMenuTitle
+    // MARK: - reconcileLoading
 
-    func testModelMenuTitlePrefixesLoadedModel() {
+    func testReconcileLoadingKeepsUnacknowledgedIDs() {
+        let models = [makeModel("a")]
         XCTAssertEqual(
-            MenubarController.modelMenuTitle(for: makeModel("org/model", loaded: true)),
-            "✅ org/model"
+            MenubarController.reconcileLoading(["a"], against: models),
+            ["a"]
         )
     }
 
-    func testModelMenuTitlePlainForUnloadedModel() {
+    func testReconcileLoadingDropsOnceServerReportsLoading() {
+        let models = [makeModel("a", isLoading: true)]
         XCTAssertEqual(
-            MenubarController.modelMenuTitle(for: makeModel("org/model", loaded: false)),
+            MenubarController.reconcileLoading(["a"], against: models),
+            []
+        )
+    }
+
+    func testReconcileLoadingDropsOnceLoaded() {
+        let models = [makeModel("a", loaded: true)]
+        XCTAssertEqual(
+            MenubarController.reconcileLoading(["a"], against: models),
+            []
+        )
+    }
+
+    func testReconcileLoadingDropsUnknownIDs() {
+        XCTAssertEqual(
+            MenubarController.reconcileLoading(["x"], against: [makeModel("a")]),
+            []
+        )
+    }
+
+    // MARK: - partitionForMenu
+
+    func testPartitionForMenuPutsLoadedAndLoadingFirst() {
+        let models = [
+            makeModel("c"),
+            makeModel("b", loaded: true),
+            makeModel("a"),
+            makeModel("d", isLoading: true),
+        ]
+        let (active, available) = MenubarController.partitionForMenu(models)
+        XCTAssertEqual(active.map(\.id), ["b", "d"])
+        XCTAssertEqual(available.map(\.id), ["a", "c"])
+    }
+
+    // MARK: - modelMenuTitle
+
+    func testModelMenuTitlePrefersDisplayName() {
+        XCTAssertEqual(
+            MenubarController.modelMenuTitle(for: makeModel("org/model", displayName: "Model")),
+            "Model"
+        )
+    }
+
+    func testModelMenuTitleFallsBackToID() {
+        XCTAssertEqual(
+            MenubarController.modelMenuTitle(for: makeModel("org/model", loaded: true)),
             "org/model"
         )
     }
@@ -95,16 +150,10 @@ final class MenubarControllerModelsTests: XCTestCase {
         XCTAssertEqual(model.sizeLabel, "10 GB")
     }
 
-    func testSizeLabelLoadedWithDifferingActualShowsBoth() {
+    func testSizeLabelLoadedPrefersActual() {
         let model = makeModel("a", loaded: true,
                               estimatedSizeFormatted: "10 GB", actualSizeFormatted: "9 GB")
-        XCTAssertEqual(model.sizeLabel, "~9 GB obs / 10 GB est")
-    }
-
-    func testSizeLabelLoadedWithEqualActualShowsObservedOnly() {
-        let model = makeModel("a", loaded: true,
-                              estimatedSizeFormatted: "9 GB", actualSizeFormatted: "9 GB")
-        XCTAssertEqual(model.sizeLabel, "~9 GB obs")
+        XCTAssertEqual(model.sizeLabel, "9 GB")
     }
 
     func testSizeLabelLoadedWithoutActualUsesEstimated() {
@@ -120,6 +169,7 @@ final class MenubarControllerModelsTests: XCTestCase {
 
     private func makeModel(
         _ id: String,
+        displayName: String? = nil,
         loaded: Bool = false,
         isLoading: Bool = false,
         estimatedSizeFormatted: String? = nil,
@@ -127,7 +177,7 @@ final class MenubarControllerModelsTests: XCTestCase {
     ) -> ModelDTO {
         ModelDTO(
             id: id,
-            displayName: nil,
+            displayName: displayName,
             modelPath: nil,
             loaded: loaded,
             isLoading: isLoading,
