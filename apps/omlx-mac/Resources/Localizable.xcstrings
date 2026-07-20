@@ -11,6 +11,30 @@
         }
       }
     },
+    "appearance.model_scope.all" : {
+      "comment" : "Models submenu scope option that lists the whole library",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Models"
+          }
+        }
+      }
+    },
+    "appearance.model_scope.favorites" : {
+      "comment" : "Models submenu scope option that lists only favorite models",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Favorites Only"
+          }
+        }
+      }
+    },
     "appearance.row.alltime_activity" : {
       "comment" : "Appearance row label for the ALL menubar item toggle",
       "extractionState" : "manual",
@@ -203,6 +227,30 @@
         }
       }
     },
+    "appearance.row.visible_models" : {
+      "comment" : "Appearance row label for the Models submenu scope picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Visible Models"
+          }
+        }
+      }
+    },
+    "appearance.row.visible_models.sub" : {
+      "comment" : "Appearance row sublabel for the Models submenu scope picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Which models the menu bar Models menu lists. Loaded models always show."
+          }
+        }
+      }
+    },
     "appearance.section.general" : {
       "comment" : "Appearance screen section header for the basic options",
       "extractionState" : "manual",
@@ -235,6 +283,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Each item shows prompt-processing and token-generation speed in the menu bar. Click one for details and a live graph."
+          }
+        }
+      }
+    },
+    "appearance.section.model_library" : {
+      "comment" : "Appearance screen section header for the Models submenu scope",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Menu Bar Model Library"
           }
         }
       }
@@ -343,6 +403,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Live Activity"
+          }
+        }
+      }
+    },
+    "menubar.models.no_favorites" : {
+      "comment" : "Disabled placeholder in the Models submenu when the favorites-only scope hides every model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No favorite models yet"
           }
         }
       }

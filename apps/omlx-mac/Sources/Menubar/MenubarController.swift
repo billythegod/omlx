@@ -1029,9 +1029,12 @@ final class MenubarController: NSObject {
         }
 
         // Loaded models first, then unloaded favorites, then the rest of the
-        // library — deduplicated top-down, empty sections omitted.
+        // library — deduplicated top-down, empty sections omitted. The
+        // Appearance scope pref can hide the library tail; loaded models
+        // always show since they are active either way.
         let (loaded, favorites, library) = MenubarController.partitionForMenu(models)
-        let sections: [(header: String, group: [ModelDTO])] = [
+        let showLibrary = MenubarMetricPrefs.modelLibraryScope == .all
+        var sections: [(header: String, group: [ModelDTO])] = [
             (String(localized: "menubar.models.section.loaded",
                     defaultValue: "Loaded",
                     comment: "Models submenu section header for loaded or loading models"),
@@ -1040,11 +1043,25 @@ final class MenubarController: NSObject {
                     defaultValue: "Favorites",
                     comment: "Models submenu section header for favorite models that are not loaded"),
              favorites),
-            (String(localized: "menubar.models.section.library",
-                    defaultValue: "Library",
-                    comment: "Models submenu section header for the remaining model library"),
-             library),
         ]
+        if showLibrary {
+            sections.append(
+                (String(localized: "menubar.models.section.library",
+                        defaultValue: "Library",
+                        comment: "Models submenu section header for the remaining model library"),
+                 library)
+            )
+        }
+
+        guard sections.contains(where: { !$0.group.isEmpty }) else {
+            modelsSubmenu.addItem(disabled(String(
+                localized: "menubar.models.no_favorites",
+                defaultValue: "No favorite models yet",
+                comment: "Disabled placeholder in the Models submenu when the favorites-only scope hides every model"
+            )))
+            return
+        }
+
         var needsSeparator = false
         for section in sections where !section.group.isEmpty {
             if needsSeparator { modelsSubmenu.addItem(.separator()) }

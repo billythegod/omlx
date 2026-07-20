@@ -23,6 +23,8 @@ struct AppearanceScreen: View {
     private var showGPUItem = false
     @AppStorage(MenubarMetricPrefs.memoryItemKey)
     private var showMemoryItem = false
+    @AppStorage(MenubarMetricPrefs.modelLibraryScopeKey)
+    private var modelLibraryScope = MenuBarModelScope.all.rawValue
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -67,6 +69,48 @@ struct AppearanceScreen: View {
                     Toggle("", isOn: $showDockIcon)
                         .labelsHidden()
                         .toggleStyle(.switch)
+                }
+            }
+
+            SectionHeader(String(
+                localized: "appearance.section.model_library",
+                defaultValue: "Menu Bar Model Library",
+                comment: "Appearance screen section header for the Models submenu scope"
+            ))
+            .padding(.top, 18)
+            ListGroup {
+                Row(
+                    label: String(
+                        localized: "appearance.row.visible_models",
+                        defaultValue: "Visible Models",
+                        comment: "Appearance row label for the Models submenu scope picker"
+                    ),
+                    sublabel: String(
+                        localized: "appearance.row.visible_models.sub",
+                        defaultValue: "Which models the menu bar Models menu lists. Loaded models always show.",
+                        comment: "Appearance row sublabel for the Models submenu scope picker"
+                    ),
+                    isLast: true
+                ) {
+                    Segmented(selection: $modelLibraryScope, options: [
+                        (
+                            MenuBarModelScope.favoritesOnly.rawValue,
+                            String(
+                                localized: "appearance.model_scope.favorites",
+                                defaultValue: "Favorites Only",
+                                comment: "Models submenu scope option that lists only favorite models"
+                            )
+                        ),
+                        (
+                            MenuBarModelScope.all.rawValue,
+                            String(
+                                localized: "appearance.model_scope.all",
+                                defaultValue: "All Models",
+                                comment: "Models submenu scope option that lists the whole library"
+                            )
+                        ),
+                    ])
+                    .frame(width: 200)
                 }
             }
 

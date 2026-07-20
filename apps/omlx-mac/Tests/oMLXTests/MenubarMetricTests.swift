@@ -128,6 +128,25 @@ final class MenubarMetricTests: XCTestCase {
         XCTAssertEqual(store.history[.alltime]?.generationTps, [30])
     }
 
+    // MARK: - Model library scope pref
+
+    func testModelLibraryScopeParsesAndFallsBackToAll() {
+        let defaults = UserDefaults.standard
+        defer { defaults.removeObject(forKey: MenubarMetricPrefs.modelLibraryScopeKey) }
+
+        defaults.removeObject(forKey: MenubarMetricPrefs.modelLibraryScopeKey)
+        XCTAssertEqual(MenubarMetricPrefs.modelLibraryScope, .all, "absent → all (legacy behavior)")
+
+        defaults.set("favorites", forKey: MenubarMetricPrefs.modelLibraryScopeKey)
+        XCTAssertEqual(MenubarMetricPrefs.modelLibraryScope, .favoritesOnly)
+
+        defaults.set("all", forKey: MenubarMetricPrefs.modelLibraryScopeKey)
+        XCTAssertEqual(MenubarMetricPrefs.modelLibraryScope, .all)
+
+        defaults.set("garbage", forKey: MenubarMetricPrefs.modelLibraryScopeKey)
+        XCTAssertEqual(MenubarMetricPrefs.modelLibraryScope, .all, "unknown raw values fall back to all")
+    }
+
     // MARK: - Glyph formatting
 
     func testFormatTpsCoversUnknownWholeAndCompactRanges() {

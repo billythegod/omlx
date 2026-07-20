@@ -37,6 +37,16 @@ enum MenubarMetricPrefs {
         )
     }
 
+    /// Which models the menubar Models submenu lists below the loaded
+    /// section. Loaded models always show regardless.
+    static let modelLibraryScopeKey = "menubar.modelLibraryScope"
+
+    static var modelLibraryScope: MenuBarModelScope {
+        MenuBarModelScope(
+            rawValue: UserDefaults.standard.string(forKey: modelLibraryScopeKey) ?? ""
+        ) ?? .all
+    }
+
     // Host-metric bar items (CPU / GPU / MEM). These drive the system
     // sampler, not the server-stats poller.
     static let cpuItemKey = "menubar.showCPU"
@@ -59,6 +69,13 @@ struct EnabledSystemItems: Equatable, Sendable {
     var memory: Bool
 
     var any: Bool { cpu || gpu || memory }
+}
+
+/// Unknown raw values (corrupt writes, future removals) fall back to .all —
+/// the behavior the menu always had.
+enum MenuBarModelScope: String, CaseIterable, Sendable {
+    case favoritesOnly = "favorites"
+    case all = "all"
 }
 
 struct EnabledMetrics: Equatable, Sendable {
