@@ -46,6 +46,7 @@ from ..api.utils import (
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
+from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -1466,6 +1467,7 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),

@@ -776,6 +776,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         request.method,
         request.url.path,
         exc,
+        exc_info=exc,
     )
     if _is_api_route(request):
         content = _openai_error_body("Internal server error", 500)
