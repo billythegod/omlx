@@ -217,6 +217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             config: config,
             updates: services.updates,
             lastError: lastError,
+            client: services.client,
+            openModelSettings: { [weak self] id in
+                guard let self else { return }
+                self.services.modelDetailID = id
+                self.services.requestedSection = .models
+                self.presentAppView()
+            },
             openAppView: { [weak self] in self?.presentAppView() },
             requestQuit:  { [weak self] in self?.requestQuit() }
         )
@@ -399,13 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The wizard spawned the server itself. Rebuild the menubar with the
         // running server state and switch to menubar-only mode.
         if let server, menubar != nil {
-            self.menubar = MenubarController(
-                server: server,
-                config: services.config,
-                updates: services.updates,
-                openAppView: { [weak self] in self?.presentAppView() },
-                requestQuit:  { [weak self] in self?.requestQuit() }
-            )
+            self.menubar = makeMenubar(server: server, config: services.config)
         }
         scheduleAccessoryPolicyFlip()
     }

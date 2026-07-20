@@ -38,6 +38,8 @@ final class MenubarController: NSObject {
     private let config: AppConfig
     private let updates: UpdateController?
     private let bootstrapError: Error?
+    private let client: OMLXClient?
+    private let openModelSettings: (String) -> Void
     private let openAppView: () -> Void
     private let requestQuit: () -> Void
 
@@ -64,6 +66,11 @@ final class MenubarController: NSObject {
     private var startItem: NSMenuItem!
     private var stopItem: NSMenuItem!
     private var restartItem: NSMenuItem!
+    private var modelsParentItem: NSMenuItem!
+    private var modelsSubmenu: NSMenu!
+    private var models: [ModelDTO] = []
+    private var unloadingIDs: Set<String> = []
+    private var modelsFetchTask: Task<Void, Never>?
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
     private var showLiveActivityInMenuBarItem: NSMenuItem!
@@ -93,6 +100,8 @@ final class MenubarController: NSObject {
         config: AppConfig,
         updates: UpdateController? = nil,
         lastError: Error? = nil,
+        client: OMLXClient? = nil,
+        openModelSettings: @escaping (String) -> Void = { _ in },
         openAppView: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
@@ -100,6 +109,8 @@ final class MenubarController: NSObject {
         self.config = config
         self.updates = updates
         self.bootstrapError = lastError
+        self.client = client
+        self.openModelSettings = openModelSettings
         self.openAppView = openAppView
         self.requestQuit = requestQuit
 
@@ -225,6 +236,16 @@ final class MenubarController: NSObject {
                          symbol: "play.circle")
         menu.addItem(startItem)
 
+        modelsParentItem = item(String(localized: "menubar.item.models",
+                                       defaultValue: "Models",
+                                       comment: "Menubar parent item opening the per-model control submenu"),
+                                action: nil,
+                                symbol: "shippingbox")
+        modelsSubmenu = NSMenu()
+        modelsSubmenu.autoenablesItems = false
+        modelsParentItem.submenu = modelsSubmenu
+        menu.addItem(modelsParentItem)
+
         menu.addItem(.separator())
 
         statsParentItem = item(String(localized: "menubar.item.serving_stats",
@@ -236,6 +257,7 @@ final class MenubarController: NSObject {
         statsParentItem.submenu = statsSubmenu
         menu.addItem(statsParentItem)
         rebuildStatsSubmenu()
+        rebuildModelsSubmenu()
 
         showLiveActivityInMenuBarItem = item(
             String(
@@ -350,6 +372,8 @@ final class MenubarController: NSObject {
         // a transitional state we shouldn't double-trigger.
         startItem.isEnabled = (server != nil) && !liveLike
         stopItem.isEnabled = liveLike && !isStopping
+
+        modelsParentItem.isEnabled = isRunning
 
         // Native Settings is the recovery surface for stopped/failed servers.
         // Web Dashboard / Chat open browser URLs against the live port, so
@@ -689,9 +713,24 @@ final class MenubarController: NSObject {
     @objc private func serverStateChanged(_ note: Notification) {
         refreshMenuState()
         rebuildStatsSubmenu()
+        rebuildModelsSubmenu()
         refreshStatsPollerEndpoint()
 
         guard let server else { return }
+
+        // Drop cached model state when the server is no longer serving so a
+        // stale list can't linger (or flash on the next start) and any in-flight
+        // fetch is cancelled rather than landing against a dead endpoint.
+        switch server.state {
+        case .stopped, .failed:
+            modelsFetchTask?.cancel()
+            modelsFetchTask = nil
+            models = []
+            unloadingIDs.removeAll()
+        default:
+            break
+        }
+
         if case .failed(let message) = server.state,
            MenubarController.shouldShowGenericFailureAlert(message: message) {
             presentServerFailureAlert(message: message, logURL: server.serverLogURL)
@@ -882,6 +921,181 @@ final class MenubarController: NSObject {
         // Quit go through `applicationShouldTerminate` and are intercepted
         // to close the window only.
         requestQuit()
+    }
+
+    // MARK: - Models submenu
+
+    private func rebuildModelsSubmenu() {
+        modelsSubmenu.removeAllItems()
+
+        guard serverIsRunning else { return }
+
+        if models.isEmpty {
+            modelsSubmenu.addItem(disabled(String(localized: "menubar.models.empty",
+                                                  defaultValue: "No models available",
+                                                  comment: "Disabled placeholder in the Models submenu when no models are discovered")))
+            return
+        }
+
+        for m in sortModelsByName(models) {
+            let parentItem: NSMenuItem
+            if m.loaded {
+                let attrTitle = NSMutableAttributedString()
+                let titleFont = NSFont.menuFont(ofSize: 0)
+                let sizeFont = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
+                attrTitle.append(NSAttributedString(
+                    string: MenubarController.modelMenuTitle(for: m),
+                    attributes: [.font: titleFont]
+                ))
+                if !m.sizeLabel.isEmpty {
+                    let paraStyle = NSMutableParagraphStyle()
+                    paraStyle.lineSpacing = 1
+                    attrTitle.append(NSAttributedString(
+                        string: "\n\(m.sizeLabel)",
+                        attributes: [
+                            .font: sizeFont,
+                            .foregroundColor: NSColor.secondaryLabelColor,
+                            .paragraphStyle: paraStyle,
+                        ]
+                    ))
+                }
+                parentItem = NSMenuItem()
+                parentItem.attributedTitle = attrTitle
+            } else {
+                parentItem = NSMenuItem(title: MenubarController.modelMenuTitle(for: m), action: nil, keyEquivalent: "")
+            }
+            parentItem.isEnabled = true
+
+            let sub = NSMenu()
+            sub.autoenablesItems = false
+
+            let toggleItem = NSMenuItem()
+            toggleItem.representedObject = m.id
+            switch MenubarController.toggleState(for: m, unloading: unloadingIDs) {
+            case .unloading:
+                toggleItem.title = String(localized: "menubar.models.unloading",
+                                          defaultValue: "Unloading model…",
+                                          comment: "Disabled menu item while a model unload is in progress")
+                toggleItem.isEnabled = false
+            case .loading:
+                toggleItem.title = String(localized: "menubar.models.loading",
+                                          defaultValue: "Loading model…",
+                                          comment: "Disabled menu item while a model load is in progress")
+                toggleItem.isEnabled = false
+            case .unload:
+                toggleItem.title = String(localized: "menubar.models.unload",
+                                          defaultValue: "Unload model",
+                                          comment: "Menu item to unload a currently loaded model")
+                toggleItem.action = #selector(unloadModelAction(_:))
+                toggleItem.target = self
+                toggleItem.isEnabled = true
+            case .load:
+                toggleItem.title = String(localized: "menubar.models.load",
+                                          defaultValue: "Load model",
+                                          comment: "Menu item to load a model")
+                toggleItem.action = #selector(loadModelAction(_:))
+                toggleItem.target = self
+                toggleItem.isEnabled = true
+            }
+            sub.addItem(toggleItem)
+
+            let settingsItem = NSMenuItem(
+                title: String(localized: "menubar.models.settings",
+                              defaultValue: "Model Settings…",
+                              comment: "Menu item that opens the in-app per-model settings pane"),
+                action: #selector(openModelSettingsAction(_:)),
+                keyEquivalent: ""
+            )
+            settingsItem.target = self
+            settingsItem.representedObject = m.id
+            settingsItem.isEnabled = true
+            sub.addItem(settingsItem)
+
+            let copyItem = NSMenuItem(
+                title: String(localized: "menubar.models.copy_name",
+                              defaultValue: "Copy name",
+                              comment: "Menu item that copies the model id to the clipboard"),
+                action: #selector(copyModelNameAction(_:)),
+                keyEquivalent: ""
+            )
+            copyItem.target = self
+            copyItem.representedObject = m.id
+            copyItem.isEnabled = true
+            sub.addItem(copyItem)
+
+            parentItem.submenu = sub
+            modelsSubmenu.addItem(parentItem)
+        }
+    }
+
+    /// Supersedes any in-flight model-list fetch with a fresh one. Keeping a
+    /// single cancellable task means a stale fetch (e.g. one started just before
+    /// the server stopped) can't clobber current state — `refreshModels` bails on
+    /// `Task.isCancelled`.
+    private func scheduleModelsRefresh() {
+        modelsFetchTask?.cancel()
+        modelsFetchTask = Task { [weak self] in await self?.refreshModels() }
+    }
+
+    private func refreshModels() async {
+        guard serverIsRunning, let client else { return }
+        guard let resp = try? await client.listModels() else { return }
+        guard !Task.isCancelled else { return }
+        models = resp.models
+        unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
+        rebuildModelsSubmenu()
+    }
+
+    // MARK: - Per-model actions
+
+    @objc private func loadModelAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        // The load POST runs in its own task so it isn't cancelled when the menu
+        // closes; only the trailing list refresh routes through the scheduler.
+        Task { try? await client?.loadModel(id: id); scheduleModelsRefresh() }
+    }
+
+    @objc private func unloadModelAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        unloadingIDs.insert(id)
+        rebuildModelsSubmenu()
+        Task { try? await client?.unloadModel(id: id); scheduleModelsRefresh() }
+    }
+
+    @objc private func openModelSettingsAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        openModelSettings(id)
+    }
+
+    @objc private func copyModelNameAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(id, forType: .string)
+    }
+
+    // MARK: - Models — pure helpers
+
+    /// The load/unload control state for a model, given the set of ids whose
+    /// unload is currently in flight. Extracted so it can be unit-tested without
+    /// a live `NSStatusBar` (which instantiating the controller requires).
+    enum ModelToggleState: Equatable { case unloading, loading, unload, load }
+
+    nonisolated static func toggleState(for model: ModelDTO, unloading: Set<String>) -> ModelToggleState {
+        if unloading.contains(model.id) { return .unloading }
+        if model.isLoading { return .loading }
+        if model.loaded { return .unload }
+        return .load
+    }
+
+    /// Keeps only the ids whose model still reports `loaded == true` — i.e. drops
+    /// any pending-unload id once the server confirms it's gone (or unknown).
+    nonisolated static func reconcileUnloading(_ unloading: Set<String>, against models: [ModelDTO]) -> Set<String> {
+        unloading.filter { id in models.first(where: { $0.id == id })?.loaded == true }
+    }
+
+    /// Plain menu label for a model: the id, prefixed with ✅ when loaded.
+    nonisolated static func modelMenuTitle(for model: ModelDTO) -> String {
+        model.loaded ? "✅ \(model.id)" : model.id
     }
 
     // MARK: - Helpers
@@ -1121,5 +1335,7 @@ extension MenubarController: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         refreshMenuState()
         rebuildStatsSubmenu()
+        rebuildModelsSubmenu()
+        scheduleModelsRefresh()
     }
 }

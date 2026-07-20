@@ -114,6 +114,7 @@
 		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
 		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
+		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
 		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
@@ -240,6 +241,7 @@
 		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -270,6 +272,44 @@
 				1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */,
 				1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				DEE000000000000000000002 /* oMLXTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000002 /* oMLXTests */ = {
+			isa = PBXGroup;
+			children = (
+				DCC000000000000000000001 /* AppServicesPathTests.swift */,
+				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
+				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
+				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
+				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
+				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
+				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
+				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
+				DCC00000000000000000000A /* ProfileScopeTests.swift */,
+				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
+				DCC00000000000000000000D /* DTOFixtureTests.swift */,
+				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
+				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
+				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
+				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
+				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
+				DCC000000000000000000105 /* ThemeTests.swift */,
+				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
+				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
+				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
+				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
+			);
+			path = oMLXTests;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
@@ -495,43 +535,6 @@
 			path = Welcome;
 			sourceTree = "<group>";
 		};
-		DEE000000000000000000001 /* Tests */ = {
-			isa = PBXGroup;
-			children = (
-				DEE000000000000000000002 /* oMLXTests */,
-			);
-			path = Tests;
-			sourceTree = "<group>";
-		};
-		DEE000000000000000000002 /* oMLXTests */ = {
-			isa = PBXGroup;
-			children = (
-				DCC000000000000000000001 /* AppServicesPathTests.swift */,
-				DCC000000000000000000002 /* AppConfigTests.swift */,
-				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
-				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
-				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
-				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
-				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
-				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
-				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
-				DCC00000000000000000000A /* ProfileScopeTests.swift */,
-				DCC00000000000000000000B /* SystemMetricsTests.swift */,
-				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
-				DCC00000000000000000000D /* DTOFixtureTests.swift */,
-				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
-				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
-				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
-				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
-				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
-				DCC000000000000000000105 /* ThemeTests.swift */,
-				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
-				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
-				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
-			);
-			path = oMLXTests;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -742,6 +745,7 @@
 				DBB000000000000000000105 /* ThemeTests.swift in Sources */,
 				DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */,
 				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
+				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
