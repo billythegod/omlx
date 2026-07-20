@@ -1059,7 +1059,14 @@ final class MenubarController: NSObject {
         guard let id = sender.representedObject as? String else { return }
         unloadingIDs.insert(id)
         rebuildModelsSubmenu()
-        Task { try? await client?.unloadModel(id: id); scheduleModelsRefresh() }
+        Task {
+            // A failed unload (500, timeout) must drop the pending id, or
+            // reconcileUnloading keeps the entry wedged on "Unloading model…"
+            // for as long as the server still reports the model loaded.
+            do { _ = try await client?.unloadModel(id: id) }
+            catch { unloadingIDs.remove(id) }
+            scheduleModelsRefresh()
+        }
     }
 
     @objc private func openModelSettingsAction(_ sender: NSMenuItem) {
