@@ -134,7 +134,10 @@ class EnginePool:
         Note:
             Pre-load admission consults `enforcer.get_final_ceiling()` via
             the `_get_final_ceiling` callback set by `server.init_server()`.
-            Until the callback is wired up the pool admits unconditionally.
+            When that reads 0 (memory guard disabled), the pool falls back
+            to `enforcer.get_admission_ceiling()` via `_get_admission_ceiling`
+            for best-effort LRU eviction (#2290). Until the callbacks are
+            wired up the pool admits unconditionally.
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
@@ -142,6 +145,7 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
+        self._get_admission_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
@@ -176,6 +180,23 @@ class EnginePool:
         "no limit").
         """
         cb = self._get_final_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _fallback_admission_ceiling(self) -> int:
+        """Best-effort admission ceiling used when `_current_ceiling()` is 0.
+
+        Wired to `enforcer.get_admission_ceiling`, which keeps returning
+        the static ceiling while the memory guard is disabled so a model
+        swap still evicts LRU models instead of overcommitting physical
+        memory (#2290). Returns 0 when no callback is wired up (standalone
+        pools admit unconditionally).
+        """
+        cb = self._get_admission_ceiling
         if cb is None:
             return 0
         try:
@@ -789,9 +810,17 @@ class EnginePool:
             # evicting LRU non-pinned models first; if the model still
             # cannot fit after evicting everything available, raise.
             #
-            # ceiling == 0 means the enforcer is off (guard disabled or
-            # not yet wired up), so we admit unconditionally.
+            # ceiling == 0 means the guard is disabled or the enforcer is
+            # not wired up. Eviction on model swap must not die with the
+            # guard (#2290): fall back to the best-effort admission
+            # ceiling (static, guard-independent) and keep evicting, but
+            # never refuse the load under it — with the guard off the
+            # user opted out of hard limits.
             ceiling = self._current_ceiling()
+            best_effort = False
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+                best_effort = ceiling > 0
             if ceiling > 0:
                 evicted_any = unloaded_for_admission
                 while True:
@@ -853,6 +882,21 @@ class EnginePool:
                         failure_current = committed
                         failure_projected = committed_projected
                         failure_label = "committed"
+
+                    if best_effort:
+                        # Memory guard is off: evicting was all we could
+                        # do. Admit over the static ceiling instead of
+                        # refusing, matching the unguarded no-hard-limit
+                        # contract.
+                        logger.warning(
+                            f"Loading '{model_id}' past the static memory "
+                            f"ceiling with the memory guard disabled "
+                            f"(projected {format_size(failure_projected)} > "
+                            f"ceiling {format_size(ceiling)}, "
+                            f"{failure_label} baseline) and nothing left to "
+                            f"evict; the system may swap heavily."
+                        )
+                        break
 
                     # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
