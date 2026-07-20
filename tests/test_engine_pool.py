@@ -2396,6 +2396,35 @@ class TestEnginePoolInUseLease:
         await pool.release_engine("nope")
 
     @pytest.mark.asyncio
+    async def test_release_engine_survives_caller_cancellation_while_lock_waits(self):
+        """A cancelled caller must not strand a lease behind the pool lock."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        pool._entries = {"leased": entry}
+
+        await pool._lock.acquire()
+        caller = asyncio.create_task(pool.release_engine("leased"))
+        try:
+            await asyncio.sleep(0)
+            assert len(pool._lease_release_tasks) == 1
+
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+            assert entry.in_use == 1
+            assert len(pool._lease_release_tasks) == 1
+        finally:
+            pool._lock.release()
+
+        await pool._drain_lease_release_tasks()
+
+        assert entry.in_use == 0
+        assert pool._lease_release_tasks == set()
+        assert pool._find_lru_victim() == "leased"
+
+    @pytest.mark.asyncio
     async def test_release_engine_unloads_pending_after_lease_drains(self):
         """Pending hard-pressure unload runs as soon as the lease drains."""
         pool = _make_pool(ceiling=0)

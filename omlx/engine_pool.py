@@ -146,6 +146,7 @@ class EnginePool:
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
+        self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self.configure_hot_cache_budget()
 
     @property
@@ -887,13 +888,41 @@ class EnginePool:
                 loaded.in_use += 1
             return loaded.engine
 
-    async def release_engine(self, model_id: str) -> None:
-        """Release one in-use lease previously taken via get_engine(_lease=True)."""
+    async def _release_engine_lease(self, model_id: str) -> None:
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
             await self._unload_pending_if_idle_locked(model_id)
+
+    def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
+        self._lease_release_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.warning("Engine lease release task was cancelled")
+        except Exception:
+            logger.exception("Engine lease release task failed")
+
+    async def _drain_lease_release_tasks(self) -> None:
+        while self._lease_release_tasks:
+            tasks = tuple(self._lease_release_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def release_engine(self, model_id: str) -> None:
+        """Release one in-use lease even if the caller is cancelled.
+
+        ASGI disconnect cancellation can arrive while this release is waiting
+        for the pool lock. Run the lock-taking operation in its own task so the
+        lease still drains after the cancelled request task exits.
+        """
+        task = asyncio.create_task(
+            self._release_engine_lease(model_id),
+            name=f"engine-lease-release:{model_id}",
+        )
+        self._lease_release_tasks.add(task)
+        task.add_done_callback(self._finish_lease_release_task)
+        await asyncio.shield(task)
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
@@ -1799,6 +1828,7 @@ class EnginePool:
 
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
+        await self._drain_lease_release_tasks()
         async with self._lock:
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
