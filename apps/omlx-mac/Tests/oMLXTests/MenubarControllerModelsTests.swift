@@ -112,18 +112,40 @@ final class MenubarControllerModelsTests: XCTestCase {
         )
     }
 
+    // MARK: - visibleMenuModels
+
+    func testVisibleMenuModelsDropsVirtualEntries() {
+        let models = [
+            makeModel("a"),
+            makeModel("markitdown", loaded: true, virtual: true),
+        ]
+        XCTAssertEqual(
+            MenubarController.visibleMenuModels(models).map(\.id),
+            ["a"]
+        )
+    }
+
     // MARK: - partitionForMenu
 
-    func testPartitionForMenuPutsLoadedAndLoadingFirst() {
+    func testPartitionForMenuSplitsLoadedFavoritesAndLibrary() {
         let models = [
             makeModel("c"),
             makeModel("b", loaded: true),
-            makeModel("a"),
+            makeModel("a", isFavorite: true),
             makeModel("d", isLoading: true),
         ]
-        let (active, available) = MenubarController.partitionForMenu(models)
-        XCTAssertEqual(active.map(\.id), ["b", "d"])
-        XCTAssertEqual(available.map(\.id), ["a", "c"])
+        let (loaded, favorites, library) = MenubarController.partitionForMenu(models)
+        XCTAssertEqual(loaded.map(\.id), ["b", "d"])
+        XCTAssertEqual(favorites.map(\.id), ["a"])
+        XCTAssertEqual(library.map(\.id), ["c"])
+    }
+
+    func testPartitionForMenuKeepsLoadedFavoriteOnlyInLoaded() {
+        let models = [makeModel("a", loaded: true, isFavorite: true)]
+        let (loaded, favorites, library) = MenubarController.partitionForMenu(models)
+        XCTAssertEqual(loaded.map(\.id), ["a"])
+        XCTAssertTrue(favorites.isEmpty)
+        XCTAssertTrue(library.isEmpty)
     }
 
     // MARK: - modelMenuTitle
@@ -172,6 +194,8 @@ final class MenubarControllerModelsTests: XCTestCase {
         displayName: String? = nil,
         loaded: Bool = false,
         isLoading: Bool = false,
+        isFavorite: Bool = false,
+        virtual: Bool = false,
         estimatedSizeFormatted: String? = nil,
         actualSizeFormatted: String? = nil
     ) -> ModelDTO {
@@ -187,7 +211,7 @@ final class MenubarControllerModelsTests: XCTestCase {
             actualSizeFormatted: actualSizeFormatted,
             pinned: nil,
             isDefault: nil,
-            isFavorite: nil,
+            isFavorite: isFavorite,
             engineType: nil,
             modelType: nil,
             configModelType: nil,
@@ -197,6 +221,7 @@ final class MenubarControllerModelsTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            virtual: virtual,
             settings: nil
         )
     }

@@ -83,6 +83,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            virtual: nil,
             settings: nil
         )
     }

@@ -949,12 +949,30 @@ final class MenubarController: NSObject {
             return
         }
 
-        // Loaded/loading models first — they are what the menu exists for —
-        // then the rest of the library, both alphabetical.
-        let (active, available) = MenubarController.partitionForMenu(models)
-        for m in active { modelsSubmenu.addItem(modelItem(for: m)) }
-        if !active.isEmpty, !available.isEmpty { modelsSubmenu.addItem(.separator()) }
-        for m in available { modelsSubmenu.addItem(modelItem(for: m)) }
+        // Loaded models first, then unloaded favorites, then the rest of the
+        // library — deduplicated top-down, empty sections omitted.
+        let (loaded, favorites, library) = MenubarController.partitionForMenu(models)
+        let sections: [(header: String, group: [ModelDTO])] = [
+            (String(localized: "menubar.models.section.loaded",
+                    defaultValue: "Loaded",
+                    comment: "Models submenu section header for loaded or loading models"),
+             loaded),
+            (String(localized: "menubar.models.section.favorites",
+                    defaultValue: "Favorites",
+                    comment: "Models submenu section header for favorite models that are not loaded"),
+             favorites),
+            (String(localized: "menubar.models.section.library",
+                    defaultValue: "Library",
+                    comment: "Models submenu section header for the remaining model library"),
+             library),
+        ]
+        var needsSeparator = false
+        for section in sections where !section.group.isEmpty {
+            if needsSeparator { modelsSubmenu.addItem(.separator()) }
+            needsSeparator = true
+            modelsSubmenu.addItem(.sectionHeader(title: section.header))
+            for m in section.group { modelsSubmenu.addItem(modelItem(for: m)) }
+        }
     }
 
     private func modelItem(for m: ModelDTO) -> NSMenuItem {
@@ -1061,7 +1079,7 @@ final class MenubarController: NSObject {
         guard serverIsRunning, let client else { return }
         guard let resp = try? await client.listModels() else { return }
         guard !Task.isCancelled else { return }
-        models = resp.models
+        models = MenubarController.visibleMenuModels(resp.models)
         modelsFetched = true
         unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
         loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
@@ -1143,12 +1161,29 @@ final class MenubarController: NSObject {
         }
     }
 
-    /// Splits models into active (loaded or loading) and the rest of the
-    /// library, each sorted like the Models screen.
-    nonisolated static func partitionForMenu(_ models: [ModelDTO]) -> (active: [ModelDTO], available: [ModelDTO]) {
-        (
-            active: sortModelsByName(models.filter { $0.loaded || $0.isLoading }),
-            available: sortModelsByName(models.filter { !$0.loaded && !$0.isLoading })
+    /// Menu-visible models: virtual builtin entries (e.g. the MarkItDown
+    /// document converter) have no real load/unload lifecycle and are dropped.
+    nonisolated static func visibleMenuModels(_ models: [ModelDTO]) -> [ModelDTO] {
+        models.filter { $0.virtual != true }
+    }
+
+    /// Splits models into the three menu sections — loaded/loading models,
+    /// unloaded favorites, and the rest of the library — deduplicated top-down
+    /// and each alphabetical by display title.
+    nonisolated static func partitionForMenu(
+        _ models: [ModelDTO]
+    ) -> (loaded: [ModelDTO], favorites: [ModelDTO], library: [ModelDTO]) {
+        func alphabetical(_ group: [ModelDTO]) -> [ModelDTO] {
+            group.sorted {
+                $0.displayTitle.localizedCaseInsensitiveCompare($1.displayTitle) == .orderedAscending
+            }
+        }
+        let active = models.filter { $0.loaded || $0.isLoading }
+        let rest = models.filter { !$0.loaded && !$0.isLoading }
+        return (
+            loaded: alphabetical(active),
+            favorites: alphabetical(rest.filter { $0.isFavorite ?? false }),
+            library: alphabetical(rest.filter { !($0.isFavorite ?? false) })
         )
     }
 

@@ -49,6 +49,9 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// True for builtin virtual entries (e.g. the MarkItDown document
+    /// converter) that have no real load/unload lifecycle.
+    let virtual: Bool?
     let settings: ModelSettingsDTO?
 }
 
