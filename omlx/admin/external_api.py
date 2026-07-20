@@ -491,9 +491,12 @@ class ExternalChatAdapter:
                 "External API connected, but preflight message.content is empty",
                 status="empty_content",
             )
-        if result.text.strip().upper() != "OK":
+        # Accept a leading OK with trailing punctuation or extra words
+        # (OK. / Okay / OK!) so a compliant endpoint is not rejected over
+        # formatting. A genuinely wrong or negated reply (NOT OK) still fails.
+        if not result.text.strip().upper().startswith("OK"):
             raise ExternalEndpointError(
-                "External API preflight response was not exactly OK in "
+                "External API preflight response did not start with OK in "
                 "message.content",
                 status="parse_error",
             )

@@ -615,6 +615,19 @@ class TestExternalChatAdapter:
         finally:
             await client.aclose()
 
+    @pytest.mark.parametrize("text", ["OK", "OK.", "Okay", "ok", "  OK  ", "OK!"])
+    async def test_preflight_accepts_ok_with_formatting(self, text):
+        # A compliant endpoint should not be rejected over trailing
+        # punctuation, casing, or whitespace around the OK sentinel.
+        def handler(request):
+            return _completion_response(text=text)
+
+        adapter, client = self._adapter(handler)
+        try:
+            await adapter.preflight()
+        finally:
+            await client.aclose()
+
     @pytest.mark.parametrize(
         ("text", "extra_message", "finish_reason", "expected_status"),
         [
