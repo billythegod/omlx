@@ -2689,6 +2689,54 @@ class TestMemorySettleBarrier:
         assert pool._current_model_memory == 0
 
     @pytest.mark.asyncio
+    async def test_settle_bails_out_while_another_model_loads(
+        self, pool_with_loaded_model, caplog
+    ):
+        """#2312: a loading entry (``is_loading=True``, ``engine`` still
+        None) allocates weights concurrently, so the freed delta is just as
+        unmeasurable as with a serving entry — the reporter's restart log
+        showed freed=-27.46GB while a large model loaded next to a TTS
+        unload. The barrier must take the indeterminate bail, not the
+        negative-freed timeout + emergency reclaim path.
+        """
+        pool = pool_with_loaded_model
+
+        entry_b = pool._entries["model-b"]
+        entry_b.engine = None
+        entry_b.is_loading = True
+
+        call_idx = [0]
+
+        def rising_gauge():
+            val = (10 + call_idx[0]) * 1024**3
+            call_idx[0] += 1
+            return val
+
+        sleep_calls: list[float] = []
+
+        async def record_sleep(duration, *args, **kwargs):
+            sleep_calls.append(duration)
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=record_sleep),
+            caplog.at_level(logging.DEBUG, logger="omlx.engine_pool"),
+        ):
+            mock_mx.get_active_memory = rising_gauge
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert "indeterminate under concurrent activity" in caplog.text
+        assert sleep_calls.count(0.5) == 0
+        assert "Settle barrier timed out" not in caplog.text
+        assert "Emergency reclaim" not in caplog.text
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
     async def test_settle_still_waits_when_pool_otherwise_idle(
         self, pool_with_loaded_model, caplog
     ):

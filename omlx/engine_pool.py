@@ -1273,17 +1273,25 @@ class EnginePool:
         return freed
 
     def _other_entries_serving(self, model_id: str) -> bool:
-        """True when any loaded entry other than ``model_id`` is serving.
+        """True when any other entry is serving or loading.
 
         Used by the settle barrier in ``_unload_engine``: the barrier's
         freed-memory check is a delta of the process-global
         ``mx.get_active_memory()`` gauge, which only measures THIS unload
-        while no other engine is allocating concurrently.
+        while no other engine is allocating concurrently. A loading entry
+        (``is_loading=True``, ``engine`` still None) allocates weights at
+        full speed, so it must count as concurrent activity too — else the
+        barrier burns its rounds against a gauge that can even read
+        negative and logs a bogus timeout (#2312).
         """
         # Snapshot the items: admin unload routes call _unload_engine without
         # the pool lock, so discover_models() can mutate _entries mid-iteration.
         for mid, e in list(self._entries.items()):
-            if mid == model_id or e.engine is None:
+            if mid == model_id:
+                continue
+            if e.is_loading:
+                return True
+            if e.engine is None:
                 continue
             if e.in_use > 0:
                 return True
