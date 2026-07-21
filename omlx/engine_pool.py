@@ -1128,7 +1128,6 @@ class EnginePool:
             return False
 
         evicted_any = False
-        reclaimed_headroom = False
         reclaim_attempted = False
         async with self._lock:
             while True:
@@ -1140,7 +1139,12 @@ class EnginePool:
                 if current + predicted <= target:
                     # A model eviction and/or the pooled-buffer reclaim below
                     # created enough headroom; signal the caller to re-admit.
-                    return evicted_any or reclaimed_headroom
+                    # reclaim_attempted stands in for "the reclaim freed
+                    # memory": the helper's own footprint delta is
+                    # process-wide and can be masked by concurrent
+                    # allocation, but reaching this check with headroom
+                    # after an attempt means admission will now succeed.
+                    return evicted_any or reclaim_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -1156,11 +1160,16 @@ class EnginePool:
                     # re-measure.
                     if not reclaim_attempted:
                         reclaim_attempted = True
-                        if await self._reclaim_pooled_buffers_for_prefill(
+                        await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
-                        ):
-                            reclaimed_headroom = True
-                            continue
+                        )
+                        # Re-measure regardless of the reported delta: the
+                        # helper measures a process-wide footprint, so
+                        # concurrent allocation on another engine can mask a
+                        # real reclaim as 0 bytes freed. The loop re-checks
+                        # the target with a fresh reading; reclaim_attempted
+                        # keeps this branch from running twice.
+                        continue
                     if evicted_any:
                         logger.info(
                             "Prefill eviction for request %s stopped with no "

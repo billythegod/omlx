@@ -1162,6 +1162,39 @@ class TestSchedulerAbortRequest:
         assert "req-ghost" not in scheduler.request_id_to_uid
         assert uid not in scheduler.uid_to_request_id
 
+    def test_abort_schedules_deferred_metal_clear(self, mock_model, mock_tokenizer):
+        """_do_abort_request must schedule the deferred Metal clear.
+
+        Aborts free KV/activation arrays into MLX's buffer pool just like
+        normal finishes. Without the deferred clear, an abort burst followed
+        by idle leaves the pooled bytes resident until the next
+        admission-time or enforcer reclaim (#2179 residue).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-abort-clear",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+
+        scheduler.requests["req-abort-clear"] = request
+        scheduler.running["req-abort-clear"] = request
+
+        with patch("omlx.scheduler.mx") as mock_mx:
+            assert scheduler._do_abort_request("req-abort-clear") is True
+            # Not cleared immediately -- deferred to avoid the IOKit race.
+            mock_mx.clear_cache.assert_not_called()
+        assert scheduler._deferred_clear_at == (
+            scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        )
+        # The pending clear counts as work so the idle engine loop keeps
+        # stepping until it fires.
+        assert scheduler.has_requests() is True
+
 
 class TestPrefillAbortInterrupt:
     """Tests for prefill abort interrupt via _check_pending_aborts_for_uids."""

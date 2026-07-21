@@ -651,8 +651,9 @@ class TestPrefixIndexOperations:
         result = prefix_cache._find_best_prefix_match(tokens)
 
         assert result is not None
-        prefix_len, matched_ids, num_blocks = result
+        prefix_len, matched_ids, num_blocks, chain_hashes = result
         assert prefix_len == 4
+        assert chain_hashes == [block_hash]
 
     def test_prefix_index_immutable_after_store(self, prefix_cache, paged_cache):
         """Test that _prefix_index entries are not affected by later mutations
@@ -677,8 +678,205 @@ class TestPrefixIndexOperations:
         # Verify: prefix_index must still contain the original block IDs
         result = prefix_cache._find_best_prefix_match(tokens)
         assert result is not None
-        _, matched_ids, num_blocks = result
+        _, matched_ids, num_blocks, _ = result
         assert list(matched_ids[:num_blocks]) == original_ids[:num_blocks]
+
+
+class TestPrefixIndexLifecycle:
+    """Tests for the prefix-index / block-hash lifecycle coupling.
+
+    Regression tests for unbounded _prefix_index growth: entries used to be
+    dropped only by clear(), so a long-lived server leaked Python heap for
+    every distinct stored prefix even after the blocks themselves were freed
+    or reused.
+    """
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def prefix_cache(self, paged_cache):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+        )
+
+    def _indexed_blocks(self, prefix_cache, paged_cache, tokens):
+        """Allocate blocks for tokens and index them; returns the blocks."""
+        num = len(tokens) // paged_cache.block_size
+        blocks = paged_cache.get_new_blocks(num)
+        for block in blocks:
+            block.token_count = paged_cache.block_size
+        prefix_cache._update_prefix_index(
+            tokens, [block.block_id for block in blocks]
+        )
+        return blocks
+
+    def test_lifecycle_hooks_registered(self, prefix_cache, paged_cache):
+        assert paged_cache.on_block_hash_dropped is not None
+        assert paged_cache.on_hash_map_cleared is not None
+
+    def test_index_entry_dropped_on_block_free(self, prefix_cache, paged_cache):
+        blocks = self._indexed_blocks(
+            prefix_cache, paged_cache, [1, 2, 3, 4, 5, 6, 7, 8]
+        )
+        assert len(prefix_cache._prefix_index) == 2
+
+        for block in blocks:
+            paged_cache.free_block(block.block_id)
+
+        assert len(prefix_cache._prefix_index) == 0
+
+    def test_index_entry_dropped_on_hash_eviction(self, prefix_cache, paged_cache):
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, [1, 2, 3, 4])
+        block = blocks[0]
+        paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+        assert len(prefix_cache._prefix_index) == 1
+
+        paged_cache._maybe_evict_cached_block(block)
+
+        assert len(prefix_cache._prefix_index) == 0
+
+    def test_index_survives_while_other_block_shares_hash(
+        self, prefix_cache, paged_cache
+    ):
+        """Hybrid models map the same hash to several blocks (one per KV
+        cache group); the index entry must only die with the last one."""
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, [1, 2, 3, 4])
+        block = blocks[0]
+        block_hash = block.block_hash
+        other = paged_cache.get_new_blocks(1)[0]
+        other.block_hash = block_hash
+        paged_cache.cached_block_hash_to_block.insert(block_hash, block)
+        paged_cache.cached_block_hash_to_block.insert(block_hash, other)
+
+        paged_cache._maybe_evict_cached_block(block)
+        assert block_hash in prefix_cache._prefix_index
+
+        paged_cache._maybe_evict_cached_block(other)
+        assert block_hash not in prefix_cache._prefix_index
+
+    def test_index_cleared_on_paged_clear(self, prefix_cache, paged_cache):
+        self._indexed_blocks(prefix_cache, paged_cache, [1, 2, 3, 4])
+        assert prefix_cache._prefix_index
+
+        paged_cache.clear()
+
+        assert not prefix_cache._prefix_index
+
+    def test_index_entry_dropped_on_forget_incompatible(
+        self, prefix_cache, paged_cache
+    ):
+        """_forget_incompatible_ssd_block pops the hash map directly; the
+        prefix index must follow, or it keeps retrying the dead chain."""
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, [1, 2, 3, 4])
+        block = blocks[0]
+        paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+        assert len(prefix_cache._prefix_index) == 1
+
+        prefix_cache._forget_incompatible_ssd_block(
+            block.block_hash, block.block_id
+        )
+
+        assert len(prefix_cache._prefix_index) == 0
+
+    def test_update_stops_at_unallocated_block_id(self, prefix_cache, paged_cache):
+        """Unallocated block ids must not be indexed: no block owns the
+        hash, so the lifecycle hooks could never drop the entry."""
+        blocks = paged_cache.get_new_blocks(1)
+        blocks[0].token_count = paged_cache.block_size
+
+        prefix_cache._update_prefix_index(
+            [1, 2, 3, 4, 5, 6, 7, 8], [blocks[0].block_id, 9999]
+        )
+
+        assert len(prefix_cache._prefix_index) == 1
+
+
+class TestPrefixIndexValidation:
+    """Tests for chain re-validation on the prefix-index hit path.
+
+    Index entries can outlive their blocks; reusing a reassigned block would
+    splice foreign KV into the request. The hit path must acquire block by
+    block, stop at the first hash mismatch, and self-heal the stale entry.
+    """
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    @pytest.fixture
+    def prefix_cache(self, paged_cache):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=paged_cache,
+        )
+
+    def _indexed_blocks(self, prefix_cache, paged_cache, tokens):
+        num = len(tokens) // paged_cache.block_size
+        blocks = paged_cache.get_new_blocks(num)
+        for block in blocks:
+            block.token_count = paged_cache.block_size
+        prefix_cache._update_prefix_index(
+            tokens, [block.block_id for block in blocks]
+        )
+        return blocks
+
+    def test_valid_index_hit_returns_full_prefix(self, prefix_cache, paged_cache):
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+
+        table, remaining = prefix_cache.fetch_cache("req-valid", tokens)
+
+        assert table is not None
+        assert table.block_ids == [b.block_id for b in blocks]
+        assert table.num_tokens == 8
+        assert remaining == []
+        assert all(b.ref_count == 2 for b in blocks)
+
+    def test_stale_tail_truncates_to_valid_prefix(self, prefix_cache, paged_cache):
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+        stale_entry_key = blocks[1].block_hash
+
+        # Simulate the tail block being reused for other content after the
+        # index was written.
+        blocks[1].block_hash = b"reassigned"
+
+        table, remaining = prefix_cache.fetch_cache("req-stale", tokens)
+
+        assert table is not None
+        assert table.block_ids == [blocks[0].block_id]
+        assert table.num_tokens == 4
+        assert remaining == tokens[4:]
+        # Reference taken only on the validated block.
+        assert blocks[0].ref_count == 2
+        assert blocks[1].ref_count == 1
+        # The dead-chain entry self-healed out of the index.
+        assert stale_entry_key not in prefix_cache._prefix_index
+
+    def test_fully_stale_chain_is_a_miss(self, prefix_cache, paged_cache):
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        blocks = self._indexed_blocks(prefix_cache, paged_cache, tokens)
+        blocks[0].block_hash = b"reassigned"
+
+        table, remaining = prefix_cache.fetch_cache("req-miss", tokens)
+
+        assert table is None
+        assert remaining == tokens
+        assert blocks[0].ref_count == 1
+        assert blocks[1].ref_count == 1
 
 
 class TestValidateBlockCacheData:

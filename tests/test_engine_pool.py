@@ -1774,6 +1774,53 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_prefill_admits_when_reclaim_delta_is_masked(self):
+        """A reclaim whose footprint delta is masked by concurrent allocation
+        must not be treated as a failed reclaim: the loop re-measures with a
+        fresh reading after the attempt and admits when the target is
+        satisfied."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # The helper's before/after reads both see 45GB (another engine
+        # allocates while the reclaim frees, masking the delta as 0), but
+        # the loop's next reading sees the real 25GB baseline. Exactly four
+        # reads: loop #1, helper before, helper after, loop #2.
+        phys = iter([45 * gb, 45 * gb, 45 * gb, 25 * gb])
+        scheduler = self._reclaim_scheduler(lambda: None)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool._entries = {
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                )
+            }
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: next(phys),
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_prefill_reclaim_failure_rejects_as_before(self):
         """A raising reclaim (#435 class: Metal already in an error state) is
         contained: the admission decision is the plain rejection, the

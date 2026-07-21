@@ -7305,6 +7305,15 @@ class Scheduler:
             req_to_remove._extracted_cache = None
             req_to_remove.prompt_cache = None
 
+        # Schedule the deferred Metal clear that _cleanup_finished would have
+        # scheduled: aborts free KV/activation arrays into MLX's buffer pool
+        # just like normal finishes, and without a clear an abort burst
+        # followed by idle leaves the pooled bytes resident until the next
+        # admission-time or enforcer reclaim (#2179 residue). has_requests()
+        # counts the pending clear, so an idle engine loop keeps stepping
+        # until it fires.
+        self._schedule_deferred_metal_clear()
+
         logger.debug(f"Aborted request {request_id}")
         return True
 
@@ -9227,24 +9236,30 @@ class Scheduler:
 
         # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
-            # Schedule deferred Metal cache cleanup instead of clearing immediately.
-            # Immediate mx.clear_cache() after request completion races with IOKit's
-            # asynchronous completeMemory() callbacks — the kernel-level GPU memory
-            # reference counting can still be in-flight even after mx.synchronize()
-            # returns, causing 'prepare count underflow' kernel panics (#435).
-            # Deferring by _DEFERRED_CLEAR_DELAY generation steps (~10-40 ms) gives
-            # IOKit time to process callbacks while still reclaiming buffers fast
-            # enough to prevent TTFT spikes from pool bloat (#411).
-            #
-            # Use max() so that concurrent completions (max_num_seqs > 1) each get
-            # a full _DEFERRED_CLEAR_DELAY window counted from *their own* finish
-            # step.  The old "only set if None" guard meant the second request's
-            # window was anchored to the first request's finish step, allowing the
-            # second request's KV cache blocks to be re-allocated before IOKit
-            # finished their completeMemory() callbacks (#557).
-            target = self._step_counter + self._DEFERRED_CLEAR_DELAY
-            if self._deferred_clear_at is None or target > self._deferred_clear_at:
-                self._deferred_clear_at = target
+            self._schedule_deferred_metal_clear()
+
+    def _schedule_deferred_metal_clear(self) -> None:
+        """Schedule the deferred Metal cache clear for a just-ended request.
+
+        Deferred instead of clearing immediately: mx.clear_cache() right after
+        completion races with IOKit's asynchronous completeMemory() callbacks —
+        the kernel-level GPU memory reference counting can still be in-flight
+        even after mx.synchronize() returns, causing 'prepare count underflow'
+        kernel panics (#435). Deferring by _DEFERRED_CLEAR_DELAY generation
+        steps (~10-40 ms) gives IOKit time to process callbacks while still
+        reclaiming buffers fast enough to prevent TTFT spikes from pool bloat
+        (#411).
+
+        Use max() so that concurrent completions (max_num_seqs > 1) each get
+        a full _DEFERRED_CLEAR_DELAY window counted from *their own* finish
+        step.  The old "only set if None" guard meant the second request's
+        window was anchored to the first request's finish step, allowing the
+        second request's KV cache blocks to be re-allocated before IOKit
+        finished their completeMemory() callbacks (#557).
+        """
+        target = self._step_counter + self._DEFERRED_CLEAR_DELAY
+        if self._deferred_clear_at is None or target > self._deferred_clear_at:
+            self._deferred_clear_at = target
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""

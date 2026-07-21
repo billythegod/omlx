@@ -25,6 +25,7 @@ from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
     BlockTable,
+    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
     resolve_block_extra_keys,
@@ -108,6 +109,13 @@ class BlockAwarePrefixCache(CacheManager):
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
         self._prefix_index: dict[bytes, tuple[int, tuple[int, ...], int]] = {}
+
+        # Tie the index lifecycle to the paged cache's hash associations.
+        # Without these hooks the index only ever grew (entries were dropped
+        # solely by clear()), leaking Python heap for the process lifetime
+        # on long-uptime servers.
+        paged_cache_manager.on_block_hash_dropped = self._on_block_hash_dropped
+        paged_cache_manager.on_hash_map_cleared = self._on_hash_map_cleared
 
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
@@ -222,6 +230,10 @@ class BlockAwarePrefixCache(CacheManager):
                 block_id = block.block_id if block is not None else None
             if block_id is not None:
                 self.paged_cache.cached_block_hash_to_block.pop(block_hash, block_id)
+                # Keep the prefix index in step with the hash map, or the
+                # index keeps retrying this dead chain until the block is
+                # freed (same last-block-standing rule as the paged hooks).
+                self.paged_cache._notify_hash_dropped(block_hash)
         except Exception as e:
             logger.debug(f"Failed to forget incompatible paged block: {e}")
         if self.paged_ssd_cache is None:
@@ -368,28 +380,48 @@ class BlockAwarePrefixCache(CacheManager):
         # Try prefix index for longer matches
         best_match = self._find_best_prefix_match(tokens, extra_keys=extra_keys)
         if best_match:
-            prefix_len, matched_block_ids, num_blocks = best_match
+            prefix_len, matched_block_ids, num_blocks, chain_hashes = best_match
 
-            # Fork the matched blocks
-            block_table = self.paged_cache.create_block_table(request_id)
-            for block_id in matched_block_ids[:num_blocks]:
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
+            # Re-validate the stored chain before reuse: index entries can
+            # outlive their blocks (eviction, reuse for other content), and
+            # handing out a reassigned block would splice foreign KV into
+            # this request. Acquire block by block and stop at the first
+            # mismatch -- the validated prefix up to that point is still
+            # correct. The old code skipped missing blocks but kept the full
+            # prefix_len, leaving holes in the block table.
+            acquired: list[CacheBlock] = []
+            for block_id, expected_hash in zip(
+                matched_block_ids[:num_blocks], chain_hashes
+            ):
+                block = self.paged_cache.acquire_cached_block(
+                    block_id, expected_hash
+                )
+                if block is None:
+                    # Chain broken: self-heal the stale index entry so the
+                    # next lookup does not walk the same dead chain.
+                    self._prefix_index.pop(chain_hashes[num_blocks - 1], None)
+                    break
+                acquired.append(block)
+
+            if acquired:
+                block_table = self.paged_cache.create_block_table(request_id)
+                for block in acquired:
+                    block_table.block_ids.append(block.block_id)
                     block_table.num_tokens += block.token_count
 
-            remaining = tokens[prefix_len:]
-            self._hits += 1
-            self._tokens_saved += prefix_len
-            self._tokens_matched_total += prefix_len
-            self._tokens_requested_total += len(tokens)
+                matched_tokens = block_table.num_tokens
+                remaining = tokens[matched_tokens:]
+                self._hits += 1
+                self._tokens_saved += matched_tokens
+                self._tokens_matched_total += matched_tokens
+                self._tokens_requested_total += len(tokens)
 
-            logger.debug(
-                f"Prefix index hit for {request_id}: " f"{prefix_len} tokens matched"
-            )
+                logger.debug(
+                    f"Prefix index hit for {request_id}: "
+                    f"{matched_tokens} tokens matched"
+                )
 
-            return block_table, remaining
+                return block_table, remaining
 
         # No cache hit
         self._misses += 1
@@ -1768,6 +1800,7 @@ class BlockAwarePrefixCache(CacheManager):
                         self.paged_cache.cached_block_hash_to_block.pop(
                             block.block_hash, block.block_id
                         )
+                        self.paged_cache._notify_hash_dropped(block.block_hash)
                         logger.debug(
                             f"Removed missing block {block_id} from hash cache"
                         )
@@ -3019,14 +3052,23 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: list[int],
         extra_keys: tuple[Any, ...] | None = None,
-    ) -> tuple[int, tuple[int, ...], int] | None:
-        """Find best matching prefix in the index."""
+    ) -> tuple[int, tuple[int, ...], int, list[bytes]] | None:
+        """Find best matching prefix in the index.
+
+        Returns:
+            Tuple of (prefix_len, block_ids, num_blocks, chain_hashes) where
+            chain_hashes holds the per-block chain hash for each matched
+            block, or None when nothing matched. The hashes let the caller
+            re-validate that the indexed blocks still hold the content they
+            were indexed for before reusing them.
+        """
         best_match = None
         best_len = 0
 
         parent_hash = b""
         prefix_len = 0
         num_blocks = 0
+        chain_hashes: list[bytes] = []
 
         for start in range(0, len(tokens), self.block_size):
             end = min(start + self.block_size, len(tokens))
@@ -3042,13 +3084,16 @@ class BlockAwarePrefixCache(CacheManager):
             )
             prefix_len += len(block_tokens)
             num_blocks += 1
+            chain_hashes.append(parent_hash)
 
             entry = self._prefix_index.get(parent_hash)
             if entry and entry[0] == prefix_len and prefix_len > best_len:
                 best_match = entry
                 best_len = prefix_len
 
-        return best_match
+        if best_match is None:
+            return None
+        return (*best_match, chain_hashes[: best_match[2]])
 
     def _update_prefix_index(
         self,
@@ -3069,7 +3114,12 @@ class BlockAwarePrefixCache(CacheManager):
                 break
 
             block = self.paged_cache.allocated_blocks.get(block_id)
-            block_hash = block.block_hash if block is not None else None
+            if block is None:
+                # Never index an unallocated block id: the entry could not
+                # be dropped by the hash-lifecycle hooks (no block owns the
+                # hash) and the chain past this point is unverifiable.
+                break
+            block_hash = block.block_hash
             if block_hash is None:
                 block_hash = compute_block_hash(
                     parent_hash,
@@ -3077,8 +3127,7 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=extra_keys,
                     model_name=self.paged_cache.model_name,
                 )
-                if block is not None:
-                    block.block_hash = block_hash
+                block.block_hash = block_hash
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
@@ -3087,6 +3136,20 @@ class BlockAwarePrefixCache(CacheManager):
                 tuple(block_ids[: i + 1]),
                 i + 1,
             )
+
+    def _on_block_hash_dropped(self, block_hash: bytes) -> None:
+        """Drop the prefix-index entry for a dead block-hash association.
+
+        Registered as PagedCacheManager.on_block_hash_dropped and invoked
+        (possibly with the paged cache lock held) whenever a (hash -> block)
+        association ceases to exist. dict.pop is GIL-atomic, so this is safe
+        from any thread; it must not call back into the paged cache.
+        """
+        self._prefix_index.pop(block_hash, None)
+
+    def _on_hash_map_cleared(self) -> None:
+        """Drop all prefix-index entries after a wholesale hash-map clear."""
+        self._prefix_index.clear()
 
     def get_stats(self) -> PrefixCacheStats:
         """
