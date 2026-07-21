@@ -407,19 +407,71 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
         assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
-    def test_xet_disabled_for_cancel_compat(self):
-        """hf_xet's Rust ``download_files`` swallows the Python exception our
-        tqdm cancel raises, so on xet-enabled repos cancellation is a no-op.
-        Importing the downloader module must force the xet path off so all
-        downloads go through ``http_get`` where cooperative cancel works.
-        See #1322.
+    def test_xet_not_disabled_on_import(self):
+        """Importing the downloader must leave the xet fast path enabled.
+
+        The old #1322 force-off is gone: cancellation on the xet path is now
+        driven by ``abort_xet_session()`` instead of the tqdm raise, so the
+        module no longer flips ``HF_HUB_DISABLE_XET``.
         """
         import huggingface_hub.constants as hc
-        from huggingface_hub.file_download import is_xet_available
 
-        # Importing omlx.admin.hf_downloader (above) flips this.
-        assert hc.HF_HUB_DISABLE_XET is True
-        assert is_xet_available() is False
+        assert hc.HF_HUB_DISABLE_XET is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_download_aborts_xet_session(self, downloader):
+        """Cancelling the in-flight task must abort the global xet session.
+
+        The tqdm raise never interrupts the xet path (the Rust side defers
+        the exception until the transfer completes), so cancel has to reap
+        the thread via abort_xet_session().
+        """
+        task = DownloadTask(
+            task_id="t1", repo_id="owner/model", status=DownloadStatus.DOWNLOADING
+        )
+        downloader._tasks[task.task_id] = task
+        active = asyncio.create_task(asyncio.sleep(10))
+        downloader._active_tasks[task.task_id] = active
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        mock_abort.assert_called_once()
+        assert task.status == DownloadStatus.CANCELLED
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+    @pytest.mark.asyncio
+    async def test_cancel_pending_download_does_not_abort_xet(self, downloader):
+        """Cancelling a queued task must not kill another task's transfer.
+
+        Only the DOWNLOADING task owns the semaphore and the xet session;
+        aborting on a PENDING cancel would tear down the active download.
+        """
+        task = DownloadTask(
+            task_id="t1", repo_id="owner/model", status=DownloadStatus.PENDING
+        )
+        downloader._tasks[task.task_id] = task
+
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            assert await downloader.cancel_download(task.task_id) is True
+
+        mock_abort.assert_not_called()
+        assert task.status == DownloadStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_aborts_xet_session(self, downloader):
+        """shutdown() must reap any in-flight xet transfer thread."""
+        with patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
+            await downloader.shutdown()
+
+        mock_abort.assert_called_once()
 
     def test_cancellable_tqdm_raises_only_after_cancel(self):
         """The injected tqdm aborts on update() once the cancel flag is set."""
@@ -2304,7 +2356,9 @@ class TestStallDetection:
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
             side_effect=_slow_download,
-        ):
+        ), patch(
+            "omlx.admin.hf_downloader.abort_xet_session"
+        ) as mock_abort:
             mock_api = MagicMock()
             mock_info = MagicMock()
             mock_info.safetensors = {"parameters": {"BF16": 5000}}
@@ -2318,6 +2372,8 @@ class TestStallDetection:
 
             assert task.status == DownloadStatus.FAILED
             assert "stalled" in task.error.lower()
+            # The stall handler must reap the wedged xet transfer thread.
+            mock_abort.assert_called()
 
             await downloader.shutdown()
 
