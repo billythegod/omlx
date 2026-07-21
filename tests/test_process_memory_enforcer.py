@@ -1238,6 +1238,34 @@ class TestAdmissionCeiling:
             assert enforcer.get_admission_ceiling() == 122 * 1024**3
 
 
+class TestAdmissionSoftTarget:
+    """#2319: pre-load eviction targets the soft watermark, not the ceiling."""
+
+    def test_guard_on_scales_admission_ceiling_by_soft_threshold(
+        self, mock_engine_pool
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=10 * 1024**3, soft_threshold=0.9
+        )
+        assert enforcer.get_admission_soft_target() == int(10 * 1024**3 * 0.9)
+
+    def test_guard_off_scales_static_fallback(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            expected = int(122 * 1024**3 * enforcer._soft_threshold)
+            assert enforcer.get_admission_soft_target() == expected
+
+    def test_no_admission_ceiling_returns_zero(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        enforcer.get_admission_ceiling = lambda: 0
+        assert enforcer.get_admission_soft_target() == 0
+
+
 class TestMetalWiredLimit:
     """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
 

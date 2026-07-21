@@ -413,6 +413,11 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._get_admission_ceiling = (
             enforcer.get_admission_ceiling
         )
+        # Pre-load eviction targets the soft watermark so idle models are
+        # unloaded before the new weights allocate (#2319).
+        _server_state.engine_pool._get_admission_soft_target = (
+            enforcer.get_admission_soft_target
+        )
         enforcer.start()
 
     # Startup: Preload pinned models in the background so uvicorn binds the
