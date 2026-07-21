@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
+    UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
@@ -1035,9 +1036,16 @@ class ModelSettingsManager:
             current = self._settings.get(model_id)
             if current is None:
                 current = ModelSettings()
-            merged = current.to_dict()
-            for k, v in profile_settings.items():
-                merged[k] = v
+            # Universal fields: the profile is authoritative — absent keys
+            # reset to ModelSettings defaults. Model-specific fields keep
+            # additive overlay so preset/template chips (materialized as
+            # universal-only profiles) never disturb engine settings.
+            merged = {
+                k: v
+                for k, v in current.to_dict().items()
+                if k not in UNIVERSAL_FIELDS_SET
+            }
+            merged.update(filter_profile_fields(profile_settings))
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
