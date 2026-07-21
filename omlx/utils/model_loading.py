@@ -201,6 +201,15 @@ def maybe_apply_pre_load_patches(
 
     _patch_mlx_lm_load_config()
 
+    # Machine-conditioned, model-independent: reroute sorted gather_qmm
+    # around the defective M5 NAX kernels (issue #2267). Install is cheap
+    # and self-gating — a canary at the first matching call decides
+    # whether to intervene at all.
+    from ..patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
+
+    if apply_m5_gather_qmm_workaround():
+        logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
