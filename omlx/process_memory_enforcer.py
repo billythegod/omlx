@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from . import settings as _settings
+from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
@@ -1075,6 +1076,12 @@ class ProcessMemoryEnforcer:
                 ):
                     continue
                 if getattr(engine, "is_diffusion_model", False):
+                    continue
+                if isinstance(engine, BaseNonStreamingEngine):
+                    # TTS/STT/STS/Embedding/Reranker engines run on the MLX
+                    # executor without a Scheduler, so an unresolvable
+                    # scheduler is their normal shape, not a wrapper break.
+                    # Warning here reads as a guard regression (#2312).
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made

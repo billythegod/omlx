@@ -10,6 +10,7 @@ import pytest
 
 import omlx.process_memory_enforcer as pme
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
@@ -1854,6 +1855,28 @@ class TestUnresolvableSchedulerWarning:
             r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
         ]
         assert warnings == []
+
+    def test_non_streaming_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """TTS/STT/STS/Embedding/Reranker engines have no Scheduler by
+        design (they run on the MLX executor), so the wrapper-break
+        warning must not fire for them — it misreads as a memory guard
+        regression (#2312)."""
+        engine = TTSEngine("dummy-tts-model")
+        entry = _make_entry("model-tts", engine=engine)
+        enforcer._engine_pool._entries = {"model-tts": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == [], (
+            "Non-streaming engines must not trigger the unresolvable-"
+            f"scheduler warning, got {[r.message for r in warnings]}"
+        )
 
     def test_unresolvable_does_not_block_other_engines(self, enforcer):
         """If engine A is unresolvable but engine B has a real scheduler,
