@@ -1318,6 +1318,119 @@ class TestSchedulerQueryMethods:
 
         assert scheduler.has_requests() is True
 
+    def test_has_requests_with_pending_idle_reclaim(self, mock_model, mock_tokenizer):
+        """A pending idle reclaim counts as work for the engine loop.
+
+        Without this the loop stops calling step() once the queues drain,
+        and an enforcer-requested reclaim that arrived during the last busy
+        steps strands forever (issue 2179's wedge).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        assert scheduler.has_requests() is False
+
+        scheduler.request_idle_reclaim()
+
+        assert scheduler.has_requests() is True
+
+    def _install_reclaim_probe(self, scheduler):
+        """Stub the Metal-touching reclaim internals; return the call log."""
+        calls = []
+
+        def fake_reclaim():
+            calls.append(True)
+            return 1 * 1024**3
+
+        scheduler._current_usage_bytes = lambda: 2 * 1024**3
+        scheduler._reclaim_prefill_headroom = fake_reclaim
+        return calls
+
+    @pytest.mark.parametrize("busy_queue", ["waiting", "prefilling", "running"])
+    def test_busy_scheduler_defers_idle_reclaim(
+        self, busy_queue, mock_model, mock_tokenizer
+    ):
+        """A reclaim request landing on a busy scheduler is deferred, not lost.
+
+        The enforcer only re-issues the request at hard pressure, so a
+        consumed-while-busy flag can never be replayed — the drain must keep
+        it pending until an idle step (issue 2179). Every busy arm matters:
+        clearing Metal buffers during an active decode or prefill is the #300
+        crash class, so none of the three may be dropped from the gate.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        calls = self._install_reclaim_probe(scheduler)
+        request = Request(
+            request_id="busy-req",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        if busy_queue == "running":
+            scheduler.running[request.request_id] = request
+        else:
+            getattr(scheduler, busy_queue).append(request)
+
+        scheduler.request_idle_reclaim()
+        scheduler._process_pending_reclaim()
+
+        # Never clears Metal buffers while work exists, and the request
+        # must survive the busy drain.
+        assert calls == []
+        assert scheduler._pending_reclaim_request is True
+
+        # First idle step performs the reclaim and retires the request.
+        if busy_queue == "running":
+            scheduler.running.clear()
+        else:
+            getattr(scheduler, busy_queue).clear()
+        scheduler._process_pending_reclaim()
+
+        assert len(calls) == 1
+        assert scheduler._pending_reclaim_request is False
+        assert scheduler.has_requests() is False
+
+    def test_failing_reclaim_does_not_refire(self, mock_model, mock_tokenizer):
+        """A raising reclaim is contained and retired, never retried.
+
+        The flag must be cleared before the reclaim runs and the exception
+        must not escape step(): this can be the first step after an
+        engine-loop error recovery with Metal already in an error state
+        (#435), and a re-firing failure would turn that into an infinite
+        error cycle.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        attempts = []
+
+        def broken_reclaim():
+            attempts.append(True)
+            raise RuntimeError("Metal in error state")
+
+        scheduler._current_usage_bytes = lambda: 2 * 1024**3
+        scheduler._reclaim_prefill_headroom = broken_reclaim
+
+        scheduler.request_idle_reclaim()
+        scheduler.step()
+
+        assert len(attempts) == 1
+        assert scheduler._pending_reclaim_request is False
+
+        # The failure is spent: no re-attempt on later steps.
+        scheduler.step()
+        assert len(attempts) == 1
+
+    def test_idle_reclaim_drains_via_step(self, mock_model, mock_tokenizer):
+        """step() on an idle scheduler executes a pending reclaim exactly once."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        calls = self._install_reclaim_probe(scheduler)
+
+        scheduler.request_idle_reclaim()
+        scheduler.step()
+
+        assert len(calls) == 1
+        assert scheduler._pending_reclaim_request is False
+
+        # A second step must not re-fire the retired request.
+        scheduler.step()
+        assert len(calls) == 1
+
     def test_get_num_waiting(self, mock_model, mock_tokenizer):
         """Test get_num_waiting() returns correct count."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -1418,6 +1531,7 @@ class TestSchedulerReset:
                 sampling_params=SamplingParams(),
             )
             scheduler.add_request(request)
+        scheduler.request_idle_reclaim()
 
         scheduler.reset()
 
@@ -1425,6 +1539,11 @@ class TestSchedulerReset:
         assert len(scheduler.running) == 0
         assert len(scheduler.requests) == 0
         assert scheduler.batch_generator is None
+        # reset() only drops Python references (bytes move INTO the pooled
+        # cache), so an enforcer reclaim request must survive it: the
+        # enforcer never re-issues below hard pressure, and dropping the
+        # request anywhere re-opens the 2179 wedge.
+        assert scheduler._pending_reclaim_request is True
 
     def test_reset_clears_async_store_cache_bookkeeping(
         self, mock_model, mock_tokenizer

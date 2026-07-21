@@ -2,6 +2,7 @@
 """Tests for EnginePool functionality."""
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import shutil
@@ -1573,11 +1574,19 @@ class TestEnginePoolPrefillEviction:
     """Tests for request-time idle LRU eviction before prefill throttling."""
 
     @staticmethod
-    def _entry(model_id: str, size: int, *, active: bool = False) -> EngineEntry:
+    def _entry(
+        model_id: str,
+        size: int,
+        *,
+        active: bool = False,
+        scheduler=None,
+        executor=None,
+    ) -> EngineEntry:
         engine = MagicMock()
         engine.has_active_requests.return_value = active
-        engine.scheduler = None
+        engine.scheduler = scheduler
         engine._engine = None
+        engine._mlx_executor = executor
         return EngineEntry(
             model_id=model_id,
             model_path=f"/models/{model_id}",
@@ -1587,6 +1596,13 @@ class TestEnginePoolPrefillEviction:
             engine=engine,
             last_access=0.0,
         )
+
+    @staticmethod
+    def _reclaim_scheduler(reclaim_fn) -> MagicMock:
+        """Scheduler stub exposing only the reclaim helper the pool calls."""
+        scheduler = MagicMock()
+        scheduler._reclaim_prefill_headroom = MagicMock(side_effect=reclaim_fn)
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_prefill_eviction_evicts_idle_lru_until_target(self):
@@ -1662,6 +1678,233 @@ class TestEnginePoolPrefillEviction:
 
         assert evicted is False
         pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_reclaims_pooled_buffers_when_no_idle_victim(self):
+        """No idle model, but pooled Metal buffers are reclaimable -> reclaim
+        on the requesting engine's own MLX thread, then admit (the
+        crept-baseline bug: reject-before-reclaim)."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # phys_footprint starts at a crept 45GB and drops to 25GB once the
+        # scheduler's stream-synchronized reclaim clears the pooled buffers
+        # (freed by finished requests).
+        phys = [45 * gb]
+
+        def reclaim():
+            phys[0] = 25 * gb
+
+        scheduler = self._reclaim_scheduler(reclaim)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            # Only the requesting model is loaded: no idle LRU victim.
+            pool._entries = {
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                )
+            }
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        # 45GB -> 25GB reclaim brings 25 + 10 (predicted) under the 40GB cap.
+        assert admitted is True
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_rejects_when_reclaim_frees_nothing(self):
+        """No idle victim and nothing reclaimable -> reject exactly as before
+        (fail-loud, no admission)."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # The reclaim frees nothing: every resident byte is live.
+        phys = [45 * gb]
+        scheduler = self._reclaim_scheduler(lambda: None)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool._entries = {
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                )
+            }
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is False
+        # Reclaim was attempted exactly once, then plain rejection.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_reclaim_failure_rejects_as_before(self):
+        """A raising reclaim (#435 class: Metal already in an error state) is
+        contained: the admission decision is the plain rejection, the
+        exception never escapes into the eviction callback."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        phys = [45 * gb]
+
+        def broken_reclaim():
+            raise RuntimeError("Metal in error state")
+
+        scheduler = self._reclaim_scheduler(broken_reclaim)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool._entries = {
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                )
+            }
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is False
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_reclaim_skipped_when_engine_unresolvable(self):
+        """An entry mid-teardown (no scheduler / executor dropped at close)
+        skips the reclaim and rejects exactly as before -- no crash."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+        # Default _entry: scheduler=None, _mlx_executor=None.
+        pool._entries = {"target": self._entry("target", 25 * gb)}
+        pool._current_model_memory = 25 * gb
+        pool._unload_engine = AsyncMock()
+
+        phys = [45 * gb]
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch(
+                "omlx.engine_pool.get_phys_footprint",
+                side_effect=lambda: phys[0],
+            ),
+        ):
+            admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is False
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_reclaim_never_evicts_inflight_model(self):
+        """The only other model is busy with in-flight work: reclaim pooled
+        buffers but never evict it. (Stream-synchronize-before-clear lives
+        inside the scheduler's _sync_and_clear_cache, which the reclaim
+        helper delegates to.)"""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        phys = [48 * gb]
+
+        def reclaim():
+            phys[0] = 30 * gb
+
+        scheduler = self._reclaim_scheduler(reclaim)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=48 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool._entries = {
+                "busy": self._entry("busy", 20 * gb, active=True),
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            # Resident model weights (45GB) sit above target-predicted, so
+            # buffer reclaim alone cannot fit -- the busy model must NOT be
+            # sacrificed.
+            pool._current_model_memory = 45 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        # Resident weights keep it over cap -> reject, but the busy model lives.
+        assert admitted is False
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+        assert pool._entries["busy"].engine is not None
 
 
 class TestEnginePoolStatus:

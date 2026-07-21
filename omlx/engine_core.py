@@ -495,7 +495,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )

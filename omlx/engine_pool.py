@@ -1128,6 +1128,8 @@ class EnginePool:
             return False
 
         evicted_any = False
+        reclaimed_headroom = False
+        reclaim_attempted = False
         async with self._lock:
             while True:
                 current = max(
@@ -1136,12 +1138,29 @@ class EnginePool:
                     self._current_model_memory,
                 )
                 if current + predicted <= target:
-                    return evicted_any
+                    # A model eviction and/or the pooled-buffer reclaim below
+                    # created enough headroom; signal the caller to re-admit.
+                    return evicted_any or reclaimed_headroom
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
+                    # No idle model left to evict -- the "No idle model
+                    # evicted" case that used to reject outright even when
+                    # tens of GB were reclaimable. Try the cheaper reclaim
+                    # once before giving up: return MLX's pooled Metal buffers
+                    # (freed by finished requests but still cached, so
+                    # get_phys_footprint stays high) to the OS on the
+                    # requesting engine's own MLX thread, then let the loop
+                    # re-measure.
+                    if not reclaim_attempted:
+                        reclaim_attempted = True
+                        if await self._reclaim_pooled_buffers_for_prefill(
+                            exclude_model_id, request_id
+                        ):
+                            reclaimed_headroom = True
+                            continue
                     if evicted_any:
                         logger.info(
                             "Prefill eviction for request %s stopped with no "
@@ -1165,6 +1184,84 @@ class EnginePool:
                 )
                 await self._unload_engine(victim)
                 evicted_any = True
+
+    @staticmethod
+    def _resolve_engine_core_from_engine(engine: object) -> object | None:
+        """Resolve the EngineCore owning an entry's scheduler and MLX thread."""
+        if getattr(engine, "scheduler", None) is not None:
+            return engine
+        try:
+            return engine._engine.engine  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+
+    async def _reclaim_pooled_buffers_for_prefill(
+        self, model_id: str, request_id: str
+    ) -> int:
+        """Return MLX's pooled Metal buffers to the OS; report bytes freed.
+
+        A warm server's resident baseline creeps between requests: finished
+        requests free their KV / activation arrays into MLX's buffer *cache*
+        (retained for reuse) rather than handing the pages back to the OS, so
+        ``get_phys_footprint`` -- the resident figure the prefill guard reads
+        -- stays high even though the bytes are reclaimable.
+
+        The clear runs on the requesting engine's own MLX thread through the
+        scheduler's ``_reclaim_prefill_headroom``, which synchronizes that
+        engine's generation stream under ``_mx_buffer_access_lock`` before
+        clearing (issues #300, #888, #1106) -- clearing from any other thread
+        could release cached buffers still referenced by in-flight
+        ``mx.async_eval`` command buffers. The engine's step loop is parked
+        awaiting this eviction callback, so its executor is free. A failing
+        reclaim is contained (#435 class): the request is then rejected
+        exactly as if nothing had been reclaimable. ``clear_cache`` releases
+        only unused cached buffers, so arrays an in-flight request still
+        references are never touched, and the shared hot / prefix cache is
+        left intact (it is SSD-backed and reclaimed separately by the
+        enforcer).
+
+        Returns:
+            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0).
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        core = (
+            self._resolve_engine_core_from_engine(engine)
+            if engine is not None
+            else None
+        )
+        scheduler = getattr(core, "scheduler", None)
+        reclaim = getattr(scheduler, "_reclaim_prefill_headroom", None)
+        executor = getattr(core, "_mlx_executor", None)
+        if not callable(reclaim) or executor is None:
+            # Engine mid-teardown (executor dropped at close) or an engine
+            # shape without the scheduler helper: skip -- reject as before.
+            return 0
+
+        def _reclaim_on_engine_thread() -> None:
+            gc.collect()
+            reclaim()
+
+        before = get_phys_footprint()
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(executor, _reclaim_on_engine_thread)
+        except Exception as e:
+            logger.warning(
+                "Pooled-buffer reclaim failed for prefill request %s: %s",
+                request_id,
+                e,
+            )
+            return 0
+        freed = max(0, before - get_phys_footprint())
+        if freed > 0:
+            logger.info(
+                "Reclaimed %s of pooled Metal buffers for prefill request %s "
+                "(no idle model to evict)",
+                format_size(freed),
+                request_id,
+            )
+        return freed
 
     def _other_entries_serving(self, model_id: str) -> bool:
         """True when any loaded entry other than ``model_id`` is serving.
