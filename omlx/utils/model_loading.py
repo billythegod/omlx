@@ -721,6 +721,8 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     """Apply optional post-load model transforms based on settings.
 
     Currently supports:
+    - Bonsai t5: free unused bias tensors (the symmetric t5 kernels never
+      read them; the repacked safetensors carries them for format compat)
     - IndexCache: skip redundant indexer computation in DSA layers
 
     Args:
@@ -730,6 +732,18 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    # t5 bias recovery for text-engine loads (~420 MB on Bonsai-27B).
+    # VLMBatchedEngine calls free_t5_biases explicitly; this covers the
+    # BatchedEngine / LLM path, and is a no-op for non-t5 models.
+    try:
+        from ..patches.bonsai_t5_load import free_t5_biases
+
+        freed = free_t5_biases(model)
+        if freed > 0:
+            logger.info("t5 bias tensors freed: %.0f MB recovered", freed / 1e6)
+    except Exception:
+        logger.debug("t5 bias free skipped", exc_info=True)
+
     if model_settings is None:
         return model
 

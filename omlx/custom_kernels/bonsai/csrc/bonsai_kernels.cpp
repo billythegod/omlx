@@ -250,8 +250,17 @@ void dispatch_qmv_fast(
     const Stream& s,
     bool symmetric = false) {
 
+    // out shape is x.shape[:-1] + [N], so out.size() == M * N always and
+    // the batched kernel variants are never dispatched (not instantiated in
+    // the metallib).  Guard the invariant so a future shape change fails
+    // loudly here instead of on a missing kernel lookup.
     int B = static_cast<int>(out.size()) / M / N;
-    bool batched = B > 1;
+    if (B != 1) {
+        throw std::runtime_error(
+            "[bonsai] batched qmv dispatch is not supported (B=" +
+            std::to_string(B) + ")");
+    }
+    bool batched = false;
     bool fast_aligned = (N % 8 == 0) && (K % 512 == 0);
     // Symmetric fallback: only symmetric fast kernel exists; fall through to
     // affine_qmv (non-fast) for unaligned shapes when symmetric is true, or
@@ -299,8 +308,17 @@ void dispatch_qmv_wide(
     const Stream& s,
     bool symmetric = false) {
 
+    // out shape is x.shape[:-1] + [N], so out.size() == M * N always and
+    // the batched kernel variants are never dispatched (not instantiated in
+    // the metallib).  Guard the invariant so a future shape change fails
+    // loudly here instead of on a missing kernel lookup.
     int B = static_cast<int>(out.size()) / M / N;
-    bool batched = B > 1;
+    if (B != 1) {
+        throw std::runtime_error(
+            "[bonsai] batched qmv dispatch is not supported (B=" +
+            std::to_string(B) + ")");
+    }
+    bool batched = false;
 
     // Tile size: ceil(M/ceil(M/5)), capped at 5
     int n_tiles = (M + 4) / 5;

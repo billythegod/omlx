@@ -41,9 +41,7 @@
 
 #define bonsai_qmv_fast_bits(type, gs, bits) \
   bonsai_instantiate_qmv_fast(type, gs, bits, 0) \
-  bonsai_instantiate_qmv_fast(type, gs, bits, 1) \
-  bonsai_instantiate_qmv(type, gs, bits, 0) \
-  bonsai_instantiate_qmv(type, gs, bits, 1)
+  bonsai_instantiate_qmv(type, gs, bits, 0)
 
 #define bonsai_qmv_fast_types(gs, bits) \
   bonsai_qmv_fast_bits(float, gs, bits) \
@@ -65,13 +63,9 @@ bonsai_qmv_fast_types(128, 2)
 
 #define bonsai_qmv_wide_bit(type, gs, bits) \
   bonsai_instantiate_qmv_wide(type, gs, bits, 2, 8, 0) \
-  bonsai_instantiate_qmv_wide(type, gs, bits, 2, 8, 1) \
   bonsai_instantiate_qmv_wide(type, gs, bits, 3, 8, 0) \
-  bonsai_instantiate_qmv_wide(type, gs, bits, 3, 8, 1) \
   bonsai_instantiate_qmv_wide(type, gs, bits, 4, 8, 0) \
-  bonsai_instantiate_qmv_wide(type, gs, bits, 4, 8, 1) \
-  bonsai_instantiate_qmv_wide(type, gs, bits, 5, 8, 0) \
-  bonsai_instantiate_qmv_wide(type, gs, bits, 5, 8, 1)
+  bonsai_instantiate_qmv_wide(type, gs, bits, 5, 8, 0)
 
 #define bonsai_qmv_wide_types(gs, bits) \
   bonsai_qmv_wide_bit(float, gs, bits) \
@@ -104,8 +98,7 @@ bonsai_qmv_wide_types(128, 2)
       affine_qmv_wide_sym, type, group_size, bits, nv, kl, batch)
 
 #define bonsai_qmv_fast_sym_bits(type, gs, bits) \
-  bonsai_instantiate_qmv_fast_sym(type, gs, bits, 0) \
-  bonsai_instantiate_qmv_fast_sym(type, gs, bits, 1)
+  bonsai_instantiate_qmv_fast_sym(type, gs, bits, 0)
 
 #define bonsai_qmv_fast_sym_types(gs, bits) \
   bonsai_qmv_fast_sym_bits(float, gs, bits) \
@@ -114,13 +107,9 @@ bonsai_qmv_wide_types(128, 2)
 
 #define bonsai_qmv_wide_sym_bit(type, gs, bits) \
   bonsai_instantiate_qmv_wide_sym(type, gs, bits, 2, 8, 0) \
-  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 2, 8, 1) \
   bonsai_instantiate_qmv_wide_sym(type, gs, bits, 3, 8, 0) \
-  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 3, 8, 1) \
   bonsai_instantiate_qmv_wide_sym(type, gs, bits, 4, 8, 0) \
-  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 4, 8, 1) \
-  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 5, 8, 0) \
-  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 5, 8, 1)
+  bonsai_instantiate_qmv_wide_sym(type, gs, bits, 5, 8, 0)
 
 #define bonsai_qmv_wide_sym_types(gs, bits) \
   bonsai_qmv_wide_sym_bit(float, gs, bits) \
