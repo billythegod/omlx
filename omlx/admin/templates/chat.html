@@ -984,8 +984,9 @@
 {% block content %}
 <script>
     // Apply theme immediately before render to prevent flash (match applyTheme / Alpine default)
+    // Literal key on purpose: THEME_STORAGE_KEY is declared in the later app script block
     (function () {
-        const stored = localStorage.getItem(THEME_STORAGE_KEY);
+        const stored = localStorage.getItem('omlx-chat-theme');
         let theme = stored || 'auto';
         if (theme === 'auto') {
             theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -1157,7 +1158,7 @@
             <button @click="downloadChats()"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="download" class="w-3 h-3"></i>
-                Download Chats
+                {{ t('chat.download_chats') }}
             </button>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
