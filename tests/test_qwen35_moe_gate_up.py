@@ -103,6 +103,19 @@ def test_unsupported_family_skipped():
     assert hasattr(model.blocks[0], "gate_proj")
 
 
+def test_per_layer_pool_drain(monkeypatch):
+    calls = []
+    monkeypatch.setattr(patch_mod, "_sync_and_clear_cache", lambda: calls.append(1))
+
+    skipped = _make_model(model_cls=_FakeOtherModel)
+    assert apply_qwen35_moe_gate_up_fusion(skipped) == 0
+    assert not calls
+
+    model = _make_model(n_blocks=3)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 3
+    assert len(calls) == 3
+
+
 def test_idempotent():
     model = _make_model()
     assert apply_qwen35_moe_gate_up_fusion(model) == 2

@@ -39,6 +39,8 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from ..scheduler import _sync_and_clear_cache
+
 logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
@@ -204,6 +206,12 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     _ensure_vlm_verify_patch()
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
+        # The freed gate/up buffers land in the MLX buffer pool, which the
+        # server pins to total RAM (#300), so nothing releases them during
+        # load and the transient grows by the whole routed gate/up set,
+        # ~2/3 of the expert bytes (#2304). Drain per fused layer to bound
+        # the transient to a single layer's worth.
+        _sync_and_clear_cache()
     logger.info("Qwen MoE gate+up fusion applied: %d layers", len(targets))
     return len(targets)
 
