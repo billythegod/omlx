@@ -212,6 +212,44 @@ def maybe_apply_pre_load_patches(
         )
         return
 
+    # Bonsai t5 load patch must run FIRST — before any other patch that wraps
+    # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).
+    # Those patches capture cls.load_weights as original_load_weights; if our
+    # patch isn't already on nn.Module.load_weights at that point, the MTP
+    # wrapper chain bypasses us entirely.
+    quant_cfg = config.get("quantization") or {}
+    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
+        except Exception as e:
+            logger.debug("bonsai t5 load patch import failed: %s", e)
+        else:
+            if apply_bonsai_t5_load_patch():
+                logger.info(
+                    "Bonsai t5 load patch applied for %s "
+                    "(t5 uint8 weights allowed past strict shape check)",
+                    model_name,
+                )
+
+    # Bonsai 1-bit construction patch: stock mlx-lm calls
+    # nn.quantize(model, bits=1) before our inference patches hook in,
+    # and mx.quantize(bits=1) is rejected at the C++ level.  Patch
+    # mx.quantize to emit uint32-packed placeholder tensors in the 1-bit
+    # shape (K//32 values per uint32); real weights bind via load_weights.
+    # bits=2 needs no shim (stock mx.quantize handles it).
+    if quant_bits == 1:
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_construct_patch
+        except Exception as e:
+            logger.debug("bonsai construct patch import failed: %s", e)
+        else:
+            if apply_bonsai_construct_patch():
+                logger.info(
+                    "Bonsai 1-bit construct patch applied for %s",
+                    model_name,
+                )
+
     model_type = config.get("model_type")
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -461,6 +499,32 @@ def maybe_apply_pre_load_patches(
             if apply_qwen3_6_nested_visual_patch():
                 logger.info(
                     "qwen3_6 nested-visual sanitize wrap applied for %s",
+                    model_name,
+                )
+
+    # Bonsai 1-bit / 2-bit affine quantized decode patch.
+    # Applies to any model whose top-level ``quantization`` config declares
+    # bits=1 or bits=2 (the keys written by the Bonsai MLX conversion).
+    # The patch is a no-op for stock 4/8-bit models so it is safe to install
+    # globally once for the process lifetime.
+    quant_cfg = config.get("quantization") or {}
+    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
+    if quant_bits in (1, 2):
+        try:
+            from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
+        except Exception as e:
+            logger.debug("bonsai qmv patch import failed: %s", e)
+        else:
+            if apply_bonsai_qmv_patch():
+                logger.info(
+                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    quant_bits,
+                    model_name,
+                )
+            else:
+                logger.debug(
+                    "Bonsai qmv patch skipped for %s "
+                    "(native extension not available; stock mlx fallback active)",
                     model_name,
                 )
 
