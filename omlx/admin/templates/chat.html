@@ -1116,59 +1116,11 @@
         </div>
 
         <!-- Sidebar Footer -->
-        <div class="p-2 border-t border-line space-y-0.5 flex-shrink-0">
-            <a href="/admin/dashboard"
-                class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+        <div class="p-2 border-t border-line flex-shrink-0">
+            <button @click="showChatSettingsModal = true"
+                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
                 <i data-lucide="settings" class="w-3 h-3"></i>
-                {{ t('chat.admin_settings') }}
-            </a>
-            <div class="svg-allow-setting px-2 py-1.5">
-                <div class="svg-allow-row">
-                    <div class="svg-allow-label">
-                        <i data-lucide="wand-sparkles" class="w-3 h-3 shrink-0" style="color: var(--text-tertiary);"></i>
-                        <span class="text-xs truncate" style="color: var(--text-tertiary);"
-                            x-text="window.t('chat.allow_svg')"></span>
-                    </div>
-                    <button type="button" role="switch" class="svg-allow-switch"
-                        :class="{ 'is-on': allowSvg }"
-                        :aria-checked="allowSvg ? 'true' : 'false'"
-                        :aria-label="window.t('chat.allow_svg')"
-                        @click="setAllowSvg(!allowSvg)">
-                        <span class="svg-allow-switch-knob" aria-hidden="true"></span>
-                    </button>
-                </div>
-                <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
-            </div>
-            <!-- Theme Select -->
-            <div class="relative w-full">
-                <div
-                    class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                    <i data-lucide="sun-moon" class="w-3 h-3" x-show="theme === 'auto'"></i>
-                    <i data-lucide="sun" class="w-3 h-3" x-show="theme === 'light'"></i>
-                    <i data-lucide="moon" class="w-3 h-3" x-show="theme === 'dark'"></i>
-                    <select @change="setTheme($event.target.value)"
-                        class="flex-1 bg-transparent border-none outline-none cursor-pointer appearance-none text-inherit"
-                        x-model="theme">
-                        <option value="auto">{{ t('navbar.theme.auto') }}</option>
-                        <option value="light">{{ t('navbar.theme.light_mode') }}</option>
-                        <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
-                    </select>
-                </div>
-            </div>
-            <button @click="downloadChats()"
-                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                <i data-lucide="download" class="w-3 h-3"></i>
-                {{ t('chat.download_chats') }}
-            </button>
-            <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
-                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
-                <i data-lucide="trash-2" class="w-3 h-3"></i>
-                {{ t('chat.clear_all_history') }}
-            </button>
-            <button @click="clearApiKey()"
-                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                <i data-lucide="key" class="w-3 h-3"></i>
-                {{ t('chat.change_api_key') }}
+                {{ t('chat.chat_settings') }}
             </button>
         </div>
     </div>
@@ -2033,6 +1985,83 @@
         <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
     </div>
 
+    <!-- Chat Settings Modal -->
+    <div x-show="showChatSettingsModal" x-cloak
+        class="fixed inset-0 z-50 overflow-y-auto"
+        @keydown.escape.window="showChatSettingsModal = false"
+        x-transition:enter="transition ease-out duration-200"
+        x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+        x-transition:leave="transition ease-in duration-150"
+        x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0">
+        <div class="fixed inset-0 bg-black/50" @click="showChatSettingsModal = false"></div>
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div class="relative bg-surface rounded-2xl shadow-2xl w-full max-w-md p-6" @click.stop
+                x-transition:enter="transition ease-out duration-200"
+                x-transition:enter-start="opacity-0 scale-95" x-transition:enter-end="opacity-100 scale-100"
+                x-transition:leave="transition ease-in duration-150"
+                x-transition:leave-start="opacity-100 scale-100" x-transition:leave-end="opacity-0 scale-95">
+                <div class="flex items-center justify-between mb-6">
+                    <h3 class="text-lg font-bold" style="color: var(--text-primary);">{{ t('chat.chat_settings') }}</h3>
+                    <button @click="showChatSettingsModal = false"
+                        class="p-2 hover:bg-surface-muted rounded-full transition-colors">
+                        <i data-lucide="x" class="w-5 h-5" style="color: var(--text-tertiary);"></i>
+                    </button>
+                </div>
+                <div class="mb-6">
+                    <label class="block text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.theme_label') }}</label>
+                    <select @change="setTheme($event.target.value)" x-model="theme"
+                        class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
+                        style="background: var(--bg-primary); color: var(--text-primary);">
+                        <option value="auto">{{ t('navbar.theme.auto') }}</option>
+                        <option value="light">{{ t('navbar.theme.light_mode') }}</option>
+                        <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
+                    </select>
+                </div>
+                <div class="mb-6">
+                    <div class="svg-allow-row">
+                        <div class="svg-allow-label">
+                            <i data-lucide="wand-sparkles" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
+                            <span class="text-sm truncate" style="color: var(--text-primary);"
+                                x-text="window.t('chat.allow_svg')"></span>
+                        </div>
+                        <button type="button" role="switch" class="svg-allow-switch"
+                            :class="{ 'is-on': allowSvg }"
+                            :aria-checked="allowSvg ? 'true' : 'false'"
+                            :aria-label="window.t('chat.allow_svg')"
+                            @click="setAllowSvg(!allowSvg)">
+                            <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                        </button>
+                    </div>
+                    <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
+                </div>
+                <div class="pt-4 border-t border-line">
+                    <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.chat_history_label') }}</h4>
+                    <div class="space-y-1">
+                        <button @click="downloadChats()"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-surface-muted rounded-lg"
+                            style="color: var(--text-primary);">
+                            <i data-lucide="download" class="w-4 h-4"></i>
+                            {{ t('chat.download_chats') }}
+                        </button>
+                        <input type="file" accept=".json,application/json" x-ref="importChatsInput"
+                            @change="importChats($event)" class="hidden">
+                        <button @click="$refs.importChatsInput.click()"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-surface-muted rounded-lg"
+                            style="color: var(--text-primary);">
+                            <i data-lucide="upload" class="w-4 h-4"></i>
+                            {{ t('chat.import_chats') }}
+                        </button>
+                        <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
+                            class="w-full flex items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-danger-bg rounded-lg">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            {{ t('chat.clear_all_history') }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
 </div>
 {% endblock %}
 
@@ -2085,6 +2114,7 @@
             isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
+            showChatSettingsModal: false,
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             activeTheme: 'light', // Will be updated by applyTheme
@@ -3858,6 +3888,54 @@
         }
     },
 
+    importChats(event) {
+        const file = event.target.files?.[0];
+        // Reset so selecting the same file again re-fires the change event
+        event.target.value = '';
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            let imported;
+            try {
+                imported = JSON.parse(e.target.result);
+            } catch {
+                alert(window.t('chat.error.import_invalid'));
+                return;
+            }
+            const valid = Array.isArray(imported)
+                ? imported.filter(c => c && typeof c.id === 'string' && c.id && Array.isArray(c.messages))
+                : [];
+            if (!valid.length) {
+                alert(window.t('chat.error.import_invalid'));
+                return;
+            }
+            const ts = (c) => {
+                const t = c?.updatedAt ? Date.parse(c.updatedAt) : 0;
+                return Number.isNaN(t) ? 0 : t;
+            };
+            const byId = new Map(this.chatHistory.map(c => [c.id, c]));
+            const changed = new Set();
+            for (const entry of valid) {
+                const existing = byId.get(entry.id);
+                if (existing) {
+                    // Never overwrite the open or streaming chat; its live state is the truth
+                    if (entry.id === this.currentChatId || this.isChatStreaming(entry.id)) continue;
+                    if (ts(entry) <= ts(existing)) continue;
+                    delete this.chatSessions[entry.id];
+                }
+                byId.set(entry.id, entry);
+                changed.add(entry.id);
+            }
+            this.chatHistory = [...byId.values()]
+                .sort((a, b) => ts(b) - ts(a))
+                .slice(0, MAX_CHAT_HISTORY_SIZE);
+            this.saveChatHistory();
+            alert(window.t('chat.import_success').replace('{count}', changed.size));
+        };
+        reader.onerror = () => alert(window.t('chat.error.import_invalid'));
+        reader.readAsText(file);
+    },
+
     async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
         localStorage.setItem(API_KEY_STORAGE_KEY, this.apiKeyInput.trim());
@@ -3872,18 +3950,6 @@
             console.error('Failed to load models after saving API key:', e);
         }
         this.loadChatHistory();
-    },
-
-    clearApiKey() {
-        if (confirm(window.t('chat.confirm_change_api_key'))) {
-            this.stopAllStreams();
-            localStorage.removeItem(API_KEY_STORAGE_KEY);
-            this.apiKeySet = false;
-            this.chatSessions = {};
-            this.streamSessions = {};
-            this.messages = [];
-            this.currentChatId = null;
-        }
     },
 
     getApiKey() {
