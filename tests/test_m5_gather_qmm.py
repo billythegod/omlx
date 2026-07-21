@@ -125,9 +125,7 @@ def test_reroute_restores_correct_output_on_defective_hardware():
     w = mx.random.normal((e, out_dim, k), key=keys[0]).astype(mx.bfloat16)
     wq, scales, biases = mx.quantize(w, group_size=32, bits=4)
     x = (mx.random.normal((n, 1, k), key=keys[1]) * 0.5).astype(mx.bfloat16)
-    idx = mx.sort(
-        mx.random.randint(0, e, (n,), key=keys[2]).astype(mx.uint32)
-    )
+    idx = mx.sort(mx.random.randint(0, e, (n,), key=keys[2]).astype(mx.uint32))
     wd = mx.dequantize(wq, scales, biases, group_size=32, bits=4)
     ref = x.astype(mx.float32) @ wd[idx].swapaxes(-1, -2).astype(mx.float32)
 
