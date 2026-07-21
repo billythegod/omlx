@@ -985,7 +985,7 @@
 <script>
     // Apply theme immediately before render to prevent flash (match applyTheme / Alpine default)
     (function () {
-        const stored = localStorage.getItem('omlx-chat-theme');
+        const stored = localStorage.getItem(THEME_STORAGE_KEY);
         let theme = stored || 'auto';
         if (theme === 'auto') {
             theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -1154,6 +1154,11 @@
                     </select>
                 </div>
             </div>
+            <button @click="downloadChats()"
+                class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                <i data-lucide="download" class="w-3 h-3"></i>
+                Download Chats
+            </button>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
@@ -2049,6 +2054,13 @@
     }
 
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
+    const MAX_CHAT_HISTORY_SIZE = 100;
+    const CHAT_HISTORY_STORAGE_KEY = 'omlx_chat_history';
+    const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
+    const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
+    const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -2072,8 +2084,8 @@
             isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
-            allowSvg: localStorage.getItem('omlx-chat-allow-svg') === 'true',
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
+            allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
 
@@ -3216,7 +3228,7 @@
                         model: historyChat?.model || (this.currentChatId === chatId ? this.currentModel : null),
                         systemPrompt: historyChat?.systemPrompt ?? (this.currentChatId === chatId
                             ? this.systemPrompt
-                            : (localStorage.getItem('omlx_chat_system_prompt') || '')),
+                            : (localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '')),
                         activeProfile: historyChat?.activeProfile ?? null,
                         modelSettings: historyChat?.modelSettings
                             ? this.cloneData(historyChat.modelSettings) : null,
@@ -3354,10 +3366,10 @@
                 const serverApiKey = {{ api_key | tojson }};
 
         if (serverApiKey) {
-            localStorage.setItem('omlx_chat_api_key', serverApiKey);
+            localStorage.setItem(API_KEY_STORAGE_KEY, serverApiKey);
         }
 
-        const storedKey = localStorage.getItem('omlx_chat_api_key');
+        const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (storedKey) {
             this.apiKeySet = true;
             await this.loadModels();
@@ -3818,9 +3830,36 @@
         });
     },
 
+    async downloadChats() {
+        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+        if (!history) {
+            alert(window.t('chat.no_chats_to_export'));
+            return;
+        }
+        try {
+            const chats = JSON.parse(history);
+            if (!chats.length) {
+                alert(window.t('chat.no_chats_to_export'));
+                return;
+            }
+            const json = JSON.stringify(chats, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'omlx-chats.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('Failed to download chats:', e);
+        }
+    },
+
     async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
-        localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
+        localStorage.setItem(API_KEY_STORAGE_KEY, this.apiKeyInput.trim());
         this.apiKeySet = true;
         this.apiKeyInput = '';
         try {
@@ -3837,7 +3876,7 @@
     clearApiKey() {
         if (confirm(window.t('chat.confirm_change_api_key'))) {
             this.stopAllStreams();
-            localStorage.removeItem('omlx_chat_api_key');
+            localStorage.removeItem(API_KEY_STORAGE_KEY);
             this.apiKeySet = false;
             this.chatSessions = {};
             this.streamSessions = {};
@@ -3847,7 +3886,7 @@
     },
 
     getApiKey() {
-        return localStorage.getItem('omlx_chat_api_key') || '';
+        return localStorage.getItem(API_KEY_STORAGE_KEY) || '';
     },
 
     combineAbortSignals(signals) {
@@ -3901,7 +3940,7 @@
             if (!modelsResponse.ok) {
                 if (modelsResponse.status === 401) {
                     alert(window.t('chat.error.incorrect_api_key'));
-                    localStorage.removeItem('omlx_chat_api_key');
+                    localStorage.removeItem(API_KEY_STORAGE_KEY);
                     this.apiKeySet = false;
                     this.messages = [];
                     this.currentChatId = null;
@@ -4146,16 +4185,16 @@
 
     loadPromptProfiles() {
         try {
-            const raw = localStorage.getItem('omlx_chat_prompt_profiles');
+            const raw = localStorage.getItem(PROMPT_PROFILES_STORAGE_KEY);
             if (raw) {
                 this.promptProfiles = JSON.parse(raw);
             } else {
                 // Migrate from old single-default format
-                const oldDefault = localStorage.getItem('omlx_chat_system_prompt');
+                const oldDefault = localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY);
                 if (oldDefault) {
                     this.promptProfiles = [{ name: 'System Default', content: oldDefault }];
                     this._persistPromptProfiles();
-                    localStorage.removeItem('omlx_chat_system_prompt');
+                    localStorage.removeItem(SYSTEM_PROMPT_STORAGE_KEY);
                 }
             }
             // Ensure System Default profile always exists
@@ -4177,7 +4216,7 @@
     },
 
     _persistPromptProfiles() {
-        localStorage.setItem('omlx_chat_prompt_profiles', JSON.stringify(this.promptProfiles));
+        localStorage.setItem(PROMPT_PROFILES_STORAGE_KEY, JSON.stringify(this.promptProfiles));
     },
 
     selectPromptProfile(name) {
@@ -4315,7 +4354,7 @@
     },
 
     loadChatHistory() {
-        const history = localStorage.getItem('omlx_chat_history');
+        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
         if (history) {
             try {
                 this.chatHistory = JSON.parse(history);
@@ -4341,7 +4380,7 @@
     },
 
     saveChatHistory() {
-        const key = 'omlx_chat_history';
+        const key = CHAT_HISTORY_STORAGE_KEY;
         const persist = () => localStorage.setItem(key, JSON.stringify(this.chatHistory));
         try {
             persist();
@@ -4567,8 +4606,8 @@
             this.chatHistory.unshift(chatData);
         }
 
-        // Keep only last 50 chats
-        this.chatHistory = this.chatHistory.slice(0, 50);
+        // Keep only last MAX_CHAT_HISTORY_SIZE chats
+        this.chatHistory = this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE);
         this.saveChatHistory();
     },
 
@@ -5816,7 +5855,7 @@
 
     setAllowSvg(enabled) {
         this.allowSvg = !!enabled;
-        localStorage.setItem('omlx-chat-allow-svg', this.allowSvg ? 'true' : 'false');
+        localStorage.setItem(ALLOW_SVG_STORAGE_KEY, this.allowSvg ? 'true' : 'false');
         this.refreshCodeBlockButtons();
     },
 
@@ -6103,7 +6142,7 @@
 
     setTheme(theme) {
         this.theme = theme;
-        localStorage.setItem('omlx-chat-theme', this.theme);
+        localStorage.setItem(THEME_STORAGE_KEY, this.theme);
         this.applyTheme();
     },
 
