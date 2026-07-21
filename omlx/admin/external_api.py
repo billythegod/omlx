@@ -9,6 +9,7 @@ tokens because providers batch multiple tokens per chunk.
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -28,6 +29,12 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=3600.0, write=120.0, pool=30.
 _ERROR_DETAIL_MAX_CHARS = 300
 
 _REASONING_FIELD_NAMES = ("reasoning_content", "reasoning", "analysis")
+
+# Thinking models spend reasoning tokens before message.content, and those
+# tokens count toward max_tokens on OpenAI-compatible APIs, so a small cap
+# truncates them before they can answer (#2309). max_tokens only bounds
+# runaway generation; non-thinking endpoints still stop after a few tokens.
+_PREFLIGHT_MAX_TOKENS = 4096
 
 # Provider-specific request JSON must not override fields owned by the
 # benchmark or authentication layer.
@@ -464,7 +471,7 @@ class ExternalChatAdapter:
         """Validate final-answer compatibility before a paid evaluation."""
         result = await self._client.chat_completion(
             messages=[{"role": "user", "content": "Reply with exactly: OK"}],
-            max_tokens=16,
+            max_tokens=_PREFLIGHT_MAX_TOKENS,
             temperature=None,
         )
         logger.info(
@@ -491,10 +498,15 @@ class ExternalChatAdapter:
                 "External API connected, but preflight message.content is empty",
                 status="empty_content",
             )
+        # Some endpoints inline reasoning into message.content as <think>
+        # blocks; drop them before checking, the same way eval scoring does.
+        answer = re.sub(
+            r"<think>.*?</think>", "", result.text, flags=re.DOTALL
+        ).strip()
         # Accept a leading OK with trailing punctuation or extra words
         # (OK. / Okay / OK!) so a compliant endpoint is not rejected over
         # formatting. A genuinely wrong or negated reply (NOT OK) still fails.
-        if not result.text.strip().upper().startswith("OK"):
+        if not answer.upper().startswith("OK"):
             raise ExternalEndpointError(
                 "External API preflight response did not start with OK in "
                 "message.content",

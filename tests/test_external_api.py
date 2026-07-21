@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from omlx.admin.external_api import (
+    _PREFLIGHT_MAX_TOKENS,
     ExternalAPIClient,
     ExternalChatAdapter,
     ExternalEndpointConfig,
@@ -621,6 +622,38 @@ class TestExternalChatAdapter:
         # punctuation, casing, or whitespace around the OK sentinel.
         def handler(request):
             return _completion_response(text=text)
+
+        adapter, client = self._adapter(handler)
+        try:
+            await adapter.preflight()
+        finally:
+            await client.aclose()
+
+    async def test_preflight_budget_covers_reasoning_tokens(self):
+        # Reasoning tokens count toward max_tokens, so a thinking model
+        # needs enough budget to finish thinking before it can answer.
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return _completion_response(
+                text="OK", extra_message={"reasoning_content": "trivial ask"}
+            )
+
+        adapter, client = self._adapter(handler)
+        try:
+            await adapter.preflight()
+        finally:
+            await client.aclose()
+        assert captured["body"]["max_tokens"] == _PREFLIGHT_MAX_TOKENS
+
+    async def test_preflight_accepts_inline_think_tags(self):
+        # Endpoints that inline reasoning into message.content wrap it in
+        # <think> tags; the sentinel check must look past them.
+        def handler(request):
+            return _completion_response(
+                text="<think>user wants exactly OK</think>\n\nOK"
+            )
 
         adapter, client = self._adapter(handler)
         try:
