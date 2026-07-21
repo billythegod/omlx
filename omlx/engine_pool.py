@@ -393,8 +393,12 @@ class EnginePool:
 
         for model_id, info in discovered.items():
             existing = self._entries.get(model_id)
-            if existing is not None and existing.engine is not None:
-                # Loaded model: preserve runtime state, only update pinned flag
+            if existing is not None and (
+                existing.engine is not None or existing.is_loading
+            ):
+                # Loaded or loading model: preserve runtime state, only
+                # update the pinned flag. Replacing an in-flight entry would
+                # orphan the engine the load attaches on completion (#2307).
                 existing.is_pinned = model_id in pinned_set
             else:
                 # New or unloaded model: create fresh entry
@@ -419,12 +423,14 @@ class EnginePool:
             if model_id in pinned_set:
                 logger.info(f"Pinned model: {model_id}")
 
-        # Remove entries no longer discovered and not loaded
+        # Remove entries no longer discovered and neither loaded nor loading
         discovered_ids = set(discovered.keys())
         stale = [
             mid
             for mid in self._entries
-            if mid not in discovered_ids and self._entries[mid].engine is None
+            if mid not in discovered_ids
+            and self._entries[mid].engine is None
+            and not self._entries[mid].is_loading
         ]
         for mid in stale:
             del self._entries[mid]
@@ -1429,6 +1435,7 @@ class EnginePool:
         self._wake_process_memory_enforcer(active=True)
         load_started_at = entry.loading_started_at
         load_completed = False
+        entry_detached = False
         entry.abort_loading = False
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
@@ -1797,6 +1804,41 @@ class EnginePool:
             observed_delta = max(0, post_load_memory - pre_load_memory)
             entry.actual_size = observed_delta or entry.estimated_size
 
+            # Registry consistency check: a lockless mutator (a
+            # discover_models() rescan or the runtime model-directory
+            # reload) may have replaced or dropped this model's entry at an
+            # await point above. The engine was then attached to a stale
+            # object unreachable from the pool; keeping it running would
+            # strand the weights until a process restart (#2307).
+            if self._entries.get(model_id) is not entry:
+                entry_detached = True
+                logger.warning(
+                    f"Registry entry for '{model_id}' changed during load; "
+                    f"releasing the freshly loaded engine "
+                    f"({format_size(entry.estimated_size)})"
+                )
+                entry.engine = None
+                self._current_model_memory = max(
+                    0, self._current_model_memory - entry.estimated_size
+                )
+                try:
+                    await engine.stop()
+                except Exception as e:
+                    logger.warning(
+                        f"Error stopping orphaned engine for {model_id}: {e}"
+                    )
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' was removed or replaced while it "
+                    "was loading; the loaded engine was released. Retry "
+                    "the request.",
+                )
+
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "
@@ -1814,7 +1856,7 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
-            if not entry.abort_loading:
+            if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(
                     "Model load failed for '%s'; caching failure until next discovery refresh",

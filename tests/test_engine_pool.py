@@ -268,6 +268,75 @@ class TestDiscoverModelsMerge:
         assert pool.get_entry("model-a").is_pinned is False
         assert pool.get_entry("model-a").engine is not None
 
+    def test_rediscover_preserves_loading_entry(self, small_mock_model_dir):
+        """Re-discovery must not replace an entry with an in-flight load (#2307)."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # Simulate an in-flight load: entry exists, engine not yet assigned
+        entry_a = pool.get_entry("model-a")
+        entry_a.is_loading = True
+
+        # Re-discover (simulates a download completing mid-load)
+        pool.discover_models(str(small_mock_model_dir), pinned_models=["model-a"])
+
+        entry_a_after = pool.get_entry("model-a")
+        assert entry_a_after is entry_a  # Same object
+        assert entry_a_after.is_loading is True
+        assert entry_a_after.is_pinned is True
+
+    def test_rediscover_keeps_loading_entry_missing_from_disk(
+        self, small_mock_model_dir
+    ):
+        """The stale sweep must not drop an entry whose load is in flight."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry_b = pool.get_entry("model-b")
+        entry_b.is_loading = True
+
+        shutil.rmtree(small_mock_model_dir / "model-b")
+
+        pool.discover_models(str(small_mock_model_dir))
+
+        assert pool.get_entry("model-b") is entry_b
+
+
+class TestOrphanedLoadSafetyNet:
+    """Tests for the post-load registry consistency check (#2307)."""
+
+    @pytest.mark.asyncio
+    async def test_orphaned_engine_released_when_entry_replaced_mid_load(
+        self, small_mock_model_dir
+    ):
+        """An engine loaded into a replaced entry is stopped, not stranded."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine = MagicMock()
+        mock_engine.stop = AsyncMock()
+
+        async def start_and_swap_entry():
+            # Simulate the runtime model-directory reload landing at an
+            # await point mid-load: entries cleared, then re-discovered
+            pool._entries.clear()
+            pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine.start = AsyncMock(side_effect=start_and_swap_entry)
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(ModelLoadingError, match="removed or replaced"),
+        ):
+            await pool._load_engine("model-a")
+
+        mock_engine.stop.assert_called_once()
+        assert pool._current_model_memory == 0
+        assert pool.get_entry("model-a").engine is None
+        # The replaced entry must be loadable again afterwards
+        assert pool.get_entry("model-a").is_loading is False
+        assert pool.get_entry("model-a").load_failure_message is None
+
 
 class TestEnginePoolErrors:
     """Tests for EnginePool error handling."""
