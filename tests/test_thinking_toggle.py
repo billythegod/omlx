@@ -30,6 +30,16 @@ class TestDetectThinkingDefault:
         (tmp_path / "chat_template.jinja").write_text(template)
         assert detect_thinking_default(tmp_path) is False
 
+    def test_explicit_default_true_pattern_returns_true(self, tmp_path):
+        """Laguna S-2.1 pattern: enable_thinking | default(true) means ON even
+        when another flag in the same template defaults to false."""
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "{%- set preserve_thinking = preserve_thinking | default(false) -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_thinking_default(tmp_path) is True
+
     def test_enable_thinking_paren_pattern_returns_false(self, tmp_path):
         """Template that references enable_thinking) returns False."""
         template = "{%- if default(enable_thinking) -%}think{%- endif -%}"

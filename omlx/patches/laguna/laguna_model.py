@@ -60,6 +60,8 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
     mlp_only_layers: list[int] = field(default_factory=lambda: [0])
+    mlp_layer_types: list[str] | None = None
+    gating_types: list[str] | None = None
     moe_routed_scaling_factor: float = 1.0
     moe_apply_router_weight_on_input: bool = False
     moe_router_logit_softcapping: float = 0.0
@@ -73,6 +75,20 @@ class ModelArgs(BaseModelArgs):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("layer_types must match num_hidden_layers.")
+
+        # Laguna S-2.1 publishes explicit per-layer MLP and gating lists that
+        # override the legacy mlp_only_layers/decoder_sparse_step cadence and
+        # the single global gating mode.
+        if self.mlp_layer_types is not None and (
+            len(self.mlp_layer_types) != self.num_hidden_layers
+        ):
+            raise ValueError("mlp_layer_types must match num_hidden_layers.")
+        if self.gating_types is not None:
+            if len(self.gating_types) != self.num_hidden_layers:
+                raise ValueError("gating_types must match num_hidden_layers.")
+            self.gating_types = [
+                gating_type.replace("_", "-") for gating_type in self.gating_types
+            ]
 
         if self.num_attention_heads_per_layer is None:
             self.num_attention_heads_per_layer = [
@@ -242,8 +258,13 @@ class Attention(nn.Module):
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
-        self.gate_per_head = args.gating == "per-head"
-        self.gating = bool(args.gating)
+        gating = (
+            args.gating_types[layer_idx]
+            if args.gating_types is not None
+            else args.gating
+        )
+        self.gate_per_head = gating == "per-head"
+        self.gating = bool(gating) and gating != "none"
         self.is_sliding = layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = args.sliding_window if self.is_sliding else None
 
@@ -347,11 +368,16 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Attention(args, layer_idx)
         self.mlp: MLP | LagunaSparseMoeBlock
-        # ``mlp_only_layers`` preserves explicit dense layers; remaining layers
-        # follow the configured sparse-MoE cadence.
-        if (layer_idx not in args.mlp_only_layers) and (
-            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
-        ):
+        # An explicit per-layer ``mlp_layer_types`` list wins; otherwise
+        # ``mlp_only_layers`` preserves explicit dense layers and remaining
+        # layers follow the configured sparse-MoE cadence.
+        if args.mlp_layer_types is not None:
+            is_sparse = args.mlp_layer_types[layer_idx] == "sparse"
+        else:
+            is_sparse = (layer_idx not in args.mlp_only_layers) and (
+                args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+            )
+        if is_sparse:
             self.mlp = LagunaSparseMoeBlock(args)
         else:
             self.mlp = MLP(args.hidden_size, args.intermediate_size)

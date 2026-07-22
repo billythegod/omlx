@@ -178,6 +178,160 @@ def test_laguna_uses_bounded_cache_for_sliding_attention():
     assert decode_logits.shape == (1, 1, 1024)
 
 
+def _s21_shaped_config():
+    """Scaled-down Laguna S-2.1 config: per-layer lists + dual yarn RoPE."""
+    return _minimal_laguna_config(
+        num_hidden_layers=8,
+        layer_types=[
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+        ]
+        * 2,
+        sliding_window=8,
+        num_attention_heads_per_layer=[4, 6, 6, 6, 4, 6, 6, 6],
+        mlp_layer_types=["dense"] + ["sparse"] * 7,
+        gating_types=["per_head"] * 8,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        moe_routed_scaling_factor=2.5,
+        partial_rotary_factor=None,
+        rope_parameters={
+            "full_attention": {
+                "rope_type": "yarn",
+                "rope_theta": 500000.0,
+                "factor": 32.0,
+                "original_max_position_embeddings": 64,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "attention_factor": 1.3465735902799727,
+                "partial_rotary_factor": 0.5,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 1.0,
+            },
+        },
+    )
+
+
+def test_laguna_s21_shaped_model_forward():
+    """S-2.1 config surface: per-layer MLP/gating lists, variable query heads,
+    yarn on full-attention layers, and mixed bounded caches."""
+    import math
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    from mlx_lm.models.rope_utils import YarnRoPE
+
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(**_s21_shaped_config())
+    model = laguna.Model(args)
+
+    cache = model.make_cache()
+    for layer_idx, layer_cache in enumerate(cache):
+        if layer_idx % 4 == 0:
+            assert type(layer_cache) is KVCache
+        else:
+            assert type(layer_cache) is RotatingKVCache
+            assert layer_cache.max_size == 8
+
+    layers = model.model.layers
+    assert type(layers[0].mlp).__name__ == "MLP"
+    assert all(
+        type(layers[i].mlp).__name__ == "LagunaSparseMoeBlock" for i in range(1, 8)
+    )
+    assert layers[0].self_attn.n_heads == 4
+    assert layers[1].self_attn.n_heads == 6
+    assert layers[1].self_attn.gate_per_head is True
+
+    # Full-attention layers use yarn over the rotary half of head_dim, and the
+    # default mscale must equal the published attention_factor formula.
+    full_rope = layers[0].self_attn.rope
+    assert isinstance(full_rope, YarnRoPE)
+    assert full_rope.dims == args.head_dim // 2
+    assert abs(full_rope.mscale - (0.1 * math.log(32.0) + 1.0)) < 1e-9
+    assert not isinstance(layers[1].self_attn.rope, YarnRoPE)
+
+    prefill_logits = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+    decode_logits = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+    mx.eval(prefill_logits, decode_logits)
+
+    assert prefill_logits.shape == (1, 3, 1024)
+    assert decode_logits.shape == (1, 1, 1024)
+
+
+def test_mlp_layer_types_overrides_legacy_cadence():
+    """An explicit mlp_layer_types list wins over mlp_only_layers cadence."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            # Legacy cadence alone would make every layer sparse.
+            mlp_only_layers=[],
+            mlp_layer_types=["dense", "sparse"],
+        )
+    )
+    model = laguna.Model(args)
+
+    assert type(model.model.layers[0].mlp).__name__ == "MLP"
+    assert type(model.model.layers[1].mlp).__name__ == "LagunaSparseMoeBlock"
+
+
+def test_gating_types_normalized_per_layer():
+    """gating_types entries are normalized and applied per layer."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(gating_types=["per_head", "per_element"])
+    )
+    model = laguna.Model(args)
+
+    per_head_attn = model.model.layers[0].self_attn
+    per_element_attn = model.model.layers[1].self_attn
+    assert per_head_attn.gate_per_head is True
+    assert per_head_attn.g_proj.weight.shape[0] == per_head_attn.n_heads
+    assert per_element_attn.gate_per_head is False
+    assert (
+        per_element_attn.g_proj.weight.shape[0]
+        == per_element_attn.n_heads * per_element_attn.head_dim
+    )
+
+
+def test_per_layer_list_length_mismatch_raises():
+    """Per-layer lists that disagree with num_hidden_layers are rejected."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    with pytest.raises(ValueError, match="mlp_layer_types"):
+        laguna.ModelArgs(**_minimal_laguna_config(mlp_layer_types=["dense"]))
+    with pytest.raises(ValueError, match="gating_types"):
+        laguna.ModelArgs(**_minimal_laguna_config(gating_types=["per_head"]))
+
+
 def test_laguna_sanitize_remaps_gate_and_stacks_experts():
     """``Model.sanitize`` remaps ``mlp.gate.weight`` and stacks expert proj weights."""
     from omlx.patches.laguna import apply_laguna_patch

@@ -431,7 +431,13 @@ def get_tokenizer_config(
         # Laguna's Mistral-derived tokenizer ships the legacy regex that
         # Transformers identifies as tokenization-incorrect without this flag.
         config["fix_mistral_regex"] = True
-        logger.debug("Laguna detected: enabling the Mistral tokenizer regex fix")
+        # mlx-lm's template sniffing sees Laguna's <arg_key> markers and picks
+        # the glm47 parser; pin the vendored Laguna parser instead.
+        config.setdefault("tool_parser_type", "laguna")
+        logger.debug(
+            "Laguna detected: enabling the Mistral tokenizer regex fix and "
+            "the laguna tool parser"
+        )
 
     return config
 

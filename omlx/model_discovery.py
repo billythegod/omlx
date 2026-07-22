@@ -787,6 +787,13 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     # ``default(false)``, then thinking is OFF by default.
     if "enable_thinking is false" in template_text:
         return True  # ON by default (Qwen pattern)
+    # An explicit ``enable_thinking | default(true)`` filter states the ON
+    # default directly. It must be anchored and checked before the broad
+    # ``default(false)`` scan: a template may default *other* flags to false
+    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
+    # changing its thinking default.
+    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+        return True
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
 

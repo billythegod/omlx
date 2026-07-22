@@ -21,7 +21,7 @@ tool_call_end = "</tool_call>"
 _TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _FUNCTION_NAME_PATTERN = re.compile(r"^(.*?)<arg_key>", re.DOTALL)
 _ARGUMENT_PAIR_PATTERN = re.compile(
-    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
     re.DOTALL,
 )
 
