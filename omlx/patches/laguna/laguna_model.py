@@ -498,43 +498,82 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        weights = self._unpack_compressed_tensors(weights)
+        # Stack experts before the format transforms so packed/scale sidecars
+        # convert as a handful of batched per-layer tensors instead of one
+        # tiny op per expert.
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
+        weights = self._unpack_compressed_tensors(weights)
+        weights = self._dequantize_fp8_block_weights(weights)
         return {
             k: v
             for k, v in weights.items()
             if "rotary_emb.inv_freq" not in k
             and not k.endswith(".self_attn.k_scale")
             and not k.endswith(".self_attn.v_scale")
+            and not k.endswith(".input_global_scale")
+            and not k.endswith(".weight_shape")
         }
 
     def _unpack_compressed_tensors(self, weights):
-        if not any(k.endswith(".weight_shape") for k in weights):
-            return weights
+        """Convert pack-quantized int4 tensors to the mlx affine layout.
 
-        new_weights = {}
-        for k, v in weights.items():
-            if k.endswith(".weight_shape"):
-                base = k[: -len("weight_shape")]
-                if (
-                    f"{base}weight_packed" in weights
-                    and f"{base}weight_scale" in weights
-                ):
-                    scales = weights[f"{base}weight_scale"]
-                    new_weights[f"{base}weight"] = weights[f"{base}weight_packed"].view(
-                        mx.uint32
-                    )
-                    new_weights[f"{base}scales"] = scales
-                    new_weights[f"{base}biases"] = (-8 * scales).astype(scales.dtype)
-            elif k.endswith(".weight_packed") or k.endswith(".weight_scale"):
-                base = k.rsplit(".", 1)[0] + "."
-                if f"{base}weight_shape" in weights:
-                    continue
-                new_weights[k] = v
-            else:
-                new_weights[k] = v
-        return new_weights
+        Symmetric int4 values in [-8, 7] map exactly onto mlx affine 4-bit
+        with ``biases = -8 * scales``. Handles flat Linears and stacked expert
+        tensors alike. Pairs carrying a ``weight_global_scale`` sidecar are
+        nvfp4-pack-quantized, and asymmetric pairs carry a zero point; both
+        are left untouched here.
+        """
+        packed_keys = [k for k in weights if k.endswith(".weight_packed")]
+        for pk in packed_keys:
+            base = pk[: -len("weight_packed")]
+            if (
+                f"{base}weight_scale" not in weights
+                or f"{base}weight_global_scale" in weights
+                or f"{base}weight_zero_point" in weights
+            ):
+                continue
+            scales = weights.pop(f"{base}weight_scale")
+            weights[f"{base}weight"] = weights.pop(pk).view(mx.uint32)
+            weights[f"{base}scales"] = scales
+            weights[f"{base}biases"] = (-8 * scales).astype(scales.dtype)
+            weights.pop(f"{base}weight_shape", None)
+        return weights
+
+    def _dequantize_fp8_block_weights(self, weights):
+        """Convert compressed-tensors float-quantized (FP8) tensors.
+
+        The checkpoint stores e4m3 weights (surfaced by ``mx.load`` as uint8)
+        with float32 block scales, typically [128, 128] per block. Metal has
+        no fp8 matmul, so decode the blocks and requantize to 8-bit affine;
+        the R1 hadamard transform in these checkpoints is already folded into
+        the stored weights and needs no runtime op.
+        """
+        scale_keys = [k for k in weights if k.endswith(".weight_scale")]
+        for sk in scale_keys:
+            base = sk[: -len("weight_scale")]
+            wk = f"{base}weight"
+            if wk not in weights or weights[wk].dtype != mx.uint8:
+                continue
+            scale = weights.pop(sk).astype(mx.float32)
+            w = mx.from_fp8(weights.pop(wk), dtype=mx.float32)
+            out_dim, in_dim = w.shape[-2], w.shape[-1]
+            blocks_out, blocks_in = scale.shape[-2], scale.shape[-1]
+            lead = w.shape[:-2]
+            w = w.reshape(
+                *lead,
+                blocks_out,
+                out_dim // blocks_out,
+                blocks_in,
+                in_dim // blocks_in,
+            )
+            w = w * scale[..., :, None, :, None]
+            w = w.reshape(*lead, out_dim, in_dim).astype(mx.bfloat16)
+            quantized, scales, biases = mx.quantize(w, group_size=64, bits=8)
+            weights[wk] = quantized
+            weights[f"{base}scales"] = scales
+            weights[f"{base}biases"] = biases
+        return weights
 
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
@@ -557,7 +596,14 @@ class Model(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
             for proj in ["gate_proj", "up_proj", "down_proj"]:
-                for suffix in ["weight", "scales", "biases"]:
+                for suffix in [
+                    "weight",
+                    "scales",
+                    "biases",
+                    "weight_packed",
+                    "weight_scale",
+                    "weight_global_scale",
+                ]:
                     first_key = f"{prefix}.experts.0.{proj}.{suffix}"
                     if first_key not in weights:
                         continue

@@ -389,6 +389,184 @@ def test_laguna_sanitize_remaps_gate_and_stacks_experts():
     assert stacked_gate.shape == (2, 128, 64)
 
 
+def test_sanitize_dequantizes_fp8_block_weights():
+    """FP8 e4m3 weight + f32 block scales convert to 8-bit affine triples."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(**_minimal_laguna_config())
+    model = laguna.Model(args)
+
+    out_dim, in_dim = 128, 256
+    w_true = (
+        (mx.arange(out_dim * in_dim).reshape(out_dim, in_dim) % 37) - 18
+    ).astype(mx.float32) / 5.0
+    scale = mx.array([[0.5, 2.0]], dtype=mx.float32)  # blocks [1, 2]
+    scale_expand = mx.repeat(mx.repeat(scale, out_dim, axis=0), 128, axis=1)
+    codes = mx.to_fp8(w_true / scale_expand)
+    assert codes.dtype == mx.uint8
+
+    key = "model.layers.0.mlp.shared_expert.gate_proj"
+    out = model.sanitize(
+        {
+            f"{key}.weight": codes,
+            f"{key}.weight_scale": scale,
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (128, 64), dtype=mx.bfloat16
+            ),
+            "model.layers.0.self_attn.k_scale": mx.array([1.0]),
+            "model.layers.0.self_attn.v_scale": mx.array([1.0]),
+        }
+    )
+
+    assert out[f"{key}.weight"].dtype == mx.uint32
+    assert f"{key}.scales" in out and f"{key}.biases" in out
+    assert f"{key}.weight_scale" not in out
+    assert "model.layers.0.self_attn.k_scale" not in out
+    assert "model.layers.0.self_attn.v_scale" not in out
+    # Untouched bf16 module stays bf16
+    assert out["model.layers.0.self_attn.q_proj.weight"].dtype == mx.bfloat16
+
+    ref = mx.from_fp8(codes, dtype=mx.float32) * scale_expand
+    deq = mx.dequantize(
+        out[f"{key}.weight"],
+        out[f"{key}.scales"],
+        out[f"{key}.biases"],
+        group_size=64,
+        bits=8,
+    ).astype(mx.float32)
+    max_err = mx.abs(deq - ref).max().item()
+    assert max_err < 0.1, f"affine8 round-trip error too large: {max_err}"
+
+
+def test_sanitize_stacks_and_dequantizes_fp8_experts():
+    """Per-expert FP8 tensors stack first, then convert as one batched tensor."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {}
+    for e in range(2):
+        for proj, (o, i) in {
+            "gate_proj": (128, 64),
+            "up_proj": (128, 64),
+            "down_proj": (64, 128),
+        }.items():
+            base = f"model.layers.0.mlp.experts.{e}.{proj}"
+            weights[f"{base}.weight"] = mx.to_fp8(
+                mx.ones((o, i), dtype=mx.float32) * (e + 1)
+            )
+            weights[f"{base}.weight_scale"] = mx.ones((1, 1), dtype=mx.float32)
+
+    out = model.sanitize(weights)
+
+    stacked = "model.layers.0.mlp.switch_mlp.gate_proj"
+    assert out[f"{stacked}.weight"].dtype == mx.uint32
+    assert out[f"{stacked}.weight"].shape == (2, 128, 16)  # 4 int8 per uint32
+    assert out[f"{stacked}.scales"].shape == (2, 128, 1)
+    assert not any(k.endswith(".weight_scale") for k in out)
+    assert not any(".experts." in k for k in out)
+
+    deq = mx.dequantize(
+        out[f"{stacked}.weight"],
+        out[f"{stacked}.scales"],
+        out[f"{stacked}.biases"],
+        group_size=64,
+        bits=8,
+    ).astype(mx.float32)
+    assert abs(deq[0].mean().item() - 1.0) < 0.05
+    assert abs(deq[1].mean().item() - 2.0) < 0.05
+
+
+def test_sanitize_unpacks_int4_stacked_experts():
+    """Pack-quantized int4 expert tensors unpack after stacking."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {}
+    for e in range(2):
+        base = f"model.layers.0.mlp.experts.{e}.gate_proj"
+        weights[f"{base}.weight_packed"] = mx.full((128, 32), e + 1, dtype=mx.uint8)
+        weights[f"{base}.weight_scale"] = mx.full((128, 2), 0.25, dtype=mx.float16)
+        weights[f"{base}.weight_shape"] = mx.array([128, 64])
+
+    out = model.sanitize(weights)
+
+    stacked = "model.layers.0.mlp.switch_mlp.gate_proj"
+    assert out[f"{stacked}.weight"].dtype == mx.uint32
+    assert out[f"{stacked}.weight"].shape == (2, 128, 8)
+    assert out[f"{stacked}.scales"].shape == (2, 128, 2)
+    biases = out[f"{stacked}.biases"]
+    assert mx.allclose(biases, -8 * out[f"{stacked}.scales"]).item()
+    assert not any(k.endswith(".weight_shape") for k in out)
+    assert not any(k.endswith(".weight_packed") for k in out)
+
+
+def test_normalize_laguna_compressed_quant_formats():
+    """Each compressed-tensors format maps to its mlx quantization target."""
+    from omlx.utils.model_loading import normalize_laguna_compressed_quant
+
+    def cfg(fmt, weights):
+        return {
+            "model_type": "laguna",
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": fmt,
+                "config_groups": {"group_0": {"format": fmt, "weights": weights}},
+            },
+        }
+
+    fp8 = normalize_laguna_compressed_quant(
+        cfg("float-quantized", {"num_bits": 8, "type": "float"})
+    )
+    assert fp8["quantization"] == {"group_size": 64, "bits": 8}
+
+    nvfp4 = normalize_laguna_compressed_quant(
+        cfg("nvfp4-pack-quantized", {"num_bits": 4, "group_size": 16})
+    )
+    assert nvfp4["quantization"] == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+    int4 = normalize_laguna_compressed_quant(
+        cfg("pack-quantized", {"num_bits": 4, "group_size": 32})
+    )
+    assert int4["quantization"] == {"group_size": 32, "bits": 4}
+
+    # Non-laguna and already-quantized configs are untouched
+    other = {"model_type": "llama", "quantization_config": {"quant_method": "compressed-tensors"}}
+    assert "quantization" not in normalize_laguna_compressed_quant(other)
+    pre = cfg("pack-quantized", {})
+    pre["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    assert normalize_laguna_compressed_quant(pre)["quantization"]["mode"] == "nvfp4"
+
+
 def test_pre_load_dispatch_applies_laguna_patch(tmp_path):
     """``maybe_apply_pre_load_patches`` dispatches for ``model_type: laguna``."""
     from omlx.patches import laguna
