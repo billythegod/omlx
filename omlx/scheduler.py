@@ -1607,6 +1607,11 @@ class Scheduler:
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
         self._memory_limit_bytes: int = 0  # soft limit (dynamic, jittery)
         self._memory_hard_limit_bytes: int = 0  # dynamic ceiling (throttle target)
+        # Hard watermark (ceiling * hard_threshold) — the line whose crossing
+        # makes the enforcer abort active requests. Propagated so the
+        # client-facing abort message can name the threshold that actually
+        # tripped instead of the ceiling above it (issue #2321).
+        self._memory_hard_watermark_bytes: int = 0
         # Stable physical cap = min(static_ceiling, metal_cap). Used ONLY to
         # abort an in-flight prefill, so a transient dynamic-ceiling dip can't
         # kill a near-complete request that actually fits. 0 => fall back to

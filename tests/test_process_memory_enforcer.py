@@ -713,6 +713,7 @@ class TestDisabledWhenCeilingZero:
         scheduler = MagicMock(spec=[])
         scheduler._memory_limit_bytes = 0
         scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_hard_watermark_bytes = 0
         scheduler._memory_static_ceiling_bytes = 0
         scheduler._memory_dynamic_ceiling_bytes = 0
         scheduler._memory_metal_cap_bytes = 0
@@ -726,6 +727,9 @@ class TestDisabledWhenCeilingZero:
         enforcer._propagate_memory_limit()
 
         assert scheduler._memory_hard_limit_bytes == metal_b - hot_reserved_b
+        assert scheduler._memory_hard_watermark_bytes == int(
+            (metal_b - hot_reserved_b) * enforcer._hard_threshold
+        )
         assert scheduler._memory_static_ceiling_bytes == static_b
         assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
         assert scheduler._memory_metal_cap_bytes == metal_b

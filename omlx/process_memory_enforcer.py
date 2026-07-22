@@ -1071,6 +1071,11 @@ class ProcessMemoryEnforcer:
             if scheduler_ceiling > 0
             else 0
         )
+        hard_watermark = (
+            int(scheduler_ceiling * self._hard_threshold)
+            if scheduler_ceiling > 0
+            else 0
+        )
         scheduler_abort_limit = self._scheduler_limit_bytes(
             abort_limit, reserved=hot_cache_reserved
         )
@@ -1126,6 +1131,7 @@ class ProcessMemoryEnforcer:
                 continue
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = scheduler_ceiling
+            scheduler._memory_hard_watermark_bytes = hard_watermark
             scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             # Propagate the component ceilings too so the rejection
