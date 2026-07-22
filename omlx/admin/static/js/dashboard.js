@@ -317,6 +317,7 @@
             hfModelsLoaded: false,
             hfError: '',
             hfSuccess: '',
+            hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
 
@@ -4942,6 +4943,7 @@
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         // Attach original rank so the # column survives column-header re-sorts
                         this.hfRecommended = {
                             trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
@@ -5108,6 +5110,7 @@
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         this.hfSearchResults = data.models || [];
                         this.hfSearchLoaded = true;
                         // Save to search history
