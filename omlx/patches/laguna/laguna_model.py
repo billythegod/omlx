@@ -503,6 +503,7 @@ class Model(nn.Module):
         # tiny op per expert.
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
+        weights = self._repack_compressed_nvfp4_weights(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._dequantize_fp8_block_weights(weights)
         return {
@@ -514,6 +515,29 @@ class Model(nn.Module):
             and not k.endswith(".input_global_scale")
             and not k.endswith(".weight_shape")
         }
+
+    def _repack_compressed_nvfp4_weights(self, weights):
+        """Convert nvfp4-pack-quantized tensors to the mlx nvfp4 layout.
+
+        The fp4 codes reinterpret bit-exactly from uint8 pairs to the uint32
+        packing mlx expects. mlx nvfp4 is single-level, so the per-tensor
+        ``weight_global_scale`` is folded into the e4m3 group scales.
+        """
+        packed_keys = [k for k in weights if k.endswith(".weight_packed")]
+        for pk in packed_keys:
+            base = pk[: -len("weight_packed")]
+            scale_key = f"{base}weight_scale"
+            global_key = f"{base}weight_global_scale"
+            if scale_key not in weights or global_key not in weights:
+                continue
+            global_scale = weights.pop(global_key).astype(mx.float32)
+            if global_scale.ndim:
+                global_scale = global_scale.reshape(*global_scale.shape[:-1], 1, 1)
+            decoded = mx.from_fp8(weights.pop(scale_key), dtype=mx.float32)
+            weights[f"{base}weight"] = weights.pop(pk).view(mx.uint32)
+            weights[f"{base}scales"] = mx.to_fp8(decoded / global_scale)
+            weights.pop(f"{base}weight_shape", None)
+        return weights
 
     def _unpack_compressed_tensors(self, weights):
         """Convert pack-quantized int4 tensors to the mlx affine layout.

@@ -530,6 +530,57 @@ def test_sanitize_unpacks_int4_stacked_experts():
     assert not any(k.endswith(".weight_packed") for k in out)
 
 
+def test_sanitize_repacks_compressed_nvfp4_experts():
+    """nvfp4-pack tensors reinterpret bit-exactly into mlx nvfp4 layout with
+    the per-tensor global scale folded into the e4m3 group scales."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    weights = {}
+    expected = {}
+    for e in range(2):
+        w_true = (
+            (mx.arange(128 * 64).reshape(128, 64) % 23) - 11
+        ).astype(mx.float32) / (3.0 + e)
+        packed, scales = mx.quantize(w_true, group_size=16, bits=4, mode="nvfp4")
+        expected[e] = (packed, scales)
+        global_scale = 2.0
+        base = f"model.layers.0.mlp.experts.{e}.gate_proj"
+        weights[f"{base}.weight_packed"] = packed.view(mx.uint8)
+        weights[f"{base}.weight_scale"] = mx.to_fp8(
+            mx.from_fp8(scales, dtype=mx.float32) * global_scale
+        )
+        weights[f"{base}.weight_global_scale"] = mx.array(
+            [global_scale], dtype=mx.float32
+        )
+        weights[f"{base}.input_global_scale"] = mx.array([1.0], dtype=mx.float32)
+
+    out = model.sanitize(weights)
+
+    stacked = "model.layers.0.mlp.switch_mlp.gate_proj"
+    assert out[f"{stacked}.weight"].dtype == mx.uint32
+    assert f"{stacked}.biases" not in out
+    assert not any(k.endswith(".weight_global_scale") for k in out)
+    assert not any(k.endswith(".input_global_scale") for k in out)
+    for e in range(2):
+        packed, scales = expected[e]
+        assert mx.array_equal(out[f"{stacked}.weight"][e], packed).item()
+        assert mx.array_equal(out[f"{stacked}.scales"][e], scales).item()
+
+
 def test_normalize_laguna_compressed_quant_formats():
     """Each compressed-tensors format maps to its mlx quantization target."""
     from omlx.utils.model_loading import normalize_laguna_compressed_quant
