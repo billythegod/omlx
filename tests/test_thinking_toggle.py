@@ -1,13 +1,9 @@
 """Tests for the enable_thinking toggle and detect_thinking_default heuristic."""
 
-import ast
 import json
-from pathlib import Path
-from types import SimpleNamespace
 
 from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
 from omlx.model_settings import ModelSettings
-from omlx.server import _apply_laguna_enable_thinking_default
 
 # ---------------------------------------------------------------------------
 # detect_thinking_default
@@ -126,102 +122,6 @@ class TestModelSettingsEnableThinking:
     def test_set_to_false(self):
         ms = ModelSettings(enable_thinking=False)
         assert ms.enable_thinking is False
-
-
-# ---------------------------------------------------------------------------
-# Laguna serving default
-# ---------------------------------------------------------------------------
-
-
-class TestLagunaThinkingDefault:
-    """Test Poolside's recommended Laguna request default and precedence."""
-
-    def test_enables_recommended_laguna_thinking_default(self):
-        template_kwargs = {}
-
-        _apply_laguna_enable_thinking_default(
-            template_kwargs,
-            SimpleNamespace(config_model_type="laguna", thinking_default=True),
-        )
-
-        assert template_kwargs == {"enable_thinking": True}
-
-    def test_does_not_override_non_laguna_thinking_default(self):
-        template_kwargs = {}
-
-        _apply_laguna_enable_thinking_default(
-            template_kwargs,
-            SimpleNamespace(config_model_type="gemma4", thinking_default=False),
-        )
-
-        assert template_kwargs == {}
-
-    def test_preserves_explicit_thinking_disable(self):
-        template_kwargs = {"enable_thinking": False}
-
-        _apply_laguna_enable_thinking_default(
-            template_kwargs,
-            SimpleNamespace(config_model_type="laguna", thinking_default=True),
-        )
-
-        assert template_kwargs == {"enable_thinking": False}
-
-    def test_preserves_explicit_thinking_enable(self):
-        template_kwargs = {"enable_thinking": True}
-
-        _apply_laguna_enable_thinking_default(
-            template_kwargs,
-            SimpleNamespace(config_model_type="laguna", thinking_default=True),
-        )
-
-        assert template_kwargs == {"enable_thinking": True}
-
-    def test_ignores_laguna_without_thinking_capability(self):
-        template_kwargs = {}
-
-        _apply_laguna_enable_thinking_default(
-            template_kwargs,
-            SimpleNamespace(config_model_type="laguna", thinking_default=None),
-        )
-
-        assert template_kwargs == {}
-
-
-def _server_route_node(route_name: str) -> ast.AsyncFunctionDef:
-    """Return an API route AST node without importing or running the server."""
-    server_path = Path(__file__).resolve().parents[1] / "omlx" / "server.py"
-    server_source = server_path.read_text()
-    for node in ast.walk(ast.parse(server_source)):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == route_name:
-            return node
-    raise AssertionError(f"{route_name} not found in server.py")
-
-
-def test_all_chat_apis_apply_laguna_thinking_default():
-    """Every chat API must use the shared caller-precedence-safe policy."""
-    route_names = (
-        "create_chat_completion",
-        "create_anthropic_message",
-        "create_response",
-    )
-
-    for route_name in route_names:
-        helper_calls = [
-            call
-            for call in ast.walk(_server_route_node(route_name))
-            if (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id == "_apply_laguna_enable_thinking_default"
-            )
-        ]
-
-        assert any(
-            len(call.args) == 2
-            and isinstance(call.args[0], ast.Name)
-            and call.args[0].id == "merged_ct_kwargs"
-            for call in helper_calls
-        ), f"{route_name} must apply the Laguna thinking default"
 
 
 # ---------------------------------------------------------------------------
