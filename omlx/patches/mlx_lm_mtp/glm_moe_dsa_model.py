@@ -77,6 +77,51 @@ def apply() -> bool:
 # cover MTP layers.
 # ---------------------------------------------------------------------------
 
+# Module-path counterpart of sanitize's weight-key special map (config
+# quantization keys carry no ".weight" suffix).
+_MTP_QUANT_SPECIAL = {
+    "eh_proj": "eh_proj",
+    "enorm": "enorm",
+    "hnorm": "hnorm",
+    "shared_head.norm": "norm",
+}
+
+
+def _remap_mtp_quant_overrides(params: dict[str, Any], n_main: int, n_mtp: int) -> None:
+    """Copy per-module quantization overrides to the runtime MTP paths.
+
+    ``sanitize`` renames the nextn layer's weights from
+    ``model.layers.<n_main + i>.*`` to ``mtp.<i>.*``, but mlx-lm's
+    ``class_predicate`` looks up per-module overrides in
+    ``config["quantization"]`` by the runtime module path. Without the
+    copied keys a dynamically quantized MTP block is built at the global
+    bit width and the strict load fails on the packed shapes (issue
+    #2326). ``params`` is the same dict ``load_model`` closes over, so
+    mutating it in place is enough. The original keys stay: no module
+    lives at those paths after the remap, so they are inert.
+    """
+    quant = params.get("quantization")
+    if not isinstance(quant, dict):
+        return
+    for k, v in list(quant.items()):
+        for i in range(n_mtp):
+            prefix = f"model.layers.{n_main + i}."
+            if not k.startswith(prefix):
+                continue
+            rest = k[len(prefix):]
+            if rest.startswith(("shared_head.head", "embed_tokens")):
+                # Shared lm_head / embeddings duplicates; sanitize drops
+                # the weights and the modules are the trunk's own.
+                nk = None
+            elif rest in _MTP_QUANT_SPECIAL:
+                nk = f"mtp.{i}.{_MTP_QUANT_SPECIAL[rest]}"
+            else:
+                nk = f"mtp.{i}.block.{rest}"
+            if nk is not None and nk not in quant:
+                quant[nk] = v
+            break
+
+
 def _patch_model_args(glm: Any) -> None:
     """Wrap ``ModelArgs.from_dict`` so MTP layers are constructible.
 
@@ -109,6 +154,8 @@ def _patch_model_args(glm: Any) -> None:
                     "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
                 )
             args.indexer_types = types
+        if n_mtp > 0:
+            _remap_mtp_quant_overrides(params, int(args.num_hidden_layers), n_mtp)
         return args
 
     args_cls.from_dict = classmethod(patched_from_dict)

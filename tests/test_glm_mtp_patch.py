@@ -127,6 +127,70 @@ class TestModelArgs:
         assert args.indexer_types == ["full", "shared"]
 
 
+class TestQuantOverrideRemap:
+    """Per-module quantization overrides must follow the weight remap.
+
+    mlx-lm's load-time class_predicate looks up config["quantization"]
+    by runtime module path (mtp.<i>.*), while dynamic-quant checkpoints
+    key their overrides by the checkpoint path (model.layers.<n>.*);
+    from_dict copies them over (issue #2326).
+    """
+
+    def test_nextn_overrides_copied_to_runtime_paths(self, glm):
+        three_bit = {"group_size": 32, "bits": 3}
+        cfg = dict(
+            TINY_CFG,
+            quantization={
+                "group_size": 32,
+                "bits": 4,
+                "model.layers.2.mlp.switch_mlp.down_proj": dict(three_bit),
+                "model.layers.2.eh_proj": dict(three_bit),
+                "model.layers.2.mlp.gate": False,
+                "model.layers.2.shared_head.head": {"group_size": 32, "bits": 4},
+                "model.layers.1.mlp.switch_mlp.down_proj": dict(three_bit),
+            },
+        )
+        glm.ModelArgs.from_dict(cfg)
+        q = cfg["quantization"]
+        assert q["mtp.0.block.mlp.switch_mlp.down_proj"] == three_bit
+        assert q["mtp.0.eh_proj"] == three_bit
+        assert q["mtp.0.block.mlp.gate"] is False
+        # Shared lm_head duplicate is dropped by sanitize; no runtime copy.
+        assert "mtp.0.block.shared_head.head" not in q
+        # Backbone overrides are not treated as nextn layers.
+        assert not any("layers.1" in k for k in q if k.startswith("mtp."))
+        # Original checkpoint-path keys stay (inert after the remap).
+        assert "model.layers.2.mlp.switch_mlp.down_proj" in q
+
+    def test_existing_runtime_key_not_overwritten(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            quantization={
+                "group_size": 32,
+                "bits": 4,
+                "model.layers.2.mlp.gate": {"group_size": 32, "bits": 3},
+                "mtp.0.block.mlp.gate": {"group_size": 32, "bits": 8},
+            },
+        )
+        glm.ModelArgs.from_dict(cfg)
+        assert cfg["quantization"]["mtp.0.block.mlp.gate"] == {
+            "group_size": 32,
+            "bits": 8,
+        }
+
+    def test_no_nextn_leaves_quantization_untouched(self, glm):
+        quant = {
+            "group_size": 32,
+            "bits": 4,
+            "model.layers.1.mlp.gate": False,
+        }
+        cfg = dict(
+            TINY_CFG, num_nextn_predict_layers=0, quantization=dict(quant)
+        )
+        glm.ModelArgs.from_dict(cfg)
+        assert cfg["quantization"] == quant
+
+
 class TestModelInit:
     def test_mtp_attached_when_active(self, glm, mtp_active):
         args = glm.ModelArgs.from_dict(TINY_CFG)
