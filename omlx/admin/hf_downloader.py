@@ -314,8 +314,10 @@ class HFDownloader:
             }
             if mlx_only:
                 kwargs["author"] = "mlx-community"
+            # list_models returns a lazy generator; drain it inside the worker
+            # thread so the paginated HTTP calls never block the event loop.
             models = await asyncio.wait_for(
-                asyncio.to_thread(api.list_models, **kwargs),
+                asyncio.to_thread(lambda: list(api.list_models(**kwargs))),
                 timeout=_HF_API_TIMEOUT,
             )
             results = []
@@ -409,8 +411,10 @@ class HFDownloader:
         if mlx_only:
             kwargs["filter"] = "mlx"
 
+        # list_models returns a lazy generator; drain it inside the worker
+        # thread so the paginated HTTP calls never block the event loop.
         models = await asyncio.wait_for(
-            asyncio.to_thread(api.list_models, **kwargs),
+            asyncio.to_thread(lambda: list(api.list_models(**kwargs))),
             timeout=_HF_API_TIMEOUT,
         )
 

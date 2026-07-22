@@ -4,6 +4,7 @@
 import asyncio
 import json
 import shutil
+import threading
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2086,6 +2087,79 @@ class TestHFAPITimeouts:
 
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.get_model_info("org/model")
+
+    @pytest.mark.asyncio
+    async def test_search_models_timeout_on_lazy_iteration(self):
+        """list_models returns a lazy generator; a hang during iteration
+        (not the call itself) must still hit the timeout instead of
+        blocking the event loop (issue #2325)."""
+
+        def lazy_hanging_list_models(**kwargs):
+            def gen():
+                time.sleep(5)
+                yield None
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_hanging_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.search_models(query="test")
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_models_timeout_on_lazy_iteration(self):
+        """Same lazy-iteration hang, via get_recommended_models."""
+
+        def lazy_hanging_list_models(**kwargs):
+            def gen():
+                time.sleep(5)
+                yield None
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+             patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_hanging_list_models
+            mock_api_cls.return_value = mock_api
+
+            with pytest.raises(asyncio.TimeoutError):
+                await HFDownloader.get_recommended_models(
+                    max_memory_bytes=16 * 1024**3
+                )
+
+    @pytest.mark.asyncio
+    async def test_search_models_drains_generator_off_event_loop(self):
+        """The lazy generator must be consumed in a worker thread, never
+        on the event loop thread."""
+        seen_threads = []
+
+        def lazy_list_models(**kwargs):
+            def gen():
+                seen_threads.append(threading.current_thread())
+                yield _make_mock_model(
+                    "mlx-community/model-a",
+                    disk_size_bytes=1_000_000_000,
+                    downloads=500,
+                )
+
+            return gen()
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = lazy_list_models
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="test")
+
+        assert len(result["models"]) == 1
+        loop_thread = threading.current_thread()
+        assert seen_threads
+        assert all(t is not loop_thread for t in seen_threads)
 
 
 class TestHFEndpointPassthrough:
