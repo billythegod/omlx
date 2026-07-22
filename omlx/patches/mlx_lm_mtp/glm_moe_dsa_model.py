@@ -122,6 +122,68 @@ def _remap_mtp_quant_overrides(params: dict[str, Any], n_main: int, n_mtp: int) 
             break
 
 
+def _resolve_module(model: Any, path: str) -> Any:
+    m = model
+    for part in path.split("."):
+        try:
+            m = m[int(part)] if part.isdigit() else getattr(m, part)
+        except (AttributeError, IndexError, KeyError, TypeError):
+            return None
+    return m
+
+
+def _infer_mtp_quant_overrides(model: Any, weights: dict[str, Any]) -> None:
+    """Derive per-module quant specs for MTP tensors absent from config.
+
+    Some dynamic-quant converters (issue #2326's Alis 3.5bpw among them)
+    pack the nextn layer's tensors at non-global bit widths but write no
+    per-module entry for that layer into ``config["quantization"]`` at
+    all, so neither the checkpoint-key remap above nor mlx-lm's
+    scales-fallback predicate can build the MTP module at the right
+    width. For every ``mtp.*`` quantized triplet without an override the
+    true (bits, group_size) is recovered from the packed/scales shapes
+    plus the unquantized module's input dim (shapes alone are ambiguous:
+    gs=32/6-bit and gs=64/3-bit pack identically) and published to
+    ``args.quantization``, which is the same dict object
+    ``load_model``'s class_predicate reads (the base patch's embed_q
+    dequant already relies on that). Runs from sanitize, i.e. before
+    ``nn.quantize``.
+    """
+    quant = getattr(model.args, "quantization", None)
+    if not isinstance(quant, dict):
+        return
+    g_bits = quant.get("bits")
+    g_gs = quant.get("group_size")
+    mode = quant.get("mode", "affine")
+    for key in weights:
+        if not key.startswith("mtp.") or not key.endswith(".scales"):
+            continue
+        path = key[: -len(".scales")]
+        if path in quant:
+            continue
+        packed = weights.get(f"{path}.weight")
+        module = _resolve_module(model, path)
+        base = getattr(module, "weight", None) if module is not None else None
+        if packed is None or base is None:
+            continue
+        in_dim = int(base.shape[-1])
+        p_dim = int(packed.shape[-1])
+        s_dim = int(weights[key].shape[-1])
+        if in_dim <= 0 or s_dim <= 0 or (32 * p_dim) % in_dim or in_dim % s_dim:
+            continue
+        bits = 32 * p_dim // in_dim
+        gs = in_dim // s_dim
+        if not 1 <= bits <= 8 or (bits, gs) == (g_bits, g_gs):
+            continue
+        quant[path] = {"group_size": gs, "bits": bits, "mode": mode}
+        logger.info(
+            "Inferred MTP quantization override %s: %d-bit group_size=%d",
+            path,
+            bits,
+            gs,
+        )
+
+
 def _patch_model_args(glm: Any) -> None:
     """Wrap ``ModelArgs.from_dict`` so MTP layers are constructible.
 
@@ -468,6 +530,7 @@ def _patch_model(glm: Any) -> None:
                     break
                 if nk is not None:
                     remapped[nk] = v
+            _infer_mtp_quant_overrides(self, remapped)
             return remapped
 
         # Load-time indexer wk/weights_proj fusion for the mtp prefix
@@ -493,7 +556,9 @@ def _patch_model(glm: Any) -> None:
                                 axis=0,
                             )
                         )
-        return original_sanitize(self, weights)
+        weights = original_sanitize(self, weights)
+        _infer_mtp_quant_overrides(self, weights)
+        return weights
 
     if not init_wrapped:
         cls.__init__ = __init__

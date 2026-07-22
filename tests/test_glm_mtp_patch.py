@@ -191,6 +191,93 @@ class TestQuantOverrideRemap:
         assert cfg["quantization"] == quant
 
 
+def _fake_triplet(out_shape, in_dim, bits, gs):
+    packed = mx.zeros((*out_shape, in_dim * bits // 32), dtype=mx.uint32)
+    scales = mx.zeros((*out_shape, in_dim // gs))
+    return packed, scales, mx.zeros((*out_shape, in_dim // gs))
+
+
+class TestQuantInference:
+    """Shape-inferred overrides for converters that record none (#2326).
+
+    The Alis 3.5bpw checkpoint packs the nextn layer at 3-bit but has no
+    config["quantization"] entry for layer 78 at all; the spec must be
+    recovered from the packed/scales shapes plus the module input dim.
+    """
+
+    DP = "mtp.0.block.mlp.switch_mlp.down_proj"
+
+    def _model_and_quant(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        return glm.Model(args), cfg["quantization"]
+
+    def test_inferred_override_published(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        # down_proj module weight is (experts, hidden, moe_int) = (4, 64, 32);
+        # fabricate a 3-bit gs=32 triplet (differs from the global 4-bit).
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        weights = {f"{self.DP}.weight": w, f"{self.DP}.scales": s, f"{self.DP}.biases": b}
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == {"group_size": 32, "bits": 3, "mode": "affine"}
+
+    def test_global_matching_module_not_written(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        w, s, b = _fake_triplet((4, 64), 32, bits=4, gs=32)
+        weights = {f"{self.DP}.weight": w, f"{self.DP}.scales": s, f"{self.DP}.biases": b}
+        _infer_mtp_quant_overrides(model, weights)
+        assert self.DP not in quant
+
+    def test_existing_override_and_bogus_path_untouched(self, glm, mtp_active):
+        from omlx.patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            _infer_mtp_quant_overrides,
+        )
+
+        model, quant = self._model_and_quant(glm)
+        sentinel = {"group_size": 32, "bits": 8, "mode": "affine"}
+        quant[self.DP] = dict(sentinel)
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        weights = {
+            f"{self.DP}.weight": w,
+            f"{self.DP}.scales": s,
+            f"{self.DP}.biases": b,
+            "mtp.0.block.bogus.scales": s,
+        }
+        _infer_mtp_quant_overrides(model, weights)
+        assert quant[self.DP] == sentinel
+        assert not any("bogus" in k for k in quant)
+
+    def test_sanitize_nextn_branch_publishes_override(self, glm, mtp_active):
+        cfg = dict(
+            TINY_CFG,
+            quantization={"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        model = glm.Model(args)
+        w, s, b = _fake_triplet((4, 64), 32, bits=3, gs=32)
+        raw = "model.layers.2.mlp.switch_mlp.down_proj"
+        out = model.sanitize(
+            {f"{raw}.weight": w, f"{raw}.scales": s, f"{raw}.biases": b}
+        )
+        assert f"{self.DP}.weight" in out
+        assert cfg["quantization"][self.DP] == {
+            "group_size": 32,
+            "bits": 3,
+            "mode": "affine",
+        }
+
+
 class TestModelInit:
     def test_mtp_attached_when_active(self, glm, mtp_active):
         args = glm.ModelArgs.from_dict(TINY_CFG)
