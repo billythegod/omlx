@@ -495,6 +495,7 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        weights = self._strip_language_model_prefix(weights)
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
@@ -514,6 +515,22 @@ class Model(nn.Module):
             and not k.endswith(".self_attn.v_scale")
             and not k.endswith(".input_global_scale")
             and not k.endswith(".weight_shape")
+        }
+
+    def _strip_language_model_prefix(self, weights):
+        """Normalize VLM-tree checkpoints to the flat text-model tree.
+
+        Conversions and oQ outputs produced through the mlx-vlm route key
+        everything under ``language_model.`` (e.g.
+        ``language_model.model.layers...``, ``language_model.lm_head``); the
+        text model expects ``model.*`` and ``lm_head.*`` directly.
+        """
+        prefix = "language_model."
+        if not any(k.startswith(prefix) for k in weights):
+            return weights
+        return {
+            (k[len(prefix) :] if k.startswith(prefix) else k): v
+            for k, v in weights.items()
         }
 
     def _repack_compressed_nvfp4_weights(self, weights):

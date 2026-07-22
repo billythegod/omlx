@@ -530,6 +530,57 @@ def test_sanitize_unpacks_int4_stacked_experts():
     assert not any(k.endswith(".weight_packed") for k in out)
 
 
+def test_sanitize_strips_language_model_prefix():
+    """VLM-tree checkpoints (language_model.*) load on the flat text tree.
+
+    mlx-community oQ outputs of Laguna S-2.1 were produced through the
+    mlx-vlm route, so every key is nested under language_model. including
+    already-sanitized names like gate.proj and stacked switch_mlp triples.
+    """
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        **_minimal_laguna_config(
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+    )
+    model = laguna.Model(args)
+
+    out = model.sanitize(
+        {
+            "language_model.lm_head.weight": mx.zeros((1024, 64)),
+            "language_model.model.embed_tokens.weight": mx.zeros((1024, 64)),
+            "language_model.model.norm.weight": mx.ones((64,)),
+            "language_model.model.layers.0.mlp.gate.proj.weight": mx.zeros((2, 64)),
+            "language_model.model.layers.0.mlp.gate.e_score_correction_bias": (
+                mx.zeros((2,))
+            ),
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight": (
+                mx.zeros((2, 128, 8), dtype=mx.uint32)
+            ),
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales": (
+                mx.zeros((2, 128, 1), dtype=mx.float16)
+            ),
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases": (
+                mx.zeros((2, 128, 1), dtype=mx.float16)
+            ),
+        }
+    )
+
+    assert "lm_head.weight" in out
+    assert "model.embed_tokens.weight" in out
+    assert "model.layers.0.mlp.gate.proj.weight" in out
+    assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in out
+    assert not any(k.startswith("language_model.") for k in out)
+
+
 def test_sanitize_repacks_compressed_nvfp4_experts():
     """nvfp4-pack tensors reinterpret bit-exactly into mlx nvfp4 layout with
     the per-tensor global scale folded into the e4m3 group scales."""
