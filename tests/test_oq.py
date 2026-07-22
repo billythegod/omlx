@@ -766,6 +766,35 @@ class TestValidateQuantizable:
             is True
         )
 
+    def test_compressed_tensors_float_quantized_is_quantizable(self):
+        # Laguna-style FP8: fp8 weights + block scales the lazy index dequants
+        assert (
+            validate_quantizable(
+                {
+                    "quantization_config": {
+                        "quant_method": "compressed-tensors",
+                        "format": "float-quantized",
+                    }
+                }
+            )
+            is True
+        )
+
+    def test_compressed_tensors_packed_not_quantizable(self):
+        # pack-quantized / nvfp4-pack-quantized carry true low-bit weights
+        for fmt in ("pack-quantized", "nvfp4-pack-quantized"):
+            assert (
+                validate_quantizable(
+                    {
+                        "quantization_config": {
+                            "quant_method": "compressed-tensors",
+                            "format": fmt,
+                        }
+                    }
+                )
+                is False
+            )
+
     def test_non_fp8_quantization_config(self):
         # Other quant methods (gptq, awq) are already quantized
         assert (

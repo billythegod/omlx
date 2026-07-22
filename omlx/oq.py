@@ -2114,6 +2114,14 @@ def validate_quantizable(config: dict) -> bool:
             # FP8 models are full-precision weights stored in FP8 format
             if quant_method == "fp8":
                 return True
+            # compressed-tensors float-quantized (e.g. Laguna FP8) is the same
+            # situation with a different container: fp8 weights + block scales
+            # that the lazy index dequantizes on the fly.
+            if quant_method == "compressed-tensors":
+                group = qc.get("config_groups", {}).get("group_0", {})
+                fmt = qc.get("format") or group.get("format")
+                if fmt == "float-quantized":
+                    return True
             # QAT models record training-time quant_type but weights are fp16/bf16
             if _is_qat_unquantized_config(qc):
                 return True
@@ -2733,6 +2741,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
 
+        # Laguna is likewise vendored into ``sys.modules`` by its pre-load
+        # patch; register it so sanitizer/proxy builds resolve the class.
+        if config.get("model_type") == "laguna":
+            try:
+                from omlx.patches.laguna import apply_laguna_patch
+
+                apply_laguna_patch()
+            except Exception as patch_err:
+                logger.debug(f"laguna patch not applied: {patch_err}")
+
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
         # patched.
@@ -3022,6 +3040,17 @@ class _LazyTensorIndex:
                     seen.add(wk)
             elif k.endswith(".scale"):
                 wk = k[: -len(".scale")] + ".weight"
+                if (
+                    wk in self._index
+                    and wk not in seen
+                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                ):
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
+            elif k.endswith(".weight_scale"):
+                # compressed-tensors float-quantized (e.g. Laguna FP8):
+                # X.weight (F8_E4M3) + X.weight_scale (f32 block scales).
+                wk = k[: -len("_scale")]
                 if (
                     wk in self._index
                     and wk not in seen
