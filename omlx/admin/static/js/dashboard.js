@@ -3775,9 +3775,11 @@
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
                 const idx = LEVELS.indexOf(lvl);
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
+                // Levels at or above the minimum are all shown dark so the
+                // included range is obvious; the selected minimum keeps the ring.
                 if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
                 if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-200 text-neutral-700';
+                return 'bg-neutral-700 text-white';
             },
 
             async loadLogs() {
