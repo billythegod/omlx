@@ -2408,7 +2408,9 @@
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_HAIKU_MODEL', haikuModel));
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
-                parts.push('claude');
+                // Deny LSP: its schema joins the tools array mid-session and
+                // re-prefills the whole conversation on a caching server (#2349).
+                parts.push('claude --disallowedTools LSP');
                 return parts.join(' ');
             },
 
