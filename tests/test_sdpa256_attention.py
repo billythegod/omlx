@@ -13,6 +13,7 @@ Covers (without needing the full Qwen3.6 model):
     fits, and falls back to always-tiled without headroom info.
 """
 
+import logging
 import math
 
 import mlx.core as mx
@@ -248,6 +249,7 @@ def _sdpa256_provider_reset(monkeypatch):
 
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
+    monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
     return sdpa256
 
 
@@ -322,6 +324,70 @@ def test_parse_force_tiled_env(monkeypatch):
     assert sdpa256._parse_force_tiled_env() is True
     monkeypatch.setenv("OMLX_SDPA256_TILED", "0")
     assert sdpa256._parse_force_tiled_env() is False
+
+
+# --- tiled-route engagement logging (issue #2283) --------------------------
+
+
+def _tiled_log_records(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "INFO" and "tiled" in r.getMessage()
+    ]
+
+
+def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
+    """Guard-off servers land on the tiled path silently (issue #2283); the
+    first engagement must say so at INFO, repeats must stay quiet."""
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        records = _tiled_log_records(caplog)
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "no guard headroom provider" in msg
+        assert "OMLX_SDPA256_TILED" in msg
+        # Second engagement for the same reason: no new record.
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        assert len(_tiled_log_records(caplog)) == 1
+
+
+def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1)  # 1 byte of headroom: unfused can't fit
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "exceeds live guard headroom" in msg
+    assert "kv_len=16384" in msg
+    assert "MiB" in msg
+
+
+def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatch):
+    sdpa256 = _sdpa256_provider_reset
+    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
+
+
+def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert _tiled_log_records(caplog) == []
 
 
 def test_scheduler_headroom_provider_math():
