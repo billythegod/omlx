@@ -640,6 +640,36 @@ class TestDisabledWhenCeilingZero:
         assert bg._memory_hard_limit_bytes == 0
 
     @pytest.mark.asyncio
+    async def test_propagate_marks_guard_state_trustworthy(self, mock_engine_pool):
+        """#2283 guard-off routing keys on _prefill_memory_guard, which is
+        only meaningful once the enforcer has pushed state at least once:
+        propagation must set the marker even when the guard is disabled
+        and every ceiling propagates as 0."""
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=0,
+            prefill_memory_guard=False,
+            breakdown={
+                "static": 0,
+                "dynamic": 0,
+                "metal_cap": 0,
+                "hard_limit": 0,
+            },
+        )
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limits_propagated = False
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_limits_propagated is True
+        assert scheduler._prefill_memory_guard is False
+        assert scheduler._memory_hard_limit_bytes == 0
+
+    @pytest.mark.asyncio
     async def test_propagate_ceiling_components_to_scheduler(self, mock_engine_pool):
         """All three component ceilings + the tier name must reach the
         scheduler so the binding-aware rejection message has the inputs

@@ -393,13 +393,16 @@ def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
 def test_scheduler_headroom_provider_math():
     """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
     hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
-    from omlx.scheduler import Scheduler
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
 
     gib = 1024**3
 
     class _Fake:
         _memory_hard_limit_bytes = 0
         _memory_abort_limit_bytes = 0
+        _memory_limits_propagated = False
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
@@ -409,7 +412,21 @@ def test_scheduler_headroom_provider_math():
             return 10 * gib
 
     fake = _Fake()
-    # No ceiling propagated yet -> negative sentinel (keep the tiled default).
+    # Nothing propagated yet: guard state is unknown, so the negative
+    # sentinel keeps the tiled default even though the flag reads False.
+    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
+
+    # Enforcer has spoken and the guard is explicitly off: the user opted
+    # out of memory management, so the route gets unbounded headroom and
+    # keeps the unfused fast path (#2283).
+    fake._memory_limits_propagated = True
+    assert (
+        Scheduler._sdpa256_unfused_headroom(fake) == _SDPA256_UNBOUNDED_HEADROOM
+    )
+
+    # Guard on but the ceiling has not landed yet (startup race): stay on
+    # the memory-safe default.
+    fake._prefill_memory_guard = True
     assert Scheduler._sdpa256_unfused_headroom(fake) == -1
 
     # Throttle target binds: abort cap (100 * 0.95) > target (100 * 0.90).
@@ -419,6 +436,36 @@ def test_scheduler_headroom_provider_math():
     # Abort cap binds when lower than the throttle target.
     fake._memory_abort_limit_bytes = 80 * gib
     assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
+
+
+def test_unguarded_fast_path_logs_once(caplog):
+    """Guard-off fast routing runs without a memory ceiling, which is the
+    one state worth a breadcrumb (#2283): exactly one INFO naming the OOM
+    trade and the recovery levers, then silence."""
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
+
+    class _Fake:
+        _memory_hard_limit_bytes = 0
+        _memory_limits_propagated = True
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
+
+    fake = _Fake()
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+    records = [
+        r for r in caplog.records if "memory guard disabled" in r.getMessage()
+    ]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "OMLX_SDPA256_TILED=1" in msg
 
 
 def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):

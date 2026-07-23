@@ -123,13 +123,15 @@ def _tiled_route_required(queries, keys) -> bool:
             _note_tiled_route(
                 "no-provider",
                 "no guard headroom provider registered "
-                "(prefill memory guard disabled, or scheduler gone)",
+                "(engine without a scheduler, or scheduler gone)",
             )
             return True
         headroom = provider()
         if headroom is None or headroom < 0:
             _note_tiled_route(
-                "no-ceiling", "guard reports no active memory ceiling"
+                "no-ceiling",
+                "memory ceiling not available (enforcer state not yet "
+                "propagated)",
             )
             return True
         batch, n_q, q_len, _ = queries.shape
