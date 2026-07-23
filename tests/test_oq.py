@@ -245,6 +245,36 @@ class TestUniversalQuantPredicate:
         assert isinstance(result, dict)
         assert result["bits"] == 6
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk.weight",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b.weight",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj.weight",
+        ],
+    )
+    def test_glm_dsa_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "glm_moe_dsa",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3.5)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
+    def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.indexer.wq_b",
+            module,
+            {"model_type": model_type},
+            3.5,
+        )
+        assert result is True
+
     def test_dense_o_proj_5bit(self, dense_config, module):
         result = universal_quant_predicate(
             "model.layers.5.self_attn.o_proj", module, dense_config
@@ -1074,6 +1104,38 @@ class TestLevelBudgetPlan:
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
         assert boost["bits"] == 4
+
+    def test_glm_dsa_indexer_q8_is_seeded_outside_budget_cap(self):
+        paths = [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj",
+        ]
+        named_shapes = {path: (64, 64) for path in paths}
+        named_shapes["model.layers.0.mlp.switch_mlp.gate_proj"] = (8, 64, 64)
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            3.5,
+            target_bpw=3.01,
+            hard_cap_bpw=3.02,
+        )
+        for path in paths:
+            assert plan.boost_map[path] == {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            }
 
     def test_oq35_predicate_floor_for_expert_down_proj(self):
         """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""

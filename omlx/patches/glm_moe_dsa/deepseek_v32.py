@@ -32,21 +32,68 @@ def _use_load_fused_wk_weights_proj(args) -> bool:
     if not isinstance(quantization, dict):
         return False
 
+    def resolved_spec(name):
+        spec = quantization.get(name, quantization)
+        return spec if isinstance(spec, dict) else {}
+
     def is_indexer_q8(name):
-        spec = quantization.get(name)
+        spec = resolved_spec(name)
         return (
-            isinstance(spec, dict)
-            and spec.get("bits") == 8
+            spec.get("bits") == 8
             and spec.get("group_size") == 64
             and spec.get("mode", "affine") == "affine"
         )
 
-    return any(
-        key.endswith(".self_attn.indexer.wk")
-        and is_indexer_q8(key)
-        and is_indexer_q8(key[:-2] + "weights_proj")
-        for key in quantization
-    )
+    prefixes = []
+    indexer_types = getattr(args, "indexer_types", None) or []
+    num_hidden_layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+    for layer_idx, indexer_type in enumerate(indexer_types[:num_hidden_layers]):
+        if indexer_type == "full":
+            prefixes.append(f"model.layers.{layer_idx}.self_attn.indexer")
+
+    # Preserved MTP checkpoints use runtime mtp.* paths. Include explicit MTP
+    # specs when present, but do not treat their absence as the global default:
+    # third-party dynamic checkpoints can omit nextn overrides and recover them
+    # from tensor shapes later in sanitize (issue #2326).
+    for key in quantization:
+        if key.startswith("mtp.") and ".block.self_attn.indexer." in key:
+            prefix, projection = key.rsplit(".", 1)
+            if projection in ("wq_b", "wk", "weights_proj"):
+                prefixes.append(prefix)
+
+    prefixes = sorted(set(prefixes))
+    if not prefixes:
+        return False
+
+    paths = [
+        f"{prefix}.{projection}"
+        for prefix in prefixes
+        for projection in ("wq_b", "wk", "weights_proj")
+    ]
+    q8_paths = [path for path in paths if is_indexer_q8(path)]
+    if not q8_paths:
+        return False
+    if len(q8_paths) != len(paths):
+        offenders = [
+            (
+                path,
+                resolved_spec(path).get("bits"),
+                resolved_spec(path).get("group_size"),
+                resolved_spec(path).get("mode", "affine"),
+            )
+            for path in paths
+            if not is_indexer_q8(path)
+        ]
+        detail = ", ".join(
+            f"{path}={bits}-bit/gs{group_size}/{mode}"
+            for path, bits, group_size, mode in offenders[:4]
+        )
+        raise ValueError(
+            "Invalid GLM DSA indexer quantization: Q8 fusion requires every "
+            "full-indexer projection to use 8-bit affine quantization with "
+            f"group_size=64; found {detail}"
+        )
+    return True
 
 
 def _dequant_mla_proj_mode(args) -> str:

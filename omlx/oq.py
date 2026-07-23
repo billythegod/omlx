@@ -42,6 +42,9 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
+_GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+_GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+
 _MAX_MODEL_RAM_FRACTION = 0.8
 
 # Auto-built proxy for sensitivity measurement when the source model
@@ -147,6 +150,25 @@ class OQImatrixData:
     reused: bool = False
 
 
+def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for GLM DSA indexer projections.
+
+    The GLM sparse-attention indexer decides which tokens survive top-k
+    selection. Its three projections are tiny relative to the full MoE model,
+    so spending mixed-precision budget below Q8 buys negligible size savings
+    while making the saved checkpoint incompatible with the fused Q8 loader.
+    Keep backbone and preserved-MTP indexers on the same explicit format.
+    """
+    if config.get("model_type") != "glm_moe_dsa":
+        return None
+    path = _normalize_quant_path(path)
+    if ".self_attn.indexer." not in path:
+        return None
+    if not path.endswith(tuple(f".{name}" for name in _GLM_INDEXER_PROJECTIONS)):
+        return None
+    return dict(_GLM_INDEXER_Q8)
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> Union[bool, dict]:
@@ -181,6 +203,10 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    glm_indexer_override = _glm_indexer_q8_override(path, config)
+    if glm_indexer_override is not None:
+        return glm_indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -689,6 +715,16 @@ def _build_quant_plan(
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
+    # GLM DSA indexers are a format invariant, not an optional sensitivity
+    # boost. Seed them before pricing the plan and never let the bpw cap drop
+    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    for path in named_shapes:
+        if path in fixed_overrides:
+            continue
+        override = _glm_indexer_q8_override(path, config)
+        if override is not None:
+            boost_map[path] = override
+
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
 
@@ -707,7 +743,7 @@ def _build_quant_plan(
         base_bits,
         base_group_size,
         base_mode,
-        overrides=fixed_overrides,
+        overrides={**fixed_overrides, **boost_map},
     )
     total_bits_f = current_bpw * total_params
 
