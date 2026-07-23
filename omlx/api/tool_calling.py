@@ -222,6 +222,19 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
         return None
     ptype = raw_type.strip().lower()
     if ptype in _SCHEMA_STRING_TYPES:
+        # A JSON-quoted string literal (e.g. MiniMax emits "SF" for a string
+        # param) carries JSON encoding on the wire; decode it back to the
+        # underlying string.  Plain values that merely look like JSON (42,
+        # {"a": 1}) are kept verbatim so a string param never gets coerced to a
+        # non-string.
+        stripped = val.strip()
+        if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+            if isinstance(decoded, str):
+                return decoded
         return val
     if ptype in _SCHEMA_BOOL_TYPES:
         lowered = val.strip().lower()

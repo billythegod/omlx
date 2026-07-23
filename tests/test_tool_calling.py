@@ -3160,6 +3160,20 @@ class TestSchemaAwareFallbackCoercion:
         assert _coerce_param_value("true", "flag", props, "t") is True
         assert _coerce_param_value("null", "count", props, "t") is None
 
+    def test_string_type_decodes_json_quoted_literal(self):
+        """A JSON-quoted value for a string param decodes to the bare string."""
+        props = {"city": {"type": "string"}}
+        # Quoted literals (e.g. MiniMax) drop their JSON encoding.
+        assert _coerce_param_value('"SF"', "city", props, "t") == "SF"
+        assert _coerce_param_value('""', "city", props, "t") == ""
+        assert _coerce_param_value('"he said \\"hi\\""', "city", props, "t") == 'he said "hi"'
+        # Plain values that merely look like JSON stay verbatim as strings.
+        assert _coerce_param_value("SF", "city", props, "t") == "SF"
+        assert _coerce_param_value("42", "city", props, "t") == "42"
+        assert _coerce_param_value('{"a": 1}', "city", props, "t") == '{"a": 1}'
+        # An unbalanced quote is not a JSON literal; keep it raw.
+        assert _coerce_param_value('"unterminated', "city", props, "t") == '"unterminated'
+
     def test_union_type_list_keeps_legacy_behavior(self):
         """A JSON Schema union type list falls back to best-effort parsing."""
         props = {"v": {"type": ["string", "null"]}}
