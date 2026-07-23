@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -1696,8 +1697,9 @@ class Scheduler:
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
         # token where the new prompt diverges from what was cached.
-        # Populated only when debug logging is enabled — zero cost otherwise.
-        self._cache_probe_seqs: deque[tuple[str, list[int]]] = deque(maxlen=4)
+        # Always maintained (int32 arrays, maxlen=4) so large re-prefills
+        # can log their divergence point at INFO (#2333).
+        self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(maxlen=4)
 
         model_name_lower = (self.config.model_name or "").lower()
         default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
@@ -6113,14 +6115,23 @@ class Scheduler:
                 return i
         return n
 
-    def _log_prefix_divergence(self, request: Request) -> None:
-        """DEBUG-only prefix-cache miss diagnostic (issue #1003).
+    # A re-prefill this large is a seconds-long event worth one INFO line
+    # when a recently stored sequence shared at least a full block with the
+    # prompt (i.e. the cache was relevant but could not cover the request).
+    _REPREFILL_INFO_MIN_TOKENS = 4096
 
-        Compares the new prompt against recently stored cache sequences and
-        logs the first divergent token offset with decoded context on both
-        sides, so an always-miss report can be traced to the exact prompt
-        position (template re-render drift, client echo changes, eviction)
-        instead of guessing from hit counters.
+    def _log_prefix_divergence(self, request: Request) -> None:
+        """Prefix-cache miss diagnostics (issues #1003, #2333, #2349).
+
+        Compares the new prompt against recently stored cache sequences.
+        Large re-prefills where a stored sequence shared at least one full
+        block get a single INFO line naming the divergence position and the
+        reused span — the one-line answer to "why did this turn re-prefill"
+        (client prompt drift such as tool-schema changes or transcript
+        edits, vs cache loss where the shared prefix exceeds what was
+        served). Numbers only at INFO; the decoded token context around the
+        divergence stays at DEBUG to keep prompt content out of standard
+        logs.
         """
         prompt = request.prompt_token_ids or []
         if not prompt or not self._cache_probe_seqs:
@@ -6134,19 +6145,35 @@ class Scheduler:
             return
         cached = request.cached_tokens or 0
         reusable = min(len(prompt), len(best_seq))
-        block = self.config.paged_cache_block_size
+        block = max(1, self.config.paged_cache_block_size)
+        reprefill = len(prompt) - cached
+        if reprefill >= self._REPREFILL_INFO_MIN_TOKENS and best_p >= block:
+            logger.info(
+                "prefix cache: request %s re-prefills %d of %d tokens "
+                "(reused %d); closest stored sequence %s shares the first "
+                "%d of %d comparable tokens before diverging",
+                request.request_id,
+                reprefill,
+                len(prompt),
+                cached,
+                best_id,
+                best_p,
+                reusable,
+            )
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         logger.debug(
             f"Request {request.request_id}: prefix probe vs stored {best_id}: "
             f"common_prefix={best_p}/{reusable} tokens "
-            f"(~{best_p // max(1, block)} blocks of {block}), "
+            f"(~{best_p // block} blocks of {block}), "
             f"served cached_tokens={cached}, prompt={len(prompt)}"
         )
         if best_p < reusable:
             lo = max(0, best_p - 12)
             hi = best_p + 12
             try:
-                stored_ctx = self.tokenizer.decode(best_seq[lo:hi])
-                prompt_ctx = self.tokenizer.decode(prompt[lo:hi])
+                stored_ctx = self.tokenizer.decode(list(best_seq[lo:hi]))
+                prompt_ctx = self.tokenizer.decode(list(prompt[lo:hi]))
             except Exception:
                 stored_ctx = prompt_ctx = "<decode failed>"
             logger.debug(
@@ -6423,10 +6450,10 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
-        # DEBUG-only: trace where this prompt diverges from recently stored
-        # cache sequences (issue #1003 always-miss diagnosis).
-        if logger.isEnabledFor(logging.DEBUG):
-            self._log_prefix_divergence(request)
+        # Trace where this prompt diverges from recently stored cache
+        # sequences: one INFO line for large re-prefills (#2333/#2349
+        # triage), decoded token context at DEBUG (issue #1003).
+        self._log_prefix_divergence(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
@@ -9067,16 +9094,19 @@ class Scheduler:
                                                 f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                                 f"intermediate snapshots)"
                                             )
-                                # DEBUG-only divergence probe (issue #1003).
-                                # Record the exact token sequence submitted to
+                                # Divergence probe (issues #1003, #2333):
+                                # record the exact token sequence submitted to
                                 # store_cache, including boundary truncation.
-                                if logger.isEnabledFor(logging.DEBUG):
-                                    self._cache_probe_seqs.append(
-                                        (
-                                            request.request_id,
-                                            list(token_sequence_to_store),
-                                        )
+                                # Always maintained so the large-re-prefill
+                                # INFO line can name the divergence point;
+                                # int32 array keeps the deque(maxlen=4) at
+                                # ~400KB per 100k-token sequence.
+                                self._cache_probe_seqs.append(
+                                    (
+                                        request.request_id,
+                                        array("i", token_sequence_to_store),
                                     )
+                                )
                                 with self._phase_timer("store_cache_main_collect"):
                                     pre_eval_arrays = (
                                         self._collect_arrays_from_extracted_cache(
