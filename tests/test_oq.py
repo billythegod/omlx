@@ -34,6 +34,7 @@ from omlx.oq import (
     _build_streaming_proxy_for_sensitivity,
     _calibration_memory_budget,
     _checkpoint_storage_bytes,
+    _configure_minimax_shared_expert_layout,
     _config_expects_moe_expert_counts,
     _discover_sanitize_plan,
     _DiscoveredPlan,
@@ -54,6 +55,7 @@ from omlx.oq import (
     _measure_sensitivity,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
+    _normalize_sensitivity_map_override,
     _oqe_calibration_batch_plan,
     _perturb_bits_for,
     _progress_total_bytes,
@@ -62,6 +64,7 @@ from omlx.oq import (
     _should_quantize_tensor,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
+    _uses_minimax_mxfp8_scale_inv_source,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -118,6 +121,26 @@ class TestUniversalQuantPredicate:
             "model.layers.0.shared_expert_gate", module, moe_config
         )
         assert isinstance(result, dict) and result["bits"] == 8
+
+    def test_shared_expert_weights_are_8bit(self, moe_config, module):
+        result = universal_quant_predicate(
+            "model.layers.0.block_sparse_moe.shared_experts.down_proj",
+            module,
+            {**moe_config, "num_local_experts": 128},
+        )
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    def test_shared_expert_floor_survives_budget_plan(self, moe_config, module):
+        result = universal_quant_predicate(
+            "model.layers.0.block_sparse_moe.shared_experts.down_proj",
+            module,
+            {
+                **moe_config,
+                "num_local_experts": 128,
+                "_oq_use_budget_plan": True,
+            },
+        )
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
 
     def test_non_quantizable_module_skipped(self, dense_config, module):
         cfg = {
@@ -2982,6 +3005,43 @@ class TestOnTheFlyFp8Dequant:
         result = idx["layer.weight"]
         assert result.dtype == mx.bfloat16
 
+    def test_minimax_mxfp8_u8_scale_inv_can_pass_through_bit_exact(self, tmp_path):
+        weight = np.arange(64 * 64, dtype=np.uint8).reshape(64, 64)
+        scales = np.arange(64 * 2, dtype=np.uint8).reshape(64, 2)
+        path = str(tmp_path / "minimax_mxfp8.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": (
+                    weight.tobytes(),
+                    list(weight.shape),
+                    "F8_E4M3",
+                ),
+                "layer.weight_scale_inv": (
+                    scales.tobytes(),
+                    list(scales.shape),
+                    "U8",
+                ),
+            },
+        )
+
+        conservative = _LazyTensorIndex([path])
+        assert conservative.source_quant_info("layer.weight") is None
+
+        native = _LazyTensorIndex([path], allow_mxfp8_scale_inv_passthrough=True)
+        assert native.source_quant_info("layer.weight") == {
+            "kind": "minimax_mxfp8",
+            "bits": 8,
+            "group_size": 32,
+            "mode": "mxfp8",
+        }
+        packed_weight, packed_scales = native._load_packed("layer.weight")
+        mx.eval(packed_weight, packed_scales)
+
+        unpacked_bytes = np.asarray(packed_weight).view(np.uint8).reshape(weight.shape)
+        np.testing.assert_array_equal(unpacked_bytes, weight)
+        np.testing.assert_array_equal(np.asarray(packed_scales), scales)
+
     def test_mxfp_dot_scale_convention(self, tmp_path):
         """MXFP convention: key.weight (F8_E4M3) + key.scale (F8_E8M0)."""
         w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
@@ -4499,6 +4559,67 @@ class TestMeasureSensitivityQuantizedVlm:
 # =============================================================================
 
 
+class TestMiniMaxSharedExpertLayout:
+    @pytest.fixture
+    def config(self):
+        return {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3ForConditionalGeneration"],
+            "text_config": {
+                "model_type": "minimax_m3",
+                "num_hidden_layers": 60,
+                "n_shared_experts": 1,
+            },
+        }
+
+    def test_mixed_bit_oq_forces_unpacked_shared_expert(self, config):
+        assert _configure_minimax_shared_expert_layout(config, 4)
+        assert config["text_config"]["pack_shared_expert"] is False
+
+    def test_oq8_preserves_default_packed_layout(self, config):
+        assert not _configure_minimax_shared_expert_layout(config, 8)
+        assert "pack_shared_expert" not in config["text_config"]
+
+    def test_non_minimax_model_is_unchanged(self):
+        config = {
+            "model_type": "qwen3_moe",
+            "text_config": {"num_hidden_layers": 60, "n_shared_experts": 1},
+        }
+        assert not _configure_minimax_shared_expert_layout(config, 4)
+        assert "pack_shared_expert" not in config["text_config"]
+
+    def test_mxfp8_scale_inv_passthrough_requires_minimax_source(self, config):
+        config["quantization_config"] = {"quant_method": "mxfp8"}
+        assert _uses_minimax_mxfp8_scale_inv_source(config)
+
+        config["model_type"] = "qwen3_moe"
+        config["architectures"] = ["Qwen3MoeForCausalLM"]
+        config["text_config"]["model_type"] = "qwen3_moe"
+        assert not _uses_minimax_mxfp8_scale_inv_source(config)
+
+
+class TestSensitivityMapOverride:
+    def test_normalizes_selected_front_and_back_layers(self):
+        config = {"text_config": {"num_hidden_layers": 60}}
+        selected = {idx: 1.0 for idx in (*range(7), *range(53, 60))}
+
+        assert _normalize_sensitivity_map_override(config, selected) == selected
+
+    @pytest.mark.parametrize(
+        ("override", "match"),
+        [
+            ({}, "non-empty dict"),
+            ({60: 1.0}, "outside"),
+            ({0: 0.0}, "finite and > 0"),
+            ({0: float("nan")}, "finite and > 0"),
+        ],
+    )
+    def test_rejects_invalid_override(self, override, match):
+        config = {"num_hidden_layers": 60}
+        with pytest.raises(ValueError, match=match):
+            _normalize_sensitivity_map_override(config, override)
+
+
 class TestPrecomputedSensitivityMap:
     """Tests for the oq_sensitivity_map.json disk cache feature.
 
@@ -4555,6 +4676,76 @@ class TestPrecomputedSensitivityMap:
         _oq._measure_sensitivity.assert_not_called()
         _oq._measure_sensitivity_from_quantized_model.assert_not_called()
         _oq._build_proxy_for_sensitivity.assert_not_called()
+
+    def test_explicit_override_skips_cache_measurement_and_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 4,
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 8,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 256,
+                }
+            )
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"1": 99.0}), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        for name in (
+            "_measure_sensitivity",
+            "_measure_sensitivity_from_quantized_model",
+            "_build_proxy_for_sensitivity",
+        ):
+            monkeypatch.setattr(
+                _oq, name, MagicMock(side_effect=RuntimeError("should not call"))
+            )
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            sensitivity_map_override={0: 1.0, 3: 1.0},
+            auto_proxy_sensitivity=False,
+        )
+
+        for name in (
+            "_measure_sensitivity",
+            "_measure_sensitivity_from_quantized_model",
+            "_build_proxy_for_sensitivity",
+        ):
+            getattr(_oq, name).assert_not_called()
+        assert len(captured_configs) == 1
+        assert captured_configs[0]["_oq_sensitivity_map"] == {
+            "0": 1.0,
+            "3": 1.0,
+        }
 
     def test_sensitivity_map_used_in_quant_plan(self, tmp_path, monkeypatch):
         """The loaded sensitivity map is stored in config['_oq_sensitivity_map']

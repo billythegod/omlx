@@ -135,6 +135,118 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     return quant_method == "fp8" and _is_deepseek_v4_config(config)
 
 
+def _is_minimax_m3_config(config: dict) -> bool:
+    """Return whether a config resolves to the MiniMax M3 model family."""
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if config.get("model_type") in ("minimax_m3", "minimax_m3_vl"):
+        return True
+    if text_model_type in ("minimax_m3", "minimax_m3_vl"):
+        return True
+    architectures = list(config.get("architectures") or [])
+    if isinstance(text_config, dict):
+        architectures.extend(text_config.get("architectures") or [])
+    return any(str(arch).startswith("MiniMaxM3") for arch in architectures)
+
+
+def _uses_minimax_mxfp8_scale_inv_source(config: dict) -> bool:
+    """Return whether MiniMax's U8 scale-inverse layout is native MXFP8."""
+    if not _is_minimax_m3_config(config):
+        return False
+    quantization_configs = [config.get("quantization_config")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        quantization_configs.append(text_config.get("quantization_config"))
+    return any(
+        isinstance(quant_config, dict)
+        and str(quant_config.get("quant_method", "")).lower() == "mxfp8"
+        for quant_config in quantization_configs
+    )
+
+
+def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bool:
+    """Force an unpacked MiniMax shared expert for mixed-bit oQ outputs.
+
+    The packed MiniMax layout stores the always-on shared expert as the final
+    row of the routed SwitchLinear bank, which makes a per-module Q8 floor
+    impossible. Preserve the default packed layout when the whole bank is Q8.
+    """
+    if not _is_minimax_m3_config(config):
+        return False
+    if int(_LEVEL_BITS.get(oq_level, oq_level)) >= 8:
+        return False
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    if int(text_config.get("n_shared_experts") or 0) <= 0:
+        return False
+
+    text_config = dict(text_config)
+    text_config["pack_shared_expert"] = False
+    config["text_config"] = text_config
+    return True
+
+
+def _normalize_sensitivity_map_override(
+    config: dict,
+    sensitivity_map_override: dict[int | str, float] | None,
+) -> dict[int, float] | None:
+    """Validate an explicit positive layer-priority map.
+
+    Missing layers intentionally receive score zero. Keeping only selected,
+    positive layers also prevents the percentile threshold in the predicate
+    from treating a zero-filled map as if every layer were sensitive.
+    """
+    if sensitivity_map_override is None:
+        return None
+    if not isinstance(sensitivity_map_override, dict) or not sensitivity_map_override:
+        raise ValueError("sensitivity_map_override must be a non-empty dict")
+
+    text_config = config.get("text_config")
+    num_layers = int(
+        config.get("num_hidden_layers")
+        or (
+            text_config.get("num_hidden_layers", 0)
+            if isinstance(text_config, dict)
+            else 0
+        )
+        or 0
+    )
+    if num_layers <= 0:
+        raise ValueError(
+            "sensitivity_map_override requires num_hidden_layers in config"
+        )
+
+    normalized = {}
+    for raw_idx, raw_score in sensitivity_map_override.items():
+        if isinstance(raw_idx, bool):
+            raise ValueError("sensitivity layer indices must be integers")
+        try:
+            layer_idx = int(raw_idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid sensitivity layer index: {raw_idx!r}") from exc
+        if isinstance(raw_idx, float) and not raw_idx.is_integer():
+            raise ValueError(f"invalid sensitivity layer index: {raw_idx!r}")
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(
+                f"sensitivity layer index {layer_idx} is outside [0, {num_layers})"
+            )
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid sensitivity score for layer {layer_idx}: {raw_score!r}"
+            ) from exc
+        if not np.isfinite(score) or score <= 0:
+            raise ValueError(
+                f"sensitivity score for layer {layer_idx} must be finite and > 0"
+            )
+        normalized[layer_idx] = score
+    return dict(sorted(normalized.items()))
+
+
 @dataclass
 class QuantPlan:
     """Byte-budgeted mixed-precision plan for a single quantization run."""
@@ -258,6 +370,13 @@ def universal_quant_predicate(
     if "shared_expert_gate" in path and "gate_proj" not in path:
         return {"bits": 8, "group_size": 64, "mode": "affine"}
 
+    # Shared experts run for every token and must keep their precision floor
+    # even when the byte-budgeted plan is active. Keeping this before the
+    # budget-plan fast path also lets native MXFP8 shared weights be recognized
+    # as fixed source-precision passthrough tensors.
+    if "shared_expert" in path and not path.endswith("shared_expert_gate"):
+        return bits(8)
+
     if _is_vision_tensor(path):
         return False
 
@@ -338,9 +457,6 @@ def universal_quant_predicate(
     if "o_proj" in path and "shared_expert" not in path:
         if not is_moe:
             return bits(5)
-
-    if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-        return bits(8)
 
     if num_experts >= 512 and hidden_size >= 4096:
         if "gate_proj" in path and "shared_expert" not in path:
@@ -2258,7 +2374,12 @@ def estimate_bpw_and_size(
     # checkpoints with dtypes mx.load rejects (F8_E8M0 block scales) still
     # estimate. The logical view hides .scale companions and reports
     # pre-quantized weights at their unpacked logical shape.
-    idx = _LazyTensorIndex(weight_files)
+    idx = _LazyTensorIndex(
+        weight_files,
+        allow_mxfp8_scale_inv_passthrough=(
+            _uses_minimax_mxfp8_scale_inv_source(config)
+        ),
+    )
     logical = idx.logical_metadata()
 
     named_shapes = {}
@@ -3134,7 +3255,13 @@ class _LazyTensorIndex:
         "F8_E8M0": 1,
     }
 
-    def __init__(self, weight_files):
+    def __init__(
+        self,
+        weight_files,
+        *,
+        allow_mxfp8_scale_inv_passthrough: bool = False,
+    ):
+        self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -3209,9 +3336,31 @@ class _LazyTensorIndex:
         """
         w_shape, w_dtype = self._index[wk][4], self._index[wk][5]
         s_shape, s_dtype = self._index[sk][4], self._index[sk][5]
-        if len(w_shape) != 2 or len(s_shape) != 2 or not sk.endswith(".scale"):
+        if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
+        # MiniMax MXFP8 checkpoints store E8M0 exponent bytes under the
+        # ``weight_scale_inv`` suffix even though the model sanitizer passes
+        # them directly to MLX as ``.scales``. Enable this only from an
+        # explicit MiniMax+MXFP8 config so ordinary vLLM scale-inverse FP8
+        # checkpoints retain the conservative dequantize/requantize path.
+        if (
+            self._allow_mxfp8_scale_inv_passthrough
+            and sk.endswith(".weight_scale_inv")
+            and w_dtype == "F8_E4M3"
+            and s_dtype == "U8"
+            and cols % 32 == 0
+            and cols % 4 == 0
+            and tuple(s_shape) == (rows, cols // 32)
+        ):
+            return {
+                "kind": "minimax_mxfp8",
+                "bits": 8,
+                "group_size": 32,
+                "mode": "mxfp8",
+            }
+        if not sk.endswith(".scale"):
+            return None
         # FP4-packed experts (DeepSeek V4): int8 bytes carry 2 fp4 values
         # each, e8m0 scale per 32 logical values -> 16 bytes per group.
         if (
@@ -4099,6 +4248,7 @@ def quantize_oq_streaming(
     imatrix_strict: bool = False,
     imatrix_num_samples: int = 128,
     imatrix_seq_length: int = 512,
+    sensitivity_map_override: dict[int | str, float] | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -4142,6 +4292,10 @@ def quantize_oq_streaming(
             of falling back to standard oQ quantization for those tensors.
         imatrix_num_samples: Calibration sample count for imatrix collection.
         imatrix_seq_length: Calibration sequence length for imatrix collection.
+        sensitivity_map_override: Optional explicit positive layer-priority
+            scores. When supplied, skips cached/measured sensitivity and the
+            sensitivity proxy path. Missing layers receive score zero. This
+            does not skip oQe imatrix calibration when enhanced is True.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -4181,6 +4335,15 @@ def quantize_oq_streaming(
     with open(config_path) as f:
         config = json.load(f)
     _validate_oq_dtype_for_model(config, dtype)
+    static_sensitivity_map = _normalize_sensitivity_map_override(
+        config, sensitivity_map_override
+    )
+    if _configure_minimax_shared_expert_layout(config, oq_level):
+        logger.info(
+            "oQ%s: MiniMax M3 shared expert will remain separate for mixed-bit "
+            "quantization",
+            f"{oq_level:g}",
+        )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
     output.mkdir(parents=True, exist_ok=True)
@@ -4193,7 +4356,12 @@ def quantize_oq_streaming(
 
     cb("loading", 8.0, "Indexing source weights")
 
-    all_weights = _LazyTensorIndex(weight_files)
+    all_weights = _LazyTensorIndex(
+        weight_files,
+        allow_mxfp8_scale_inv_passthrough=(
+            _uses_minimax_mxfp8_scale_inv_source(config)
+        ),
+    )
     if (
         preserve_mtp
         and not any(_is_mtp_tensor(k) for k in all_weights.keys())
@@ -4221,7 +4389,7 @@ def quantize_oq_streaming(
         fallback_system_bytes=_system_ram,
     )
     _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
-    if _model_requires_proxy:
+    if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
             f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
             f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
@@ -4232,6 +4400,12 @@ def quantize_oq_streaming(
             "Metal available="
             f"{_format_size(int(_calibration_budget['metal_available_bytes']))}). "
             "Full-model calibration will use a proxy."
+        )
+    elif _model_requires_proxy:
+        logger.info(
+            "oQ%s: static sensitivity override supplied; skipping the "
+            "full-model sensitivity proxy",
+            f"{oq_level:g}",
         )
 
     # Memory-safe calibration proxy, shared between oQe imatrix collection and
@@ -4357,7 +4531,14 @@ def quantize_oq_streaming(
             "zero_count_experts": 0,
         }
 
-    if sensitivity_map_path.exists():
+    if static_sensitivity_map is not None:
+        sensitivity_map = static_sensitivity_map
+        logger.info(
+            "oQ%s: static sensitivity override applied to layers %s",
+            f"{oq_level:g}",
+            ",".join(str(idx) for idx in sensitivity_map),
+        )
+    elif sensitivity_map_path.exists():
         sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
         logger.info(f"{sensitivity_map_path} found, skipping measuring.")
     else:

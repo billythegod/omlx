@@ -819,16 +819,27 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
+def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
+    """Resolve the explicit MiniMax shared-expert layout override."""
+    configured = getattr(args, "pack_shared_expert", None)
+    if configured is not None:
+        return bool(configured)
+    return bool(
+        args.n_shared_experts == 1
+        and args.shared_intermediate_size == args.intermediate_size
+    )
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
 
     mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
-    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
-    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
-    the unpacked MoE layout, so strict loading sees those tensors as unknown.
-    Hide only the safetensors ``format=mlx`` metadata during this load so the
-    upstream sanitize path runs before quantization and load_weights.
+    ``switch_mlp`` when ``Model.sanitize`` runs. MLX-format checkpoints skip
+    sanitize upstream, while MiniMax checkpoints can carry either packed or
+    explicitly unpacked mixed-bit MoE weights. Hide only the safetensors
+    ``format=mlx`` metadata during this load so the configured sanitize path
+    runs before quantization and load_weights.
     """
     if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
         yield
@@ -879,11 +890,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
         return handle
 
     def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
-        pack_shared = (
-            args.n_shared_experts == 1
-            and args.shared_intermediate_size == args.intermediate_size
-        )
-        if not pack_shared:
+        if not _should_pack_minimax_m3_shared_expert(args):
             return 0
 
         packed = 0
