@@ -26,10 +26,14 @@ from omlx.oq import (
     _PROXY_QUANT_GROUP_SIZE,
     _ROUTED_LAYER_BOOST_LEVELS,
     OQ_LEVELS,
+    OQImatrixCollector,
+    OQImatrixEntry,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
     _build_streaming_proxy_for_sensitivity,
+    _calibration_memory_budget,
+    _checkpoint_storage_bytes,
     _config_expects_moe_expert_counts,
     _discover_sanitize_plan,
     _DiscoveredPlan,
@@ -38,10 +42,10 @@ from omlx.oq import (
     _forward_layer,
     _forward_layer_result,
     _get_predicate_bits,
-    _ImatrixCaptureWrapper,
     _imatrix_expert_coverage_stats,
     _imatrix_expert_coverage_sufficient,
     _imatrix_requires_expert_counts,
+    _ImatrixCaptureWrapper,
     _is_audio_tensor,
     _is_moe_router,
     _is_vision_tensor,
@@ -50,6 +54,7 @@ from omlx.oq import (
     _measure_sensitivity,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
+    _oqe_calibration_batch_plan,
     _perturb_bits_for,
     _progress_total_bytes,
     _quantize_chunked,
@@ -57,8 +62,6 @@ from omlx.oq import (
     _should_quantize_tensor,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
-    OQImatrixCollector,
-    OQImatrixEntry,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -2398,8 +2401,7 @@ class TestDiscoverSanitizePlan:
 
 
 class TestModelExceedsRamGuard:
-    """Tests for the OOM guard that skips memory-intensive paths when a model
-    is larger than system RAM."""
+    """Tests for the full-model calibration memory admission guard."""
 
     @pytest.fixture
     def sf_file(self, tmp_path):
@@ -2421,17 +2423,149 @@ class TestModelExceedsRamGuard:
         idx = _LazyTensorIndex([path])
         assert idx.nbytes() == expected_bytes
 
-    def test_guard_boundary(self, sf_file):
-        """Guard uses strict > with _MAX_MODEL_RAM_FRACTION of system RAM."""
+    def test_checkpoint_storage_includes_safetensors_header(self, sf_file):
         path, expected_bytes = sf_file
-        idx = _LazyTensorIndex([path])
-        nbytes = idx.nbytes()
-        # Exceeds when "system RAM" is small enough
-        small_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) - 1
-        assert nbytes > int(small_ram * _MAX_MODEL_RAM_FRACTION)
-        # Does not exceed when system RAM is large
-        large_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) + 1
-        assert not (nbytes > int(large_ram * _MAX_MODEL_RAM_FRACTION))
+
+        assert _checkpoint_storage_bytes([path]) == path.stat().st_size
+        assert path.stat().st_size > expected_bytes
+
+    def test_checkpoint_storage_counts_hidden_fp8_scales(self, tmp_path):
+        weight = np.zeros((64, 64), dtype=np.uint8)
+        scales = np.full((64, 2), 127, dtype=np.uint8)
+        path = tmp_path / "mxfp8.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                "layer.weight": (
+                    weight.tobytes(),
+                    list(weight.shape),
+                    "F8_E4M3",
+                ),
+                "layer.weight_scale_inv": (
+                    scales.tobytes(),
+                    list(scales.shape),
+                    "U8",
+                ),
+            },
+        )
+
+        index = _LazyTensorIndex([path])
+
+        assert index.nbytes() == weight.nbytes
+        assert _checkpoint_storage_bytes([path]) >= weight.nbytes + scales.nbytes
+
+    @pytest.mark.parametrize("capacity_gib", [16, 32, 64])
+    def test_budget_reserves_25_percent_on_smaller_systems(
+        self, monkeypatch, capacity_gib
+    ):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        capacity = capacity_gib * gib
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
+        )
+
+        budget = _calibration_memory_budget()
+
+        assert budget["capacity_bytes"] == capacity
+        assert budget["model_limit_bytes"] == int(capacity * 0.75)
+        assert budget["reserve_bytes"] == capacity - int(capacity * 0.75)
+
+    def test_budget_uses_smaller_metal_working_set(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 512 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 464 * gib
+        )
+
+        budget = _calibration_memory_budget(413 * gib)
+
+        assert budget["capacity_bytes"] == 464 * gib
+        assert budget["model_limit_bytes"] == 348 * gib
+        assert budget["requires_proxy"] is True
+
+    def test_guard_boundary_is_strict(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        capacity = 4000
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
+        )
+
+        at_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+        assert _calibration_memory_budget(at_limit)["requires_proxy"] is False
+        assert _calibration_memory_budget(at_limit + 1)["requires_proxy"] is True
+
+
+class TestOqeCalibrationBatchPlan:
+    def test_subtracts_lazy_model_footprint(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 64 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 48 * gib
+        )
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=40 * gib,
+        )
+
+        assert plan["live_available_bytes"] == 48 * gib
+        assert plan["remaining_available_bytes"] == 8 * gib
+        assert plan["fits_one_sample"] is True
+
+    def test_near_limit_falls_back_to_one_sample(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        mib = 1024**2
+        live = 1024 * mib
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: live)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: live)
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=1000 * mib,
+        )
+
+        assert plan["micro_batch_size"] == 1
+        assert plan["fits_one_sample"] is True
+
+    def test_reports_when_one_sample_cannot_fit(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        mib = 1024**2
+        live = 1024 * mib
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: live)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: live)
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=1020 * mib,
+        )
+
+        assert plan["micro_batch_size"] == 1
+        assert plan["fits_one_sample"] is False
 
 
 class TestQuantProgressTotalBytes:
@@ -2629,10 +2763,13 @@ class TestSensitivityRequiredEnforcement:
         )
         (src / "config.json").write_text('{"model_type": "llama"}')
 
-        # Force OOM by pretending system has 0 bytes of RAM.
+        # Force proxy admission by pretending no calibration memory is live.
+        from omlx import oq as _oq
         from omlx import settings as _settings
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
         with pytest.raises(RuntimeError, match="auto_proxy_sensitivity is disabled"):
             quantize_oq_streaming(
@@ -2671,6 +2808,9 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
 
         from omlx import oq as _oq
+
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
         # Stub the auto-proxy sensitivity path so the run reaches discovery.
         monkeypatch.setattr(
@@ -2717,6 +2857,9 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
         from omlx import oq as _oq
 
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
+
         monkeypatch.setattr(
             _oq,
             "_build_streaming_proxy_for_sensitivity",
@@ -2730,6 +2873,87 @@ class TestSensitivityRequiredEnforcement:
                 4,
                 auto_proxy_sensitivity=True,
             )
+
+    def test_oversized_proxy_is_rejected_and_cleaned(self, tmp_path, monkeypatch):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as oq_module
+
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
+        proxy = tmp_path / "proxy"
+
+        def _fake_build(*_args, **_kwargs):
+            proxy.mkdir()
+            (proxy / "model.safetensors").write_bytes(b"x" * 800)
+            return proxy
+
+        monkeypatch.setattr(oq_module, "_build_proxy_for_sensitivity", _fake_build)
+
+        with pytest.raises(RuntimeError, match="calibration proxy is still too large"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=True,
+            )
+
+        assert not proxy.exists()
+
+    def test_oqe_uses_proxy_when_source_exceeds_live_limit(self, tmp_path, monkeypatch):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as oq_module
+
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
+        proxy = tmp_path / "proxy"
+        build_proxy = MagicMock()
+
+        def _fake_build(*_args, **_kwargs):
+            build_proxy()
+            proxy.mkdir()
+            (proxy / "model.safetensors").write_bytes(b"x" * 100)
+            return proxy
+
+        def _fake_imatrix(*_args, load_path_factory=None, **_kwargs):
+            assert load_path_factory is not None
+            assert load_path_factory() == str(proxy)
+            raise RuntimeError("stop after proxy selection")
+
+        monkeypatch.setattr(oq_module, "_build_proxy_for_sensitivity", _fake_build)
+        monkeypatch.setattr(oq_module, "_load_or_collect_imatrix", _fake_imatrix)
+
+        with pytest.raises(RuntimeError, match="stop after proxy selection"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                enhanced=True,
+            )
+
+        build_proxy.assert_called_once()
+        assert not proxy.exists()
 
 
 # =============================================================================
@@ -3509,8 +3733,11 @@ class TestQuantizeOqStreamingFp8:
         _make_fp8_model(src, n_layers=2, hidden=128, fp8_convention="mxfp")
         out = tmp_path / "out"
 
-        # Patch system RAM to 1 byte — any model exceeds it
-        with patch("omlx.settings.get_system_memory", return_value=1):
+        # Patch live calibration capacity to 1 byte — any model exceeds it.
+        with (
+            patch("omlx.oq._system_available_memory_bytes", return_value=1),
+            patch("omlx.oq._metal_available_memory_bytes", return_value=1),
+        ):
             quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         assert (out / "config.json").exists()
@@ -3532,7 +3759,10 @@ class TestQuantizeOqStreamingFp8:
         tmpdir = tempfile.gettempdir()
         before = set(os.listdir(tmpdir))
 
-        with patch("omlx.settings.get_system_memory", return_value=1):
+        with (
+            patch("omlx.oq._system_available_memory_bytes", return_value=1),
+            patch("omlx.oq._metal_available_memory_bytes", return_value=1),
+        ):
             quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         # No new safetensors scratch files in tmp

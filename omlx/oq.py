@@ -45,7 +45,7 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 
-_MAX_MODEL_RAM_FRACTION = 0.8
+_MAX_MODEL_RAM_FRACTION = 0.75
 
 # Auto-built proxy for sensitivity measurement when the source model
 # exceeds available RAM. Uniform 4-bit affine quant — same shape as a
@@ -2469,6 +2469,53 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _checkpoint_storage_bytes(weight_files) -> int:
+    """Return the complete on-disk size of checkpoint weight shards.
+
+    Calibration loads native quantization metadata such as FP8 block scales
+    alongside the visible model weights.  Using the logical tensor index size
+    undercounts those hidden scale tensors, so memory admission must use the
+    complete safetensors storage footprint instead.
+    """
+    total = 0
+    for path in weight_files:
+        try:
+            total += int(Path(path).stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def _calibration_memory_budget(
+    checkpoint_bytes: int = 0,
+    *,
+    fallback_system_bytes: int = 0,
+) -> dict[str, int | bool]:
+    """Return the live memory budget for full-model calibration forwards.
+
+    Apple Silicon uses unified memory, but Metal exposes a recommended working
+    set that can be smaller than physical RAM.  The safe capacity is therefore
+    the smaller positive value of live system memory and remaining Metal
+    working-set memory.  A proportional 25% reserve scales down to 16/32 GiB
+    machines without imposing a fixed reserve that would reject every model.
+    """
+    system_available = _system_available_memory_bytes()
+    metal_available = _metal_available_memory_bytes()
+    candidates = [value for value in (system_available, metal_available) if value > 0]
+    capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
+    model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    checkpoint_bytes = max(0, int(checkpoint_bytes))
+    return {
+        "system_available_bytes": int(system_available),
+        "metal_available_bytes": int(metal_available),
+        "capacity_bytes": int(capacity),
+        "model_limit_bytes": int(model_limit),
+        "reserve_bytes": max(0, int(capacity) - int(model_limit)),
+        "checkpoint_bytes": checkpoint_bytes,
+        "requires_proxy": checkpoint_bytes > model_limit,
+    }
+
+
 def _nested_config_int(config: dict, keys: tuple[str, ...], default: int = 0) -> int:
     text_config = config.get("text_config", {})
     for source in (config, text_config if isinstance(text_config, dict) else {}):
@@ -2488,6 +2535,7 @@ def _oqe_calibration_batch_plan(
     *,
     requested_samples: int,
     seq_length: int,
+    model_bytes: int = 0,
 ) -> dict[str, Any]:
     """Choose an oQe calibration micro-batch from live memory and model shape."""
     hidden_size = _nested_config_int(
@@ -2515,11 +2563,16 @@ def _oqe_calibration_batch_plan(
         if system_available > 0 or metal_available > 0
         else 0
     )
+    model_bytes = max(0, int(model_bytes))
+    remaining_available = max(0, live_available - model_bytes)
 
     if live_available > 0:
         # Cap activation materialization even on very large-memory machines:
         # MoE capture creates large temporary NumPy arrays per module.
-        capture_budget = min(768 * 1024**2, max(128 * 1024**2, live_available // 100))
+        # The model is loaded lazily, so live availability still includes its
+        # future resident weights here.  Subtract the checkpoint footprint
+        # before choosing a micro-batch and allow the result to fall to one.
+        capture_budget = min(768 * 1024**2, remaining_available // 100)
     else:
         capture_budget = 256 * 1024**2
 
@@ -2535,6 +2588,11 @@ def _oqe_calibration_batch_plan(
         "system_available_bytes": int(system_available),
         "metal_available_bytes": int(metal_available),
         "live_available_bytes": int(live_available),
+        "model_bytes": int(model_bytes),
+        "remaining_available_bytes": int(remaining_available),
+        "fits_one_sample": bool(
+            live_available <= 0 or remaining_available >= sample_bytes
+        ),
         "hidden_size": int(hidden_size),
         "num_experts": int(num_experts),
         "top_k": int(top_k),
@@ -4065,9 +4123,10 @@ def quantize_oq_streaming(
             are stripped *and* the output config's mtp_num_hidden_layers /
             num_nextn_predict_layers are normalized to 0 to keep the
             quantized model self-consistent.
-        auto_proxy_sensitivity: When True (default) and the source model
-            exceeds available RAM, automatically build a temporary uniform
-            4-bit proxy on disk and run sensitivity measurement on it,
+        auto_proxy_sensitivity: When True (default) and the source checkpoint
+            exceeds 75% of live system/Metal calibration capacity,
+            automatically build a temporary uniform 4-bit proxy on disk and
+            run sensitivity measurement on it,
             preserving oQ's data-driven mixed-precision allocation. When
             False, the quantization aborts on RAM-exceeding models with a
             RuntimeError so callers always get a real sensitivity-driven
@@ -4155,18 +4214,28 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    _model_bytes = all_weights.nbytes()
+    _model_bytes = _checkpoint_storage_bytes(weight_files)
     _system_ram = _get_system_memory()
-    _model_exceeds_ram = _model_bytes > int(_system_ram * _MAX_MODEL_RAM_FRACTION)
-    if _model_exceeds_ram:
+    _calibration_budget = _calibration_memory_budget(
+        _model_bytes,
+        fallback_system_bytes=_system_ram,
+    )
+    _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
+    if _model_requires_proxy:
         logger.info(
-            f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
-            f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
-            "OOM-prone paths will be skipped"
+            f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+            f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
+            f"capacity ({_format_size(int(_calibration_budget['capacity_bytes']))}; "
+            f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
+            "system available="
+            f"{_format_size(int(_calibration_budget['system_available_bytes']))}, "
+            "Metal available="
+            f"{_format_size(int(_calibration_budget['metal_available_bytes']))}). "
+            "Full-model calibration will use a proxy."
         )
 
-    # RAM-safe calibration proxy, shared between oQe imatrix collection and
-    # auto-proxy sensitivity so an exceeds-RAM run builds it at most once.
+    # Memory-safe calibration proxy, shared between oQe imatrix collection and
+    # auto-proxy sensitivity so an over-budget run builds it at most once.
     # Built lazily (an imatrix cache hit never pays for it) and deleted as
     # soon as the last calibration pass is done.
     _ram_safe_proxy_dir: Path | None = None
@@ -4175,19 +4244,41 @@ def quantize_oq_streaming(
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
             logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) "
-                f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
-                f"({_system_ram / 1e9:.1f} GB). Building a uniform "
+                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                "exceeds the "
+                f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                "full-model calibration limit. Building a uniform "
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk for the calibration "
                 "passes."
             )
-            _ram_safe_proxy_dir = _build_proxy_for_sensitivity(
+            candidate = _build_proxy_for_sensitivity(
                 model_path,
                 config=config,
                 dtype=dtype,
                 working_dir=str(output.parent),
                 trust_remote_code=trust_remote_code,
                 preserve_mtp=preserve_mtp,
+            )
+            proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
+            proxy_budget = _calibration_memory_budget(
+                proxy_bytes,
+                fallback_system_bytes=_system_ram,
+            )
+            if int(proxy_budget["capacity_bytes"]) > 0 and bool(
+                proxy_budget["requires_proxy"]
+            ):
+                shutil.rmtree(candidate, ignore_errors=True)
+                raise RuntimeError(
+                    "calibration proxy is still too large for the live memory "
+                    f"budget (proxy={_format_size(proxy_bytes)}, "
+                    f"limit={_format_size(int(proxy_budget['model_limit_bytes']))}, "
+                    f"capacity={_format_size(int(proxy_budget['capacity_bytes']))})"
+                )
+            _ram_safe_proxy_dir = candidate
+            logger.info(
+                f"oQ{oq_level:g}: calibration proxy size "
+                f"{_format_size(proxy_bytes)} within "
+                f"{_format_size(int(proxy_budget['model_limit_bytes']))} limit"
             )
         return _ram_safe_proxy_dir
 
@@ -4243,7 +4334,7 @@ def quantize_oq_streaming(
                 progress_start=13.0,
                 progress_end=18.0,
                 load_path_factory=(
-                    _imatrix_load_path if _model_exceeds_ram else None
+                    _imatrix_load_path if _model_requires_proxy else None
                 ),
             )
         except BaseException:
@@ -4286,10 +4377,7 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-        elif (
-            not _model_exceeds_ram
-            and _uses_quantized_source_sensitivity(config)
-        ):
+        elif not _model_requires_proxy and _uses_quantized_source_sensitivity(config):
             # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
             # measurement only perturbs float Linears, so measure on the source
             # itself with the re-quantization perturbation instead.
@@ -4305,18 +4393,20 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-        elif _model_exceeds_ram and auto_proxy_sensitivity:
+        elif _model_requires_proxy and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
-                f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
-                f"({_system_ram / 1e9:.1f} GB). Auto-building a uniform "
+                f"oQ{oq_level:g}: checkpoint size ({_format_size(_model_bytes)}) "
+                "exceeds the "
+                f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                "full-model calibration limit. Auto-building a uniform "
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
             try:
                 _proxy_dir = _ensure_ram_safe_proxy()
                 logger.info(
-                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
+                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, "
+                    "measuring sensitivity"
                 )
                 sensitivity_map = _measure_sensitivity_from_quantized_model(
                     str(_proxy_dir),
@@ -4335,10 +4425,10 @@ def quantize_oq_streaming(
                 ) from e
             finally:
                 _cleanup_ram_safe_proxy()
-        elif _model_exceeds_ram:
+        elif _model_requires_proxy:
             raise RuntimeError(
                 f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
-                "of system RAM and auto_proxy_sensitivity is disabled. "
+                "of live calibration memory and auto_proxy_sensitivity is disabled. "
                 "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
                 "with a pre-quantized version of this model, or run on a "
                 "machine with enough RAM."
@@ -4370,8 +4460,8 @@ def quantize_oq_streaming(
         )
 
     # Calibration passes are done — drop the RAM-safe proxy (built when the
-    # source exceeds system RAM; a cached sensitivity map plus an imatrix
-    # cache hit means it was never built at all).
+    # source exceeds live calibration capacity; a cached sensitivity map plus
+    # an imatrix cache hit means it was never built at all).
     _cleanup_ram_safe_proxy()
 
     cb(
@@ -4396,13 +4486,14 @@ def quantize_oq_streaming(
                 f"{len(all_weights)} output tensors"
             )
         except Exception as e:
-            if _model_exceeds_ram:
+            if _model_requires_proxy:
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
                     f"failed ({e}) and the eager fallback is unsafe with "
-                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
-                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
-                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
+                    f"checkpoint size {_format_size(_model_bytes)} exceeding "
+                    "the "
+                    f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                    "full-model calibration limit. Run on a machine with "
                     "enough RAM, or extend _TrackedTensor to cover the "
                     "indexing pattern the sanitize uses."
                 ) from e
@@ -5536,6 +5627,7 @@ def _collect_imatrix_from_model(
     progress_callback=None,
     progress_start: float = 13.0,
     progress_end: float = 18.0,
+    model_bytes: int = 0,
 ) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
     adaptive_max_samples = max(
         int(num_samples),
@@ -5573,7 +5665,16 @@ def _collect_imatrix_from_model(
         config,
         requested_samples=step_samples,
         seq_length=seq_length,
+        model_bytes=model_bytes,
     )
+    if not batch_plan["fits_one_sample"]:
+        collector.restore(model)
+        raise RuntimeError(
+            "oQe imatrix: insufficient calibration memory after model load "
+            f"(available={_format_size(int(batch_plan['live_available_bytes']))}, "
+            f"model={_format_size(int(batch_plan['model_bytes']))}, "
+            f"one sample={_format_size(int(batch_plan['estimated_sample_bytes']))})"
+        )
     micro_batch_size = int(batch_plan["micro_batch_size"])
     processed_samples = 0
     micro_batches = 0
@@ -5584,11 +5685,13 @@ def _collect_imatrix_from_model(
     coverage = _imatrix_expert_coverage_stats(collector.entries)
     logger.info(
         "oQe imatrix: adaptive max=%d, step=%d, micro-batch=%d "
-        "(available=%s, capture budget=%s)",
+        "(available=%s, model=%s, remaining=%s, capture budget=%s)",
         max_samples,
         step_samples,
         micro_batch_size,
         _format_size(int(batch_plan["live_available_bytes"])),
+        _format_size(int(batch_plan["model_bytes"])),
+        _format_size(int(batch_plan["remaining_available_bytes"])),
         _format_size(int(batch_plan["capture_budget_bytes"])),
     )
     try:
@@ -5836,6 +5939,7 @@ def _collect_imatrix(
             restore_mtp_active()
 
     try:
+        model_bytes = _checkpoint_storage_bytes(Path(model_path).glob("*.safetensors"))
         return _collect_imatrix_from_model(
             model,
             tokenizer,
@@ -5846,6 +5950,7 @@ def _collect_imatrix(
             progress_callback=progress_callback,
             progress_start=progress_start,
             progress_end=progress_end,
+            model_bytes=model_bytes,
         )
     finally:
         del model, tokenizer
@@ -5929,9 +6034,9 @@ def _load_or_collect_imatrix(
         calib_dataset,
     )
     # ``load_path_factory`` swaps in an alternate checkpoint for the
-    # calibration forwards (a RAM-safe quantized proxy of the source when
-    # the source exceeds system RAM). Resolved only on a cache miss so a
-    # reusable cache never pays the proxy build. The cache signature stays
+    # calibration forwards (a memory-safe quantized proxy of the source when
+    # the source exceeds live calibration capacity). Resolved only on a cache
+    # miss so a reusable cache never pays the proxy build. The cache signature stays
     # keyed to the source checkpoint either way.
     load_path = model_path
     if load_path_factory is not None:
@@ -6187,8 +6292,8 @@ def _build_proxy_for_sensitivity(
 ) -> Path:
     """Build a temporary uniform 4-bit proxy for calibration passes.
 
-    Used when the source model exceeds available RAM and full-fp16
-    sensitivity measurement / oQe imatrix collection is not feasible. The
+    Used when the source model exceeds the live calibration budget and
+    full-fp16 sensitivity measurement / oQe imatrix collection is not feasible. The
     proxy keeps oQ data-driven; without it, quantize_oq_streaming aborts
     the run with a RuntimeError.
 
