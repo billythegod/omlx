@@ -180,7 +180,21 @@ class InklingShortConvolution(nn.Module):
             if stash is None:
                 stash = {}
                 cache._omlx_verify_xp = stash
-            stash[self.conv_idx] = xp
+            # OMLX: MTP head-block conv caches set ``_omlx_stash_rows`` so
+            # the stash keeps a ROLLING input window instead of just the
+            # last forward — the multi-block head cycle rewinds provisional
+            # rows across cycles whose windows can be longer than the last
+            # forward. Trunk caches leave it unset and keep the exact
+            # last-forward stash (byte-identical path).
+            rows = getattr(cache, "_omlx_stash_rows", 0)
+            if rows:
+                prev = stash.get(self.conv_idx)
+                roll = xp if prev is None else mx.concatenate([prev, xf], axis=1)
+                if roll.shape[1] > rows:
+                    roll = roll[:, -rows:, :]
+                stash[self.conv_idx] = roll
+            else:
+                stash[self.conv_idx] = xp
         else:
             xp = mx.pad(xf, [(0, 0), (K - 1, 0), (0, 0)])
         out = self.conv(xp.astype(self.conv.weight.dtype)).astype(mx.float32)

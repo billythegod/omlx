@@ -497,6 +497,16 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
 def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
     if not _mtp_common_eligible(gen_batch):
         return False
+    model = getattr(gen_batch, "model", None)
+    if getattr(model, "_omlx_mtp_rowwise_unsupported", False) or getattr(
+        getattr(model, "_language_model", None),
+        "_omlx_mtp_rowwise_unsupported",
+        False,
+    ):
+        # Multi-block window heads (inkling) keep per-request cycle state
+        # on the cache list; the row-wise extract/merge path does not
+        # model that.
+        return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) <= 1:
         return False
@@ -1952,6 +1962,15 @@ def _chain_next_drafts(
     )
     if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
         hidden_rows = _trunk_norm_module(model)(hidden_rows)
+
+    # Multi-block heads (inkling) route fold/chain by a per-cycle pass
+    # counter on the cache list; reset it before the fold. Single-block
+    # heads have no hook and are unaffected.
+    begin = getattr(model, "mtp_begin_cycle", None) or getattr(
+        getattr(model, "_language_model", None), "mtp_begin_cycle", None
+    )
+    if begin is not None:
+        begin(state.mtp_cache, depth)
 
     n = committed.shape[0]
     logits, head_hidden = model.mtp_forward(

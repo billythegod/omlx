@@ -7,8 +7,19 @@ for Inkling Small. MIT licensed like the rest of mlx-vlm.
 Byte-identical to the PR head except for changes marked with `OMLX:`
 comments in `language.py` (batched right-padded prefill support:
 conv_mask wiring, lengths-aware conv state writes, per-sequence key
-masking and log-tau positions, per-layer cache.advance; and an explicit
-error for configs missing `dense_intermediate_size`).
+masking and log-tau positions, per-layer cache.advance; an explicit
+error for configs missing `dense_intermediate_size`; MTP verify
+rollback conv-input stashes, with an opt-in rolling window
+`_omlx_stash_rows` for the MTP head-block caches).
+
+The Lightning MTP runtime (`patches/mlx_vlm_mtp/inkling_vlm_runtime.py`)
+deliberately does NOT follow upstream mlx-vlm's
+`speculative/drafters/inkling_mtp` drafter: that reference only folds
+block 0 and snapshot-restores per round, leaving depth blocks 1..7 with
+empty caches (measured per-depth agreement 0.68/0.45/0.19/0.00). It
+follows vLLM's Inkling MTP semantics instead (vllm-project/vllm#48768:
+per-depth stateful caches, uniform-window chained passes, double-normed
+embedding input), measured 0.87/0.76/0.67/0.61 with the same weights.
 
 `processing_inkling.py` is NOT from mlx-vlm: it is a torch-free numpy/PIL
 port of transformers 5.14's Inkling processors (Apache-2.0), needed
