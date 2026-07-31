@@ -264,6 +264,13 @@ def maybe_apply_pre_load_patches(
     if apply_m5_gather_qmm_workaround():
         logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
 
+    # Model-independent: ArraysCache.extract lacks the None-slot guard its
+    # filter/extend/merge siblings have; early-aborted requests on
+    # CacheList(KVCache, ArraysCache) models crash without it.
+    from ..patches.arrays_cache_extract import apply_arrays_cache_extract_guard
+
+    apply_arrays_cache_extract_guard()
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
