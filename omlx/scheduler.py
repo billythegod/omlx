@@ -11028,6 +11028,25 @@ class Scheduler:
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
                 self._fixed_state_measure_armed = arrays_cache_layers > 0
+
+                # Inkling builds its banded relative-position bias as a full
+                # [H, LQ, S] tensor before SDPA; register the transient so
+                # prefill admission prices it (cleared for other models —
+                # the registry is process-wide across model swaps).
+                try:
+                    from .memory_monitor import register_attention_bias_transient
+
+                    model_type = str(getattr(self.model, "model_type", "") or "")
+                    register_attention_bias_transient(
+                        base_dtype_size
+                        if model_type in ("inkling", "inkling_mm_model")
+                        else None
+                    )
+                except Exception:
+                    logger.debug(
+                        "attention-bias transient registration failed",
+                        exc_info=True,
+                    )
                 logger.debug(
                     f"Model info for memory estimation: "
                     f"layers={num_layers} ({num_kv_cache_layers} KVCache, "

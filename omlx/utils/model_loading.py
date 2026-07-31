@@ -404,6 +404,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type in ("inkling", "inkling_mm_model"):
+        from ..patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        if apply_mlx_vlm_inkling_compat_patch():
+            logger.info(
+                "Inkling mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
