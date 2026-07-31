@@ -547,6 +547,25 @@ def _patch_language_model(inkling_lang: Any) -> None:
         cache.win_hid = out
         cache.chain_step = 1
         cache.frontier = f_new
+        # Materialize the cycle bookkeeping (KV buffers, conv states, stash
+        # rolls, ring) without a host sync. Nothing else ever evaluates the
+        # stash rolls or trimmed states, so left lazy they accumulate a
+        # deepening cross-cycle graph that every eval re-walks (measured
+        # 26-59 ms/cycle vs 9 ms materialized). Covers last cycle's chain
+        # appends too — this runs after the trims that consume them.
+        evals = [cache.ring_hid, cache.ring_tok]
+        for j in range(active):
+            kv, conv = cache[j][0], cache[j][1]
+            if kv.keys is not None:
+                evals.append(kv.keys)
+                evals.append(kv.values)
+            slots = getattr(conv, "cache", None)
+            if isinstance(slots, list):
+                evals.extend(a for a in slots if a is not None)
+            stash = getattr(conv, "_omlx_verify_xp", None)
+            if stash:
+                evals.extend(stash.values())
+        mx.async_eval(evals)
         return out
 
     def _mtp_chain(self, cache, next_token_ids, step):

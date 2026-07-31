@@ -60,13 +60,21 @@ def _restore_cache_state(caches, snapshot):
             c.state = _clone_cache_tree(s)
 
 
+# OMLX: S / LQ / Q_OFF / B are RUNTIME params (uint32 buffer), not template
+# constants. Every template tuple compiles its own Metal pipeline, and these
+# values change every decode step (cache growth) and every MTP verify/head
+# cycle — templating them forced a pipeline recompile per step on the seven
+# global layers and per pass on the MTP head blocks. Only genuinely static
+# per-layer constants (dtype, H, D_REL, REL_EXTENT, SLIDING) stay templated.
 _MASK_SRC = r"""
     uint j  = thread_position_in_grid.x;   // key   position [0, S)
     uint i  = thread_position_in_grid.y;   // query position [0, LQ)
     uint bh = thread_position_in_grid.z;   // b * H + h
+    uint S = params[0], LQ = params[1], B = params[3];
+    int q_off = (int)params[2];
     if (i >= LQ || j >= S || bh >= B * H) return;
     uint b = bh / H, h = bh % H;
-    int dist = (int(i) + int(Q_OFF)) - int(j);   // backward distance
+    int dist = (int(i) + q_off) - int(j);   // backward distance
     T val;
     if (dist < 0) {
         val = (T)(-1e30f);                                   // causal
@@ -86,7 +94,7 @@ _MASK_SRC = r"""
 """
 _mask_kernel = mx.fast.metal_kernel(
     name="inkling_banded_mask",
-    input_names=["rel", "proj"],
+    input_names=["rel", "proj", "params"],
     output_names=["out"],
     source=_MASK_SRC,
 )
@@ -101,15 +109,12 @@ def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
     B, LQ, H, d_rel = rel.shape
     dtype = rel.dtype
     if mx.default_device() == mx.gpu:
+        params = mx.array([S, LQ, int(q_offset), B], dtype=mx.uint32)
         return _mask_kernel(
-            inputs=[rel, proj],
+            inputs=[rel, proj, params],
             template=[
                 ("T", dtype),
-                ("B", B),
                 ("H", H),
-                ("LQ", LQ),
-                ("S", S),
-                ("Q_OFF", q_offset),
                 ("D_REL", d_rel),
                 ("REL_EXTENT", rel_extent),
                 ("SLIDING", sliding),
