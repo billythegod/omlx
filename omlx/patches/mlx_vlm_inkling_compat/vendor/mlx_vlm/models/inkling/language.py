@@ -170,6 +170,17 @@ class InklingShortConvolution(nn.Module):
                 cache[self.conv_idx] = mx.take_along_axis(xp, positions, axis=1)
             else:
                 cache[self.conv_idx] = xp[:, -(K - 1) :, :]
+            # OMLX: keep the padded conv input of the LAST forward so an
+            # MTP verify rollback can reslice the state at any accepted
+            # boundary (state after keeping j tokens = xp[:, j : j+K-1]).
+            # Conv states cannot be trimmed like KV; without this, rejected
+            # draft tokens would stay baked into the sliding window. A lazy
+            # array reference, overwritten every forward — no extra compute.
+            stash = getattr(cache, "_omlx_verify_xp", None)
+            if stash is None:
+                stash = {}
+                cache._omlx_verify_xp = stash
+            stash[self.conv_idx] = xp
         else:
             xp = mx.pad(xf, [(0, 0), (K - 1, 0), (0, 0)])
         out = self.conv(xp.astype(self.conv.weight.dtype)).astype(mx.float32)

@@ -3393,6 +3393,9 @@ def _normalize_mtp_in_config(config: dict) -> None:
         for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
             if key in text_cfg and text_cfg[key]:
                 text_cfg[key] = 0
+    # Inkling nests the declaration under a top-level mtp_config block.
+    if isinstance(config.get("mtp_config"), dict):
+        config.pop("mtp_config", None)
 
 
 def _normalize_text_only_in_config(config: dict) -> None:

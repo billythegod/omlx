@@ -5789,8 +5789,10 @@ class TestInklingSanitizeDiscovery:
         assert plan["language_model.model.embed_tokens.weight"]["transform"] == (
             "passthrough"
         )
-        # MTP weights are dropped by sanitize.
-        assert not any(".mtp" in k for k in plan)
+        # MTP keys are either dropped (no Lightning MTP hook installed) or
+        # mapped to language_model.mtp.* (hook active, process-wide once any
+        # MTP-aware sanitize ran); raw model.mtp.* names must never leak.
+        assert not any(k.startswith("model.mtp") for k in plan)
 
     def test_plan_materializes_interleaved_split(self, tmp_path):
         """Replaying the discovered plan must reproduce the de-interleave

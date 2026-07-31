@@ -321,7 +321,10 @@ def test_sanitize_maps_bf16_checkpoint_keys(applied):
     assert prefix + "mlp.global_scale" in out
     assert "language_model.model.embed_tokens.weight" in out
     assert "language_model.lm_head.weight" in out
-    assert not any(".mtp" in k for k in out)
+    # Raw mtp keys never leak; with the Lightning MTP hook installed
+    # (process-wide once any MTP-aware sanitize ran) they map to
+    # language_model.mtp.*, otherwise they are dropped.
+    assert not any(k.startswith("model.mtp") for k in out)
 
     gate = out[prefix + "mlp.switch_mlp.gate_proj.weight"]
     up = out[prefix + "mlp.switch_mlp.up_proj.weight"]

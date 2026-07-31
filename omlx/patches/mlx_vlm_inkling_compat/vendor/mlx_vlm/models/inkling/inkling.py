@@ -202,6 +202,12 @@ class Model(nn.Module):
         experts = {}  # layer index -> {"w13"|"w2": {"weight"|"scale"|"scale2": array}}
         for k, v in weights.items():
             if ".mtp" in k or k.startswith("model.mtp") or k.endswith("training_args"):
+                # OMLX: single-checkpoint Lightning MTP keeps and remaps
+                # the head weights when the runtime patch installs a hook
+                # (upstream always drops them). None → upstream behavior.
+                hook = globals().get("_OMLX_MTP_SANITIZE_HOOK")
+                if hook is not None and not k.endswith("training_args"):
+                    out.update(hook(k, v))
                 continue
             # Routed-expert tensors (base weight + NVFP4 sidecars) are buffered and
             # folded per layer once both w13 and w2 are seen; input_amax /

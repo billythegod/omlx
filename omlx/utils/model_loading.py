@@ -464,6 +464,13 @@ def maybe_apply_pre_load_patches(
                 # vs 1.53x capped at 3); the controller still settles shallow
                 # on low-accept content.
                 set_mtp_depth(8)
+            elif model_type in ("inkling", "inkling_mm_model"):
+                # The checkpoint ships one MTP block per draft depth; cap
+                # the chain at the shipped depth (8 on Inkling Small).
+                mtp_cfg = config.get("mtp_config") or {}
+                set_mtp_depth(
+                    int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
+                )
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -653,6 +660,10 @@ def _has_mtp_heads(config: dict) -> bool:
         return True
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
+    # Inkling nests the head declaration under a top-level mtp_config.
+    mtp_cfg = config.get("mtp_config") or {}
+    if int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
+        return True
     return False
 
 
@@ -759,6 +770,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
         or model_type == "gemma4"
+        or model_type in ("inkling", "inkling_mm_model")
     )
 
 

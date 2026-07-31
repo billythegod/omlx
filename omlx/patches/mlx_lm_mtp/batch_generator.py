@@ -1944,7 +1944,13 @@ def _chain_next_drafts(
         state.draft_accept_lps = []
         return
 
-    if _HEAD_HIDDEN_POST_NORM and hidden_rows.ndim == 3:
+    # Models whose MTP head normalizes its hidden input internally
+    # (inkling: per-block hidden_norm, chain_hidden_post_norm=False) mark
+    # themselves and receive the raw pre-norm trunk hidden.
+    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
+        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
+    )
+    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
         hidden_rows = _trunk_norm_module(model)(hidden_rows)
 
     n = committed.shape[0]
