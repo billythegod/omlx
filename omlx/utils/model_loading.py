@@ -445,10 +445,9 @@ def maybe_apply_pre_load_patches(
             # mtp_num_draft_tokens is the MAX draft depth; an adaptive
             # controller picks 1..max per sequence from rolling accept/latency
             # estimates, so prose/chat settles at 1 and predictable text
-            # climbs. Set it to 1 for a fixed depth-1 cycle. Note: depth >= 2
-            # verify forwards route through the verify-shape qmm kernels
-            # (M >= 3), whose numerics can diverge from the unrouted path at
-            # bf16 tail-ULP level.
+            # climbs. Set it to 1 for a fixed depth-1 cycle. The hidden
+            # server.mtp_target_verify_exact setting can force affine target
+            # projections through independent M=1 calls for QA.
             depth = getattr(model_settings, "mtp_num_draft_tokens", None)
             if depth:
                 set_mtp_depth(int(depth))

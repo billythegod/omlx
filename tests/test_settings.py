@@ -51,6 +51,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.mtp_target_verify_exact is False
 
     def test_custom_values(self):
         """Test custom values."""
@@ -79,6 +80,7 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "mtp_target_verify_exact": False,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -110,6 +112,12 @@ class TestServerSettings:
         """Missing preserve_mid_system_cache keeps the cache-friendly default."""
         settings = ServerSettings.from_dict({})
         assert settings.preserve_mid_system_cache is True
+
+    def test_from_dict_mtp_target_verify_exact(self):
+        """The hidden exact target-verification toggle round-trips."""
+        settings = ServerSettings.from_dict({"mtp_target_verify_exact": True})
+        assert settings.mtp_target_verify_exact is True
+        assert settings.to_dict()["mtp_target_verify_exact"] is True
 
     def test_from_dict_auto_start_on_launch(self):
         """auto_start_on_launch round-trips through from_dict / to_dict."""

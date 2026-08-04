@@ -174,6 +174,9 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    # Hidden, startup-only QA toggle. This is intentionally not exposed by
+    # the admin settings API or UI.
+    mtp_target_verify_exact: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -193,6 +196,7 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            mtp_target_verify_exact=bool(data.get("mtp_target_verify_exact", False)),
         )
 
 

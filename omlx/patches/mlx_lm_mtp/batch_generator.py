@@ -78,24 +78,11 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from ..target_verify_exact import set_target_verify_exact_armed
 from . import cache_rollback as _rollback_mod
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
-
-
-def _set_verify_qmm_armed(flag: bool) -> None:
-    """Arm the verify-shape qmm routing for the duration of an MTP forward.
-
-    Import is deferred and failure-tolerant: the kernel module is optional
-    and its absence must not affect the MTP path.
-    """
-    try:
-        from ..qwen35_verify_qmm import set_verify_qmm_armed
-
-        set_verify_qmm_armed(flag)
-    except Exception:
-        pass
 
 
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
@@ -1336,16 +1323,15 @@ def _call_backbone(
         kwargs["n_confirmed"] = n_confirmed
     dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
-    # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
-    # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # DeepSeek keeps its architecture-native target-verification path.
+    set_target_verify_exact_armed(not dspark_verify)
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
     finally:
         if dspark_verify:
             _set_dspark_target_verify(model, False)
-        _set_verify_qmm_armed(False)
+        set_target_verify_exact_armed(False)
         _rollback_mod.set_undo_armed(False)
 
     # LanguageModelOutput (mlx-vlm dataclass)

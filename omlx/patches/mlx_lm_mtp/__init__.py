@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import logging
 
+from ..target_verify_exact import configure_target_verify_exact
+
 logger = logging.getLogger(__name__)
 
 # Process-wide construction flag read by the patched ``Model.__init__``
@@ -132,14 +134,7 @@ def apply_mlx_lm_mtp_patch() -> bool:
         )
         return False
 
-    # Verify-shape qmm kernels. Optional: inert unless armed around an MTP
-    # verify forward, and strictly shape-gated at call time.
-    try:
-        from ..qwen35_verify_qmm import apply_verify_qmm_patch
-
-        apply_verify_qmm_patch()
-    except Exception:
-        logger.debug("verify qmm patch not applied", exc_info=True)
+    configure_target_verify_exact()
 
     from ..deepseek_v4.decode_consistency import apply as apply_ds_consistency
 

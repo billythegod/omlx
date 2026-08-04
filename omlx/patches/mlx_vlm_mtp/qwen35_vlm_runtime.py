@@ -43,6 +43,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..mlx_lm_mtp import prompt_priming
+from ..target_verify_exact import patch_qwen_target_verify_helpers
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ def apply() -> bool:
 
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
+    patch_qwen_target_verify_helpers(q35_lang)
     _patch_vlm_language_model(q35_lang)
     _patch_inner_model_capture(q35_lang)
     # VLMModelAdapter pass-throughs are installed by the MoE runtime patch

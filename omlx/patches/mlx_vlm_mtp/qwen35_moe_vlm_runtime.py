@@ -42,6 +42,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..target_verify_exact import patch_qwen_target_verify_helpers
+
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -63,6 +65,7 @@ def apply() -> bool:
 
     _patch_text_config(q35moe_config)
     _register_mtp_classes_for_vlm(q35moe_lang)
+    patch_qwen_target_verify_helpers(q35moe_lang)
     _patch_vlm_language_model(q35moe_lang)
     _patch_vlm_outer_model_sanitize(q35moe_outer)
     _patch_vlm_model_adapter()
