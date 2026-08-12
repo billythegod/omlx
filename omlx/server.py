@@ -540,9 +540,14 @@ app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
 try:
     import mlx_audio as _  # noqa: F401
 
+    from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
     app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    # The realtime WebSocket router authenticates in-band (first message):
+    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # Authorization header on WebSocket connections.
+    app.include_router(audio_realtime_router)
     del _
 except ImportError:
     pass
