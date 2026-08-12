@@ -815,6 +815,19 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
     return JSONResponse(status_code=500, content=content)
 
 
+_TEXTUAL_BODY_CONTENT_TYPES = (
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "text/",
+)
+
+
+def _is_textual_body(content_type: str) -> bool:
+    """True when a request body is safe to dump into the log as text."""
+    ct = content_type.split(";", 1)[0].strip().lower()
+    return ct.startswith(_TEXTUAL_BODY_CONTENT_TYPES) or ct.endswith("+json")
+
+
 class DebugRequestLoggingMiddleware:
     """Pure ASGI middleware for trace-level request body logging.
 
@@ -832,6 +845,27 @@ class DebugRequestLoggingMiddleware:
             or not logger.isEnabledFor(5)
             or scope.get("method") != "POST"
         ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        content_type = headers.get("content-type", "")
+        if not _is_textual_body(content_type):
+            # Multipart / binary uploads (audio files can be 100 MB):
+            # dumping the raw bytes garbles the terminal and buffering
+            # the whole body just for logging wastes memory — log a
+            # summary and stream the body through untouched.
+            logger.log(
+                5,
+                "Incoming %s %s — body: <%s, %s bytes omitted>",
+                scope["method"],
+                scope["path"],
+                content_type or "unknown content-type",
+                headers.get("content-length", "?"),
+            )
             await self.app(scope, receive, send)
             return
 
