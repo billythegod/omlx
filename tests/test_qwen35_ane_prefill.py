@@ -87,6 +87,23 @@ class _OQ4eGDN(nn.Module):
         self.in_proj_a = nn.QuantizedLinear(128, 48, bias=False, group_size=64, bits=4)
 
 
+@pytest.mark.parametrize("sequence_length", [2048, 4096])
+def test_configure_scheduler_uses_the_compiled_ane_shape(sequence_length):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048),
+        _qwen35_prefill_floor=4096,
+    )
+
+    configured = ane_patch.configure_qwen35_ane_prefill_scheduler(
+        scheduler,
+        sequence_length,
+    )
+
+    assert configured is True
+    assert scheduler.config.prefill_step_size == sequence_length
+    assert scheduler._qwen35_prefill_floor == 0
+
+
 def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
     fallback = object()
     accelerated = object()

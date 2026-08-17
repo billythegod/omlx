@@ -67,6 +67,13 @@ working profile is applied. The editor starts from the measured 2,048-token,
 53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
 itself stays off until explicitly enabled.
 
+When the feature is active, oMLX aligns the scheduler's prompt chunk size with
+the configured fixed ANE shape. This also overrides the wider Qwen prefill
+floor used on high-memory systems. A 4,096-token ANE shape is supported, but a
+4K benchmark request prefills only 4,095 tokens because the final token is
+reserved for generation kickoff. The default remains 2,048 so 4K prompts still
+route one full chunk through ANE.
+
 The throughput-benchmark screen also offers a **Full · 2,048** warm-up. The
 scheduler reserves the last prompt token for the first decode step, so this
 mode builds a 2,049-token prompt to execute one genuine 2,048-token prefill
@@ -103,21 +110,24 @@ to avoid per-request weight preparation and to keep both ANEs ready.
 ## Qwen3.8-27B-oQ4e validation
 
 The group-size-64 and mixed q4/q5 path was validated on an M3 Ultra with
-`Qwen3.8-27B-oQ4e-mtp`. Each row is the mean of two deterministic runs with a
-128-token generation tail and a 2,048-token ANE prompt block.
+`Qwen3.8-27B-oQ4e-mtp`, a 128-token generation tail, and a 2,048-token ANE
+prompt block. The 4K row is a matched current-revision recheck. Its gain ranged
+from 1.7% to 3.4% across matched fixed prompts because only one 2,048-token ANE
+chunk runs before the 2,047-token GPU tail. The 16K and 32K GPU baselines are
+the mean of two deterministic runs; their ANE/GPU values are single
+scheduler-aligned rechecks.
 
 | Prompt | GPU PP | ANE/GPU PP | PP change | TTFT change | End-to-end change |
 |---:|---:|---:|---:|---:|---:|
-| 4K | 452.8 tok/s | 488.2 tok/s | +7.8% | -7.2% | -5.1% |
-| 16K | 439.1 tok/s | 515.4 tok/s | +17.4% | -14.8% | -13.3% |
-| 32K | 408.9 tok/s | 485.1 tok/s | +18.6% | -15.7% | -14.9% |
+| 4K | 445.2 tok/s | 460.4 tok/s | +3.4% | -3.3% | -2.3% |
+| 16K | 439.1 tok/s | 517.0 tok/s | +17.8% | -15.1% | -13.6% |
+| 32K | 408.9 tok/s | 486.0 tok/s | +18.9% | -15.9% | -15.0% |
 
-The 16K and 32K output hashes matched the GPU path exactly across both runs.
-The 4K output was stable across ANE runs but differed from GPU, which is
-consistent with the approximate INT8 ANE prefix. Peak memory increased by
-about 4.15 GB, and eager load time increased from 3.35 to 27.27 seconds on the
-test system. Token-generation throughput was unchanged because decode remains
-on the GPU.
+The 16K and 32K output hashes matched the GPU path exactly. The 4K output was
+stable across ANE rechecks but differed from GPU, which is consistent with the
+approximate INT8 ANE prefix. Peak memory increased by about 4.15 GB, and eager
+load time increased from 3.35 to about 27-29 seconds on the test system.
+Token-generation throughput was unchanged because decode remains on the GPU.
 
 ## M3 Ultra reference result
 

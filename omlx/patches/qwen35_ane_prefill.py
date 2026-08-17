@@ -135,6 +135,28 @@ def _eligible_input(x: mx.array, config: _AnePrefillConfig) -> bool:
     return int(x.size // input_dim) == config.sequence_length
 
 
+def configure_qwen35_ane_prefill_scheduler(
+    scheduler: Any,
+    sequence_length: int,
+) -> bool:
+    """Align scheduler prompt chunks with the compiled fixed ANE shape."""
+    if sequence_length < 1024 or sequence_length % 64:
+        raise ValueError(
+            "ANE prefill sequence_length must be a multiple of 64 >= 1024"
+        )
+    config = getattr(scheduler, "config", None)
+    if config is None:
+        return False
+    config.prefill_step_size = int(sequence_length)
+    if hasattr(scheduler, "_qwen35_prefill_floor"):
+        scheduler._qwen35_prefill_floor = 0
+    logger.info(
+        "Qwen ANE prefill scheduler aligned to fixed shape %d",
+        sequence_length,
+    )
+    return True
+
+
 def _eligible_pair(mlp: Any) -> bool:
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
