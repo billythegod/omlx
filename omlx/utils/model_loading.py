@@ -414,9 +414,10 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    - mlx-vlm MLX 0.32.2 integer compatibility backport when ``for_vlm`` is
-      True. This installs before model-module imports and carries only upstream
-      PRs #1982 and #2006, without moving the deliberately stable mlx-vlm pin.
+    - mlx-vlm MLX 0.32.2 compatibility backport when ``for_vlm`` is True.
+      This installs before model-module imports and carries only upstream PRs
+      #1949, #1982, and #2006, without moving the deliberately stable mlx-vlm
+      pin.
     Some model patches inject modules into ``sys.modules`` or replace mlx-lm
     internals; the mlx-vlm compatibility hook instead transforms only the
     affected pinned sources as they load. Gating keeps non-affected models at

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Backport the narrow mlx-vlm changes required by MLX 0.32.2.
 
-The pinned mlx-vlm revision predates upstream PRs #1982 and #2006. MLX 0.32.2
-stopped accepting scalar ``mx.array`` objects where Python integer dimensions
-are required, so affected vision models otherwise fail in ``mx.repeat``, shape
-construction, or Metal grid dispatch.
+The pinned mlx-vlm revision predates upstream PRs #1949, #1982, and #2006.
+MLX 0.32.2 stopped accepting scalar ``mx.array`` objects where Python integer
+dimensions are required and changed ``mx.random.state`` from a mutable list to
+a proxy whose member arrays must be updated in place. Affected models otherwise
+fail in speculative RNG restoration, ``mx.repeat``, shape construction, or
+Metal grid dispatch.
 
-Moving the mlx-vlm pin to either merge commit would also import hundreds of
+Moving the mlx-vlm pin to any of these merge commits would also import hundreds of
 unrelated upstream changes. Instead, this module installs a source loader for
 the exact affected modules and applies only the upstream integer conversions.
 Each replacement is checked before compilation: an unexpected pinned source
@@ -39,6 +41,12 @@ _REPEAT_GRID = _Replacement(
 )
 
 _MODULE_REPLACEMENTS: dict[str, tuple[_Replacement, ...]] = {
+    "mlx_vlm.speculative.common": (
+        _Replacement(
+            "mx.random.state[i] = value",
+            "mx.random.state[i][:] = value",
+        ),
+    ),
     "mlx_vlm.models.aya_vision.vision": (
         _Replacement(
             "height, width = spatial_shapes[i]",
@@ -208,7 +216,7 @@ def apply_mlx_vlm_mlx0322_compat_patch() -> bool:
         raise
 
     _INSTALLED = True
-    logger.info("mlx-vlm MLX 0.32.2 integer compatibility patch installed")
+    logger.info("mlx-vlm MLX 0.32.2 compatibility patch installed")
     return True
 
 

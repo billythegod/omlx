@@ -65,6 +65,28 @@ def test_mlx_vlm_grid_sample_uses_python_integer_metal_grid():
     assert result.shape == (1, 1, 1, 1)
 
 
+def test_mlx_vlm_speculative_rng_restores_random_state_in_place():
+    from omlx.patches.mlx_vlm_mlx0322_compat import (
+        apply_mlx_vlm_mlx0322_compat_patch,
+    )
+
+    apply_mlx_vlm_mlx0322_compat_patch()
+
+    from mlx_vlm.speculative.common import _restore_rng_state
+
+    original = [mx.array(value) for value in mx.random.state]
+    replacement = [value + 1 for value in original]
+    try:
+        _restore_rng_state(replacement)
+        mx.eval(*mx.random.state)
+        assert all(
+            bool(mx.all(actual == expected))
+            for actual, expected in zip(mx.random.state, replacement)
+        )
+    finally:
+        _restore_rng_state(original)
+
+
 def _compiled_thread_call(value: int) -> int:
     @mx.compile
     def add_one(x):
