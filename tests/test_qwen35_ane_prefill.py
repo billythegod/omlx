@@ -1446,9 +1446,9 @@ def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
     assert state is not None
     assert state.bits == 8
     assert state.group_size == 64
-    assert state.weight.shape == (192, 32)
-    assert state.scales.shape == (192, 2)
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert state.weight.shape == (256, 32)
+    assert state.scales.shape == (256, 2)
+    assert compiled == [((128, 128), mx.float32, 2048)]
 
 
 @pytest.mark.parametrize("group_size", [64, 128])
@@ -1505,7 +1505,7 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
     mixed_qkv, z, b, a = ane_patch._gdn_backend(gdn, x)
     mx.eval(mixed_qkv, z, b, a)
 
-    assert compiled == [(192, 128)]
+    assert compiled == [(128, 128)]
     assert z.shape == (1, 1, state.z_outputs)
     assert mixed_qkv.shape == (1, 1, state.qkv_outputs)
     assert b.shape == (1, 1, state.b_outputs)
@@ -1723,11 +1723,11 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
 
     assert state is not None
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert compiled == [((128, 128), mx.float32, 2048)]
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert state.weight.shape == (192, 20)
-    assert state.scales.shape == (192, 2)
+    assert state.weight.shape == (256, 20)
+    assert state.scales.shape == (256, 2)
     assert state.bits == 5
     assert state.group_size == 64
 
@@ -1752,10 +1752,10 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     state, dense0, dense1 = prepared
     assert state.bits == 4
     assert state.group_size == 64
-    assert state.weight.shape == (128, 16)
-    assert state.scales.shape == (128, 2)
-    assert dense0.shape == (128, 128)
-    assert dense1.shape == (128, 128)
+    assert state.weight.shape == (256, 16)
+    assert state.scales.shape == (256, 2)
+    assert dense0.shape == (64, 128)
+    assert dense1.shape == (64, 128)
 
 
 def test_prepare_gdn_single_ane_keeps_one_full_prefix():
@@ -1778,7 +1778,7 @@ def test_prepare_gdn_single_ane_keeps_one_full_prefix():
     state, dense0, dense1 = prepared
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert dense0.shape == (256, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
 
 
@@ -1841,12 +1841,12 @@ def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
 
     assert prepared is not None
     state, dense0, dense1 = prepared
-    assert dense0.shape == (192, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
     assert state.cpu_outputs == 64
     assert state.cpu_weight is not None
     assert state.cpu_weight.shape == (64, 128)
-    assert state.weight.shape == (128, 16)
+    assert state.weight.shape == (192, 16)
 
 
 def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch):
@@ -3266,6 +3266,36 @@ def _floor_gdn(z_outputs: int, qkv_outputs: int):
     )
 
 
+def test_recurrent_safe_gdn_slice_caps_ane_at_z():
+    """A wider requested slice must not move recurrent qkv rows onto ANE."""
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.50, 128)
+        == 6144
+    )
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.375, 128)
+        == 6144
+    )
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.35, 128) == 0
+
+
+def test_recurrent_safe_gdn_slice_rejects_unaligned_z():
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 128) == 0
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 64) == 320
+
+
+def test_recurrent_safe_gdn_cap_is_reported(caplog):
+    gdn = _floor_gdn(512, 1536)
+    gdn._omlx_ane_gdn_state = object()
+    model = SimpleNamespace(modules=lambda: [gdn])
+
+    with caplog.at_level(logging.INFO):
+        ane_patch._log_gdn_recurrent_safe_cap(model, 0.50, 1, True)
+
+    assert "requested 0.500 to 0.250" in caplog.text
+    assert "recurrent qkv" in caplog.text
+
+
 def test_min_viable_gdn_fraction_tracks_the_alignment():
     """Single-ANE slices align to 64, dual to 128, so the same model has a
     different floor in each mode."""
@@ -3276,10 +3306,10 @@ def test_min_viable_gdn_fraction_tracks_the_alignment():
     assert (int(total * 0.25) // 128) * 128 >= 512
     assert (int(total * 0.15) // 128) * 128 < 512
 
-    # A 64-aligned slice reaches z at the same 0.25 here, but the rule is
-    # evaluated against the requested alignment, not a fixed 128.
+    # Exact z must satisfy the active ANE alignment. A wider aligned prefix
+    # would enter recurrent qkv rows and is intentionally rejected.
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 64) == 0.15625
-    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) == 0.1875
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) is None
 
     # z alone larger than the whole projection can never engage
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None
