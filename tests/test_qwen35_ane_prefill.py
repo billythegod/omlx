@@ -70,6 +70,32 @@ def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
     assert source.count("ane_guard.transfer_ticket1();") == 2
 
 
+def test_hybrid_merge_waits_for_gpu_suffix_completion():
+    """ANE completion alone must not let merge race an in-flight GPU qmm."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    single = source.split("class AneHybridQ4Primitive", 1)[1]
+    single = single.split("class DualAneHybridPrimitive", 1)[0]
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+
+    for block, ane_wait in (
+        (single, "model_->wait(ticket)"),
+        (dual, "model1_->wait(ticket1)"),
+    ):
+        assert "[qmm_buffer retain];" in block
+        assert block.count("[qmm_buffer waitUntilCompleted];") == 2
+        assert block.index(ane_wait) < block.rindex(
+            "[qmm_buffer waitUntilCompleted];"
+        )
+        assert block.rindex("[qmm_buffer waitUntilCompleted];") < block.index(
+            "auto merge ="
+        )
+        assert block.rindex("[qmm_buffer release];") < block.index("auto merge =")
+
+
 @pytest.fixture(autouse=True)
 def _restore_lm_gdn_backend():
     import omlx.patches.qwen35_q4_mlp as q4_patch
