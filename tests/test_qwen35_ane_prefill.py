@@ -498,6 +498,7 @@ def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
 
 def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     calls = []
+    scheduled = []
 
     def exact(_gdn, block, _target_verify=False):
         calls.append(("ane", int(block.shape[-2])))
@@ -517,6 +518,7 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
             )
 
     monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: scheduled.append(values))
     linears = [Linear(value) for value in (10, 20, 30, 40)]
     gdn = SimpleNamespace(
         in_proj_qkv=linears[0],
@@ -530,6 +532,10 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
         gdn, mx.zeros((1, 4095, 8), dtype=mx.float16)
     )
     assert result is not None
+    assert len(scheduled) == 1
+    assert all(
+        actual is expected for actual, expected in zip(scheduled[0], result)
+    )
     mx.eval(*result)
 
     assert [part.shape for part in result] == [(1, 4095, 1)] * 4

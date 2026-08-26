@@ -1711,10 +1711,17 @@ def _gdn_backend(
                 )
             )
 
-    return tuple(
+    result = tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
         for index in range(4)
     )
+    # The four tiled projections are sibling consumers of the same native
+    # hybrid outputs. Schedule them together before the recurrent GDN graph
+    # consumes individual branches; otherwise MLX can interleave their Metal
+    # merge/lifetime boundaries after a prefix-cache restore (#3117). This is
+    # asynchronous, so ANE/GPU overlap is preserved without a host fence.
+    mx.async_eval(*result)
+    return result
 
 
 def _backend_exact(
