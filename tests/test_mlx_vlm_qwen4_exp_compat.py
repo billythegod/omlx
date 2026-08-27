@@ -134,6 +134,38 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
+def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    model = LanguageModel(config.text_config, config)
+    full_cache = model.make_cache()
+    prefix_cache = model.make_cache()
+
+    full = model(mx.array([[2, 3, 4, 5]], dtype=mx.int32), cache=full_cache)
+    model(mx.array([[2, 3, 4]], dtype=mx.int32), cache=prefix_cache)
+
+    restored = []
+    for cache in prefix_cache:
+        handler = CacheTypeRegistry.get_handler_by_class_name(type(cache).__name__)
+        state = handler.extract_state(cache)
+        if type(cache).__name__ == "ArraysCache":
+            restored.append(handler.reconstruct_cache(state, token_count=3))
+        else:
+            restored.append(handler.reconstruct_cache(state))
+
+    resumed = model(mx.array([[5]], dtype=mx.int32), cache=restored)
+    expected = mx.argmax(full.logits[:, -1], axis=-1)
+    actual = mx.argmax(resumed.logits[:, -1], axis=-1)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
+    assert restored[1].index_keys.shape[1] == 4
+    assert restored[1].index_position_ids.shape[-1] == 4
+
+
 def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 

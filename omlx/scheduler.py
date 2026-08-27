@@ -7455,6 +7455,9 @@ class Scheduler:
                     if handler is not None and class_name in (
                         "MiniMaxM3KVCache",
                         "MiniMaxM3BatchKVCache",
+                        "QSAKVCache",
+                        "QSAQuantizedKVCache",
+                        "BatchQSAKVCache",
                     ):
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
