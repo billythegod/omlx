@@ -662,6 +662,12 @@ def maybe_apply_pre_load_patches(
             mtp_active = False
         configure_qwen4_exp_runtime(
             model_name,
+            mode=(
+                "mmap"
+                if model_settings is not None
+                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
+                else "resident" if model_settings is not None else None
+            ),
             mtp_enabled=mtp_active,
         )
 

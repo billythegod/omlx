@@ -96,3 +96,25 @@ def test_qwen4_exp_loader_enables_depth_one_lightning_mtp(tmp_path):
     )
     assert get_mtp_runtime().enabled is False
     assert is_mtp_active() is False
+
+
+def test_qwen4_exp_loader_uses_explicit_ple_ssd_offload_setting(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+
+    maybe_apply_pre_load_patches(
+        str(tmp_path),
+        SimpleNamespace(mtp_enabled=False, qwen4_ple_ssd_offload=False),
+        for_vlm=True,
+    )
+    from mlx_vlm.models.qwen4_exp.language import get_ple_runtime_mode
+
+    assert get_ple_runtime_mode() == "resident"
+
+    maybe_apply_pre_load_patches(
+        str(tmp_path),
+        SimpleNamespace(mtp_enabled=False, qwen4_ple_ssd_offload=True),
+        for_vlm=True,
+    )
+    assert get_ple_runtime_mode() == "mmap"
