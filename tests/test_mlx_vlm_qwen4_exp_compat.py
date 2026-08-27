@@ -166,6 +166,130 @@ def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
     assert restored[1].index_position_ids.shape[-1] == 4
 
 
+def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    verify_cache = model.make_cache()
+    singleton_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    model(prefix, cache=verify_cache)
+    model(prefix, cache=singleton_cache)
+
+    verified = model(
+        mx.array([[5, 6]], dtype=mx.int32),
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    first = model(mx.array([[5]], dtype=mx.int32), cache=singleton_cache)
+    second = model(mx.array([[6]], dtype=mx.int32), cache=singleton_cache)
+    singleton_logits = mx.concatenate([first.logits, second.logits], axis=1)
+    verified_tokens = mx.argmax(verified.logits, axis=-1)
+    singleton_tokens = mx.argmax(singleton_logits, axis=-1)
+    mx.eval(verified_tokens, singleton_tokens)
+
+    assert mx.array_equal(verified_tokens, singleton_tokens).item()
+    assert verified.hidden_states[0].shape == (1, 2, 64)
+    assert len(verified.gdn_states) == 1
+
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=0,
+        block_size=2,
+    )
+    qsa_cache = verify_cache[1]
+    assert qsa_cache.offset == 4
+    assert qsa_cache.index_keys.shape[1] == 4
+    assert qsa_cache.index_position_ids.shape[-1] == 4
+
+
+def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpMTPModule,
+        configure_mtp_runtime,
+    )
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+        encoding="utf-8",
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = Model(config)
+        assert isinstance(model.mtp, Qwen4ExpMTPModule)
+        assert model.language_model.get_mtp_module() is model.mtp
+        assert model.language_model._omlx_mtp_decode_enabled is True
+
+        head = model.mtp
+        head.fc_embedding.weight = mx.eye(config.text_config.hidden_size)
+        head.fc_hidden.weight = mx.eye(config.text_config.hidden_size)
+        embedding = mx.arange(1, 33, dtype=mx.float32).reshape(1, 1, 32)
+        hidden = mx.arange(1, 65, dtype=mx.float32).reshape(1, 1, 64)
+        actual = head.fuse_inputs(embedding, hidden)
+        expected_embedding = embedding * mx.rsqrt(
+            mx.mean(embedding * embedding, axis=-1, keepdims=True)
+            + config.text_config.rms_norm_eps
+        )
+        expected_hidden = hidden * mx.rsqrt(
+            mx.mean(hidden * hidden, axis=-1, keepdims=True)
+            + config.text_config.rms_norm_eps
+        )
+        expected = (
+            expected_embedding[..., None, :] + expected_hidden.reshape(1, 1, 2, 32)
+        ).reshape(1, 1, 64)
+
+        assert mx.allclose(actual, expected, atol=2e-5).item()
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+
+def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+        encoding="utf-8",
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(
+                    tie_word_embeddings=False,
+                    num_hidden_layers=1,
+                    num_experts=4,
+                )
+            )
+        )
+        weights = {}
+        for root in (
+            "model.language_model.layers.0.mlp",
+            "mtp.layers.0.mlp",
+        ):
+            for expert in range(4):
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    key = f"{root}.experts.{expert}.{projection}.weight"
+                    weights[key] = mx.to_fp8(mx.ones((2, 2), dtype=mx.float32))
+                    weights[f"{key}_scale_inv"] = mx.ones((1, 1))
+
+        result = Model.sanitize(model, weights)
+
+        base_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        mtp_key = "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
+        assert result[base_key].shape == (4, 2, 2)
+        assert result[mtp_key].shape == (4, 2, 2)
+        assert result[base_key].dtype == mx.bfloat16
+        assert not any(key.endswith("weight_scale_inv") for key in result)
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+
 def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 

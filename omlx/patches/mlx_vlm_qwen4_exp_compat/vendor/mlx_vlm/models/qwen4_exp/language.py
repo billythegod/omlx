@@ -5,7 +5,9 @@ import math
 import mmap
 import os
 import struct
+import weakref
 from bisect import bisect_right
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -21,12 +23,81 @@ from ..qwen3_5.language import (
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
+    _target_verify_linear,
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+
+
+@dataclass(frozen=True)
+class Qwen4ExpMTPRuntime:
+    """Lightning MTP construction decision for the next model load."""
+
+    enabled: bool = False
+    checkpoint_prefix: str | None = None
+
+
+_MTP_RUNTIME = Qwen4ExpMTPRuntime()
+
+
+def configure_mtp_runtime(
+    model_path: str | Path,
+    *,
+    enabled: bool,
+) -> Qwen4ExpMTPRuntime:
+    """Detect and bind an embedded Qwen4 Lightning MTP checkpoint head."""
+    global _MTP_RUNTIME
+
+    checkpoint_prefix = None
+    if enabled:
+        model_path = Path(model_path)
+        index_path = model_path / "model.safetensors.index.json"
+        if index_path.is_file():
+            try:
+                weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+            except (OSError, ValueError):
+                weight_map = {}
+            for prefix in (
+                "mtp.",
+                "language_model.mtp.",
+                "model.mtp.",
+                "model.language_model.mtp.",
+            ):
+                if any(key.startswith(prefix) for key in weight_map):
+                    checkpoint_prefix = prefix
+                    break
+        else:
+            try:
+                import safetensors
+
+                for shard in sorted(model_path.glob("*.safetensors")):
+                    with safetensors.safe_open(str(shard), framework="numpy") as file:
+                        for prefix in (
+                            "mtp.",
+                            "language_model.mtp.",
+                            "model.mtp.",
+                            "model.language_model.mtp.",
+                        ):
+                            if any(key.startswith(prefix) for key in file.keys()):
+                                checkpoint_prefix = prefix
+                                break
+                    if checkpoint_prefix is not None:
+                        break
+            except Exception:
+                checkpoint_prefix = None
+
+    _MTP_RUNTIME = Qwen4ExpMTPRuntime(
+        enabled=bool(enabled and checkpoint_prefix),
+        checkpoint_prefix=checkpoint_prefix,
+    )
+    return _MTP_RUNTIME
+
+
+def get_mtp_runtime() -> Qwen4ExpMTPRuntime:
+    return _MTP_RUNTIME
 
 
 def resolve_ple_runtime_mode(
@@ -639,15 +710,25 @@ class Qwen4ExpQSAIndexer(nn.Module):
         hidden_states: mx.array,
         cache: Optional[QSAKVCache],
         position_ids: Optional[mx.array],
+        target_verify: bool = False,
     ) -> Optional[mx.array]:
-        batch, seq_len, _ = hidden_states.shape
+        projected = _target_verify_linear(
+            self.index_qk_proj, hidden_states, target_verify
+        )
+        return self.from_projected(projected, cache, position_ids)
+
+    def from_projected(
+        self,
+        qk: mx.array,
+        cache: Optional[QSAKVCache],
+        position_ids: Optional[mx.array],
+    ) -> Optional[mx.array]:
+        batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
         if position_ids is None:
             position_ids = self._default_position_ids(batch, past_len, seq_len)
 
-        qk = self.index_qk_proj(hidden_states).reshape(
-            batch, seq_len, self.n_heads + self.kv_heads, self.head_dim
-        )
+        qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
         query = qk[:, :, : self.n_heads]
         raw_keys = qk[:, :, self.n_heads :].squeeze(2)
         query = self.q_layernorm(query).transpose(0, 2, 1, 3)
@@ -746,8 +827,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
+        target_verify: bool = False,
     ) -> mx.array:
-        qsa_mask = self.indexer(x, cache, position_ids)
+        qsa_mask = self.indexer(
+            x,
+            cache,
+            position_ids,
+            target_verify=target_verify,
+        )
         if qsa_mask is not None:
             if mask is None or (isinstance(mask, str) and mask == "causal"):
                 mask = qsa_mask
@@ -766,6 +853,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache=cache,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            target_verify=target_verify,
         )
 
 
@@ -791,17 +879,35 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(self, hyper_input: mx.array):
+    def __call__(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        mix = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
-        mix = mx.sigmoid(self.input_mix_weight_up(mix))
+        mix = nn.silu(
+            _target_verify_linear(
+                self.input_mix_weight_down,
+                normed,
+                target_verify,
+            )
+            / self.hc_count
+        )
+        mix = mx.sigmoid(
+            _target_verify_linear(
+                self.input_mix_weight_up,
+                mix,
+                target_verify,
+            )
+        )
         mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
         streams = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
         mixed_input = mx.mean(mix * streams, axis=-2)
         if "block_inject_weight" not in self:
             return mixed_input
         injection_weights = 2 * mx.sigmoid(
-            self.block_inject_weight(normed) / self.hc_count
+            _target_verify_linear(
+                self.block_inject_weight,
+                normed,
+                target_verify,
+            )
+            / self.hc_count
         )
         return mixed_input, hyper_input, injection_weights
 
@@ -1217,12 +1323,13 @@ class Qwen4ExpPLELayer(nn.Module):
         input_ids: mx.array,
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
+        target_verify: bool = False,
     ):
         embeddings = self.ple_embedding(input_ids, cache)
-        keys = self.norm_key(self.key_proj(embeddings)).reshape(
-            *hidden_states.shape[:-1], self.hc_count, self.hidden_size
-        )
-        values = self.value_proj(embeddings)
+        keys = self.norm_key(
+            _target_verify_linear(self.key_proj, embeddings, target_verify)
+        ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
+        values = _target_verify_linear(self.value_proj, embeddings, target_verify)
         queries = self.norm_query(hidden_states).reshape(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -1265,26 +1372,46 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         position_ids: Optional[mx.array],
+        gdn_sink=None,
+        target_verify: bool = False,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
-                hidden_states, input_ids, cache, mask
+                hidden_states,
+                input_ids,
+                cache,
+                mask,
+                target_verify=target_verify,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
-            hidden_states
+            hidden_states,
+            target_verify=target_verify,
         )
         if self.is_linear:
-            branch = self.linear_attn(mixed, mask=mask, cache=cache)
+            branch = self.linear_attn(
+                mixed,
+                mask=mask,
+                cache=cache,
+                gdn_sink=gdn_sink,
+                target_verify=target_verify,
+            )
         else:
             branch = self.self_attn(
-                mixed, mask=mask, cache=cache, position_ids=position_ids
+                mixed,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                target_verify=target_verify,
             )
         injection = branch[..., None, :] * injection_weights[..., None]
         hidden_states = hyper_input + injection.reshape(*hyper_input.shape)
 
-        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
-        branch = self.mlp(mixed)
+        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
+            hidden_states,
+            target_verify=target_verify,
+        )
+        branch = self.mlp(mixed, target_verify=target_verify)
         injection = branch[..., None, :] * injection_weights[..., None]
         return hyper_input + injection.reshape(*hyper_input.shape)
 
@@ -1315,6 +1442,7 @@ class Qwen4ExpModel(nn.Module):
         position_ids: Optional[mx.array] = None,
         capture_layer_ids=None,
         hidden_sink=None,
+        gdn_sink=None,
         **kwargs,
     ):
         del kwargs
@@ -1339,11 +1467,138 @@ class Qwen4ExpModel(nn.Module):
                 mask=layer_mask,
                 cache=layer_cache,
                 position_ids=position_ids,
+                gdn_sink=gdn_sink,
+                target_verify=gdn_sink is not None,
             )
             if hidden_sink is not None and index in capture:
-                hidden_sink.append(self.hyper_connection_mixer(hidden_states))
+                hidden_sink.append(
+                    self.hyper_connection_mixer(
+                        hidden_states,
+                        target_verify=gdn_sink is not None,
+                    )
+                )
 
-        return self.hyper_connection_mixer(hidden_states)
+        if inputs_embeds is None and gdn_sink is None:
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                from omlx.patches.mlx_lm_mtp import prompt_priming
+
+                if prompt_priming.capture_eligible(host, cache):
+                    prompt_priming.maybe_capture(
+                        host,
+                        inputs,
+                        hidden_states,
+                        cache,
+                    )
+
+        if hidden_sink is not None and capture_layer_ids == []:
+            # Lightning MTP consumes all residual streams before the final
+            # mixer. Ordinary layer captures retain their mixed representation.
+            hidden_sink.append(hidden_states)
+
+        return self.hyper_connection_mixer(
+            hidden_states,
+            target_verify=gdn_sink is not None,
+        )
+
+
+class Qwen4ExpMTPModule(nn.Module):
+    """Embedded one-layer draft head for Qwen4 Lightning MTP."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.hc_count = args.hc_count
+        hc_hidden_size = self.hc_count * self.hidden_size
+        self.pre_fc_norm_embedding = Qwen4ExpRMSNorm(
+            self.hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.pre_fc_norm_hidden = Qwen4ExpRMSNorm(
+            hc_hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.fc_embedding = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+        self.fc_hidden = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+
+        layer_config = replace(
+            args,
+            num_hidden_layers=1,
+            layer_types=["qwen_sparse_attention"],
+            full_attention_interval=1,
+            ple_layer_ids=[],
+        )
+        self.layers = [Qwen4ExpDecoderLayer(layer_config, layer_idx=0)]
+        self.hyper_connection_mixer = Qwen4ExpGatedResidual(
+            layer_config,
+            use_combine=False,
+        )
+
+    def fuse_inputs(
+        self,
+        token_embeddings: mx.array,
+        hidden_states: mx.array,
+    ) -> mx.array:
+        expected_width = self.hc_count * self.hidden_size
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.reshape(
+                *hidden_states.shape[:-2],
+                expected_width,
+            )
+        if hidden_states.ndim != 3 or hidden_states.shape[-1] != expected_width:
+            raise ValueError(
+                "Qwen4 Lightning MTP expects hidden shape "
+                "[batch, tokens, hc_count * hidden_size]."
+            )
+
+        projected_embedding = self.fc_embedding(
+            self.pre_fc_norm_embedding(token_embeddings)
+        )
+        hidden_streams = self.pre_fc_norm_hidden(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            self.hc_count,
+            self.hidden_size,
+        )
+        projected_hidden = self.fc_hidden(hidden_streams)
+        return (projected_embedding[..., None, :] + projected_hidden).reshape(
+            hidden_states.shape
+        )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens,
+        cache=None,
+    ) -> tuple[mx.array, mx.array]:
+        hidden_states = self.fuse_inputs(
+            embed_tokens(next_token_ids),
+            hidden_states,
+        )
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = _create_qwen3_5_attention_mask(
+            hidden_states,
+            cache[0] if cache else None,
+        )
+        for layer, layer_cache in zip(self.layers, cache):
+            hidden_states = layer(
+                hidden_states,
+                next_token_ids,
+                mask=mask,
+                cache=layer_cache,
+                position_ids=None,
+            )
+        return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
@@ -1353,10 +1608,76 @@ class LanguageModel(Qwen3_5LanguageModel):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen4ExpModel(args)
+        self.model._omlx_mtp_prime_host = weakref.ref(self)
         self._position_ids = None
         self._rope_deltas = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def bind_mtp_owner(self, owner) -> None:
+        """Reference a root-level Lightning MTP head without double registration."""
+        self._omlx_qwen4_mtp_owner = weakref.ref(owner)
+        self._enable_mtp_decode_markers()
+
+    def _enable_mtp_decode_markers(self) -> None:
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth
+
+        self._omlx_mtp_decode_enabled = True
+        self._omlx_mtp_chain = True
+        self._omlx_mtp_depth = get_mtp_depth()
+        self._omlx_mtp_head_prenorm = True
+
+    def get_mtp_module(self):
+        module = getattr(self, "mtp", None)
+        if module is not None:
+            return module
+        owner_ref = getattr(self, "_omlx_qwen4_mtp_owner", None)
+        owner = owner_ref() if owner_ref is not None else None
+        return getattr(owner, "mtp", None) if owner is not None else None
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        return_hidden = bool(kwargs.get("return_hidden", False))
+        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        if mtp_capture:
+            kwargs["capture_layer_ids"] = []
+        output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+        if mtp_capture and output.hidden_states:
+            output.hidden_states = [output.hidden_states[0]]
+        return output
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        mtp = self.get_mtp_module()
+        if mtp is None:
+            raise RuntimeError(
+                "Qwen4 Lightning MTP forward called without an attached head."
+            )
+        mtp_output, hc_hidden = mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+        )
+        logits_source = mtp_output
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hc_hidden
+        return logits
+
+    def make_mtp_cache(self):
+        mtp = self.get_mtp_module()
+        return [QSAKVCache() for _ in mtp.layers] if mtp is not None else []
 
     def make_cache(self):
         caches = []
