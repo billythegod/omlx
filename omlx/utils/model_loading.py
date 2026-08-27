@@ -651,7 +651,10 @@ def maybe_apply_pre_load_patches(
             if model_settings is not None
             else None
         )
-        set_mtp_depth(int(depth) if depth else 1)
+        # Qwen4-Exp uses the same adaptive draft-depth controller as the
+        # general Lightning MTP path.  A single MTP hidden layer can be
+        # chained autoregressively, so default to the validated max depth 3.
+        set_mtp_depth(int(depth) if depth else 3)
         if mtp_active and not apply_mlx_lm_mtp_patch():
             logger.warning(
                 "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "

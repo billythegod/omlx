@@ -59,7 +59,7 @@ def test_qwen4_exp_mlx_metadata_is_hidden_during_load(tmp_path, monkeypatch):
     assert safetensors.safe_open is original
 
 
-def test_qwen4_exp_loader_enables_depth_one_lightning_mtp(tmp_path):
+def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -86,7 +86,7 @@ def test_qwen4_exp_loader_enables_depth_one_lightning_mtp(tmp_path):
 
     assert get_mtp_runtime().enabled is True
     assert get_mtp_runtime().checkpoint_prefix == "mtp."
-    assert get_mtp_depth() == 1
+    assert get_mtp_depth() == 3
     assert is_mtp_active() is True
 
     maybe_apply_pre_load_patches(
