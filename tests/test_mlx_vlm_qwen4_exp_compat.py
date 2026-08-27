@@ -121,6 +121,59 @@ def test_qwen4_exp_sanitize_keeps_converted_norm_values():
     assert mx.array_equal(result["language_model.model.norm.weight"], norm).item()
 
 
+def test_qwen4_exp_sanitize_keeps_converted_ple_shared_scale():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    key = (
+        "language_model.model.layers.1.ple.ple_embedding."
+        "ngram_embedding.weight_scale"
+    )
+    scale = mx.array([0.0002], dtype=mx.bfloat16)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=0,
+                num_experts=0,
+                ple_layer_ids=[2],
+            )
+        )
+    )
+
+    result = Model.sanitize(model, {key: scale})
+
+    assert list(name for name in result if name.endswith("weight_scale")) == [key]
+    assert mx.array_equal(result[key], scale).item()
+
+
+def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    key = (
+        "language_model.model.layers.1.ple.ple_embedding."
+        "ngram_embedding.weight_scale"
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False,
+                num_hidden_layers=0,
+                num_experts=0,
+                ple_layer_ids=[2],
+            )
+        )
+    )
+
+    result = Model.sanitize(model, {})
+
+    assert list(name for name in result if name.endswith("weight_scale")) == [key]
+    assert mx.array_equal(
+        result[key], mx.ones((1,), dtype=mx.bfloat16)
+    ).item()
+
+
 def test_qwen4_quantization_sanitize_keeps_mmap_ple_shards(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime

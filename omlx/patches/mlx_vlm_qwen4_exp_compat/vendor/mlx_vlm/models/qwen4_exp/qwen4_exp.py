@@ -47,11 +47,23 @@ class Model(Qwen3_5Model):
                 weights.pop(key)
         weights = dequantize_fp8_weights(weights, copy_weights=False)
         for layer_id in getattr(self.config.text_config, "ple_layer_ids", ()):
-            scale_key = (
+            source_scale_key = (
                 f"model.language_model.layers.{int(layer_id) - 1}.ple."
                 "ple_embedding.ngram_embedding.weight_scale"
             )
-            weights.setdefault(scale_key, mx.ones((1,), dtype=mx.bfloat16))
+            runtime_scale_key = (
+                f"language_model.model.layers.{int(layer_id) - 1}.ple."
+                "ple_embedding.ngram_embedding.weight_scale"
+            )
+            # Converted MLX checkpoints already use the runtime prefix. Do not
+            # add the raw-HF default as a second key: sanitize_key() maps both
+            # spellings to runtime_scale_key, and the default would otherwise
+            # overwrite a real shared FP8 PLE scale during normalization.
+            if (
+                source_scale_key not in weights
+                and runtime_scale_key not in weights
+            ):
+                weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
         mtp_enabled = get_mtp_runtime().enabled
 
         normalized = {}
