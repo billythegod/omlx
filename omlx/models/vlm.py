@@ -70,6 +70,9 @@ class VLMModelAdapter(nn.Module):
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        close = getattr(self._vlm_model, "close", None)
+        if callable(close):
+            close()
         self._pending_embeds = None
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()

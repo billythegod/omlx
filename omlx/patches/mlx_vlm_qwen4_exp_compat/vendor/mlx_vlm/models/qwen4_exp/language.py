@@ -151,6 +151,10 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
     return _PLE_RUNTIME_MODE
 
 
+def get_ple_runtime_mode() -> str:
+    return _PLE_RUNTIME_MODE
+
+
 def _append_indexer_positions(
     cached: Optional[mx.array], position_ids: mx.array
 ) -> mx.array:
@@ -961,7 +965,7 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 
 
 class _SafeTensorMMap:
-    """Read sparse BF16 embedding rows without making the table resident."""
+    """Read selected dense or affine-packed rows without resident weights."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -978,23 +982,39 @@ class _SafeTensorMMap:
     def tensor_shape(self, key: str) -> tuple[int, ...]:
         return tuple(self._header[key]["shape"])
 
+    def tensor_dtype(self, key: str) -> str:
+        return str(self._header[key]["dtype"])
+
     def rows(self, key: str, rows: list[int]) -> mx.array:
         entry = self._header[key]
-        if entry["dtype"] != "BF16":
-            raise TypeError(f"SSD-backed Qwen4 PLE requires BF16, got {entry['dtype']}")
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
-        if len(shape) != 2 or end - start != math.prod(shape) * 2:
+        dtype = entry["dtype"]
+        dtype_info = {
+            "BF16": (np.dtype("<u2"), 2),
+            "F16": (np.dtype("<f2"), 2),
+            "F32": (np.dtype("<f4"), 4),
+            "U32": (np.dtype("<u4"), 4),
+            "F8_E4M3": (np.dtype("u1"), 1),
+        }.get(dtype)
+        if dtype_info is None:
+            raise TypeError(f"SSD-backed Qwen4 PLE does not support {dtype}")
+        np_dtype, item_size = dtype_info
+        if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
         view = np.ndarray(
             shape,
-            dtype=np.dtype("<u2"),
+            dtype=np_dtype,
             buffer=self._mapping,
             offset=self._data_start + start,
         )
         copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
-        values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-        return mx.array(values).astype(mx.bfloat16)
+        if dtype == "BF16":
+            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
+            return mx.array(values).astype(mx.bfloat16)
+        if dtype == "F8_E4M3":
+            return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
+        return mx.array(copied)
 
     def close(self):
         if self._mapping is not None:
@@ -1006,7 +1026,7 @@ class _SafeTensorMMap:
 
 
 class DiskBackedShardedEmbedding(nn.Module):
-    """The official 128-way PLE table, gathered directly from SSD mmap."""
+    """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
     def __init__(
         self,
@@ -1026,29 +1046,137 @@ class DiskBackedShardedEmbedding(nn.Module):
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
         self.dims = dims
+        self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
         self.rows_read = 0
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
+        self._shard_specs: dict[
+            int, tuple[str, str | None, str | None, int | None, int | None]
+        ] = {}
 
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
         weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-        for shard_index, shard_size in enumerate(self.shard_sizes):
-            key = f"{prefix}.shard_{shard_index}.weight"
-            filename = weight_map.get(key)
-            if filename is None:
-                raise KeyError(f"SSD-backed PLE tensor {key!r} is absent")
+
+        def register_reader(key: str) -> _SafeTensorMMap:
+            filename = weight_map[key]
             reader = self._readers.get(filename)
             if reader is None:
                 reader = _SafeTensorMMap(model_path / filename)
                 self._readers[filename] = reader
-            if reader.tensor_shape(key) != (shard_size, dims):
-                raise ValueError(
-                    f"Unexpected shape for {key}: {reader.tensor_shape(key)}"
-                )
             self._tensor_readers[key] = reader
+            return reader
+
+        runtime_prefix = prefix
+        if runtime_prefix.startswith("model.language_model."):
+            runtime_prefix = (
+                "language_model.model." + runtime_prefix[len("model.language_model.") :]
+            )
+        for shard_index, shard_size in enumerate(self.shard_sizes):
+            bases = (
+                f"{prefix}.shard_{shard_index}",
+                f"{prefix}.shards.{shard_index}",
+                f"{runtime_prefix}.shard_{shard_index}",
+                f"{runtime_prefix}.shards.{shard_index}",
+            )
+            base = next(
+                (
+                    candidate
+                    for candidate in bases
+                    if f"{candidate}.weight" in weight_map
+                ),
+                None,
+            )
+            if base is None:
+                raise KeyError(
+                    f"SSD-backed PLE shard {shard_index} is absent; "
+                    f"checked {', '.join(bases)}"
+                )
+
+            weight_key = f"{base}.weight"
+            scales_key = f"{base}.scales"
+            biases_key = f"{base}.biases"
+            weight_reader = register_reader(weight_key)
+            weight_shape = weight_reader.tensor_shape(weight_key)
+            weight_dtype = weight_reader.tensor_dtype(weight_key)
+            if len(weight_shape) != 2 or weight_shape[0] != shard_size:
+                raise ValueError(f"Unexpected shape for {weight_key}: {weight_shape}")
+
+            if scales_key not in weight_map and biases_key not in weight_map:
+                if weight_shape[1] != dims:
+                    raise ValueError(
+                        f"Unexpected dense PLE width for {weight_key}: "
+                        f"expected {dims}, got {weight_shape[1]}"
+                    )
+                if weight_dtype not in {"BF16", "F16", "F32", "F8_E4M3"}:
+                    raise TypeError(
+                        f"SSD-backed dense Qwen4 PLE does not support {weight_dtype}"
+                    )
+                self._shard_specs[shard_index] = (
+                    weight_key,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                continue
+
+            if scales_key not in weight_map or biases_key not in weight_map:
+                raise ValueError(
+                    f"Incomplete affine PLE tensors for {base}: both scales and "
+                    "biases are required"
+                )
+            if weight_dtype != "U32":
+                raise TypeError(
+                    f"Affine Qwen4 PLE weight must be U32, got {weight_dtype} "
+                    f"for {weight_key}"
+                )
+
+            scales_reader = register_reader(scales_key)
+            biases_reader = register_reader(biases_key)
+            scales_shape = scales_reader.tensor_shape(scales_key)
+            biases_shape = biases_reader.tensor_shape(biases_key)
+            if scales_shape != biases_shape or len(scales_shape) != 2:
+                raise ValueError(
+                    f"Invalid affine PLE parameter shapes for {base}: "
+                    f"scales={scales_shape}, biases={biases_shape}"
+                )
+            if scales_shape[0] != shard_size or scales_shape[1] <= 0:
+                raise ValueError(
+                    f"Unexpected affine PLE scale shape for {base}: {scales_shape}"
+                )
+            if dims % scales_shape[1] != 0:
+                raise ValueError(
+                    f"Cannot infer affine PLE group size for {base}: "
+                    f"dims={dims}, scales={scales_shape}"
+                )
+            group_size = dims // scales_shape[1]
+            packed_bits = weight_shape[1] * 32
+            if packed_bits % dims != 0:
+                raise ValueError(
+                    f"Cannot infer affine PLE bits for {base}: "
+                    f"dims={dims}, packed_shape={weight_shape}"
+                )
+            bits = packed_bits // dims
+            if bits not in {2, 3, 4, 5, 6, 8} or group_size not in {32, 64, 128}:
+                raise ValueError(
+                    f"Unsupported affine PLE layout for {base}: "
+                    f"bits={bits}, group_size={group_size}"
+                )
+            if dims % group_size or weight_shape[1] != dims * bits // 32:
+                raise ValueError(
+                    f"Inconsistent affine PLE layout for {base}: "
+                    f"weight={weight_shape}, scales={scales_shape}, dims={dims}"
+                )
+            self._shard_specs[shard_index] = (
+                weight_key,
+                scales_key,
+                biases_key,
+                bits,
+                group_size,
+            )
 
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
@@ -1066,14 +1194,32 @@ class DiskBackedShardedEmbedding(nn.Module):
         result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
         for shard_index in touched:
             positions = [
-                i for i, current_shard in enumerate(shard_indices)
+                i
+                for i, current_shard in enumerate(shard_indices)
                 if current_shard == shard_index
             ]
             local = [
                 host_indices[i] - self.shard_offsets[shard_index] for i in positions
             ]
-            key = f"{self._prefix}.shard_{shard_index}.weight"
-            values = self._tensor_readers[key].rows(key, local)
+            weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
+                shard_index
+            ]
+            values = self._tensor_readers[weight_key].rows(weight_key, local)
+            if bits is not None:
+                assert scales_key is not None
+                assert biases_key is not None
+                assert group_size is not None
+                scales = self._tensor_readers[scales_key].rows(scales_key, local)
+                biases = self._tensor_readers[biases_key].rows(biases_key, local)
+                values = mx.dequantize(
+                    values,
+                    scales,
+                    biases,
+                    group_size=group_size,
+                    bits=bits,
+                    mode="affine",
+                )
+            values = values.astype(mx.bfloat16) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
@@ -1083,6 +1229,7 @@ class DiskBackedShardedEmbedding(nn.Module):
             reader.close()
         self._readers.clear()
         self._tensor_readers.clear()
+        self._shard_specs.clear()
 
     @property
     def _prefix(self):
@@ -1105,6 +1252,9 @@ class ShardedEmbedding(nn.Module):
             base + (1 if index < remainder else 0) for index in range(num_shards)
         )
         self.shards = [nn.Embedding(size, dims) for size in self.shard_sizes]
+        # Official FP8 checkpoints keep one shared scale for every PLE shard.
+        # Decode only the selected rows so the 100 GB table stays compact.
+        self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         offsets = [0]
         for size in self.shard_sizes:
             offsets.append(offsets[-1] + size)
@@ -1138,6 +1288,9 @@ class ShardedEmbedding(nn.Module):
             ]
             positions = mx.array(positions_list, dtype=mx.int32)
             values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+            if values.dtype == mx.uint8:
+                values = mx.from_fp8(values, dtype=mx.bfloat16)
+            values = values * self.weight_scale
             if result is None:
                 result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
             result = result.at[positions].add(values)

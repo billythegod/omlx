@@ -1211,6 +1211,69 @@ class TestStreamingHelpers:
         assert gs == 64
         assert mode == "affine"
 
+    @pytest.mark.parametrize("oq_level, expected_bits", [(4, 4), (6, 6), (8, 8)])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight",
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0.weight",
+        ],
+    )
+    def test_qwen4_ngram_uses_base_bits_and_group32(
+        self, oq_level, expected_bits, path
+    ):
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "_oq_boost_map": {
+                path.removesuffix(".weight"): {
+                    "bits": 8,
+                    "group_size": 64,
+                    "mode": "affine",
+                }
+            },
+        }
+
+        bits, gs, mode = _get_predicate_bits(path, config, oq_level, 64)
+
+        assert (bits, gs, mode) == (expected_bits, 32, "affine")
+
+    def test_non_qwen4_ngram_keeps_default_group_size(self):
+        path = (
+            "model.layers.1.ple.ple_embedding.ngram_embedding."
+            "shards.0.weight"
+        )
+
+        bits, gs, mode = _get_predicate_bits(
+            path, {"model_type": "other"}, 4, 64
+        )
+
+        assert (bits, gs, mode) == (4, 64, "affine")
+
+    def test_qwen4_ngram_is_exempt_from_strict_imatrix_lookup(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        path = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0.weight"
+        )
+        imatrix = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            path,
+            (156_250, 160),
+            config={"model_type": "qwen4_exp"},
+            strict=True,
+            report=report,
+        )
+
+        assert importance is None
+        assert report["missing"] == []
+
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {
             "lm_head": (4096, 4096),
@@ -6144,6 +6207,63 @@ class TestInklingSanitizeDiscovery:
         np.testing.assert_array_equal(up, ref[:, :, 1, :])
         scale = np.asarray(materialized.pop(prefix + "gate_scale"))
         np.testing.assert_array_equal(scale, np.ones(n_experts, dtype=np.float32))
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQwen4ExpLayerWalk:
+    def test_trunk_and_mtp_imatrix_hooks_execute(self, tmp_path):
+        from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+
+        config = _tiny_config()
+        from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+        from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+        from omlx.oq import _collect_mtp_head_imatrix
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+            encoding="utf-8",
+        )
+        configure_mtp_runtime(tmp_path, enabled=True)
+        try:
+            model = Model(config)
+            tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+            layers = model.language_model.model.layers
+            inputs = model.language_model.model.embed_tokens(tokens)
+            inputs, masks, state = _prepare_layer_inputs(
+                model, layers, tokens, inputs
+            )
+
+            assert inputs.shape == (1, 6, 64)
+            assert state["kind"] == "qwen4_exp"
+            assert masks[0] is None
+            assert masks[1] is not None
+
+            collector = OQImatrixCollector()
+            assert collector.install(model) > 0
+            try:
+                for layer_idx, layer in enumerate(layers):
+                    inputs, _ = _forward_layer_result(
+                        layer,
+                        inputs,
+                        masks[layer_idx],
+                        state,
+                        layer_idx=layer_idx,
+                    )
+                    mx.eval(inputs)
+                assert _collect_mtp_head_imatrix(model, tokens, inputs)
+                assert any(
+                    name.startswith("language_model.model.layers.")
+                    for name in collector.entries
+                )
+                assert "mtp.fc_embedding" in collector.entries
+                assert any(
+                    name.startswith("mtp.layers.0.mlp.switch_mlp.")
+                    for name in collector.entries
+                )
+            finally:
+                collector.restore(model)
+        finally:
+            configure_mtp_runtime(tmp_path, enabled=False)
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

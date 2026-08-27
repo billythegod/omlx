@@ -12,10 +12,15 @@ from .language import (
     LanguageModel,
     Qwen4ExpMTPModule,
     get_mtp_runtime,
+    get_ple_runtime_mode,
 )
 from .vision import VisionModel
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
+_NGRAM_STORAGE_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\."
+    r"(?:shard_\d+|shards\.\d+)\.(?:weight|scales|biases)$"
+)
 _MTP_PREFIXES = (
     "model.language_model.mtp.",
     "language_model.mtp.",
@@ -35,7 +40,18 @@ class Model(Qwen3_5Model):
             self.language_model.bind_mtp_owner(self)
 
     def sanitize(self, weights):
+        if get_ple_runtime_mode() == "mmap" and not getattr(
+            self, "_omlx_preserve_qwen4_ple_for_quantization", False
+        ):
+            for key in [key for key in weights if _NGRAM_STORAGE_RE.search(key)]:
+                weights.pop(key)
         weights = dequantize_fp8_weights(weights, copy_weights=False)
+        for layer_id in getattr(self.config.text_config, "ple_layer_ids", ()):
+            scale_key = (
+                f"model.language_model.layers.{int(layer_id) - 1}.ple."
+                "ple_embedding.ngram_embedding.weight_scale"
+            )
+            weights.setdefault(scale_key, mx.ones((1,), dtype=mx.bfloat16))
         mtp_enabled = get_mtp_runtime().enabled
 
         normalized = {}
@@ -131,7 +147,9 @@ class Model(Qwen3_5Model):
         """Release external PLE mmap handles during oMLX model unload."""
         for layer in self.language_model.model.layers:
             ple = getattr(layer, "ple", None)
-            embedding = getattr(getattr(ple, "ple_embedding", None), "ngram_embedding", None)
+            embedding = getattr(
+                getattr(ple, "ple_embedding", None), "ngram_embedding", None
+            )
             close = getattr(embedding, "close", None)
             if close is not None:
                 close()

@@ -121,6 +121,52 @@ def test_qwen4_exp_sanitize_keeps_converted_norm_values():
     assert mx.array_equal(result["language_model.model.norm.weight"], norm).item()
 
 
+def test_qwen4_quantization_sanitize_keeps_mmap_ple_shards(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=0,
+            num_experts=0,
+            ple_layer_ids=(),
+        )
+    )
+    key = (
+        "model.language_model.layers.1.ple.ple_embedding."
+        "ngram_embedding.shard_0.weight"
+    )
+    base = key.removesuffix(".weight")
+    weights = {
+        key: mx.zeros((2, 20), dtype=mx.uint32),
+        f"{base}.scales": mx.ones((2, 5), dtype=mx.bfloat16),
+        f"{base}.biases": mx.zeros((2, 5), dtype=mx.bfloat16),
+    }
+    runtime_model = SimpleNamespace(config=config)
+    quantization_proxy = SimpleNamespace(
+        config=config,
+        _omlx_preserve_qwen4_ple_for_quantization=True,
+    )
+
+    configure_ple_runtime(tmp_path, mode="mmap")
+    try:
+        assert Model.sanitize(runtime_model, dict(weights)) == {}
+        sanitized = Model.sanitize(quantization_proxy, dict(weights))
+    finally:
+        configure_ple_runtime(tmp_path, mode="resident")
+
+    sanitized_key = (
+        "language_model.model.layers.1.ple.ple_embedding."
+        "ngram_embedding.shards.0.weight"
+    )
+    assert sanitized_key in sanitized
+    assert sanitized[sanitized_key].shape == (2, 20)
+    assert sanitized_key.removesuffix(".weight") + ".scales" in sanitized
+    assert sanitized_key.removesuffix(".weight") + ".biases" in sanitized
+
+
 def test_qwen4_exp_tiny_text_prefill_and_decode():
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
@@ -132,6 +178,25 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     mx.eval(logits.logits, next_logits.logits)
     assert logits.logits.shape == (1, 3, 64)
     assert next_logits.logits.shape == (1, 1, 64)
+
+
+def test_qwen4_fp8_ple_dequantizes_only_selected_rows():
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(num_embeddings=4, dims=2, num_shards=2)
+    embedding.shards[0].weight = mx.to_fp8(
+        mx.array([[1.0, 2.0], [3.0, 4.0]], dtype=mx.float32)
+    )
+    embedding.shards[1].weight = mx.to_fp8(
+        mx.array([[5.0, 6.0], [7.0, 8.0]], dtype=mx.float32)
+    )
+    embedding.weight_scale = mx.array([0.25], dtype=mx.bfloat16)
+
+    result = embedding(mx.array([[1, 2]], dtype=mx.int32))
+    expected = mx.array([[[0.75, 1.0], [1.25, 1.5]]], dtype=mx.bfloat16)
+
+    assert mx.array_equal(result, expected).item()
 
 
 def test_qwen4_qsa_cache_round_trip_preserves_greedy_decode():
@@ -291,6 +356,7 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
 
 
 def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
     prefix = (
@@ -323,6 +389,63 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    source_prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    stored_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {}
+    expected_rows = []
+    for shard_index in range(2):
+        dense = (
+            mx.arange(4 * 160, dtype=mx.float32).reshape(4, 160) / 97
+            + shard_index * 10
+        ).astype(mx.bfloat16)
+        weight, scales, biases = mx.quantize(
+            dense, group_size=32, bits=bits, mode="affine"
+        )
+        base = f"{stored_prefix}.shards.{shard_index}"
+        tensors[f"{base}.weight"] = weight
+        tensors[f"{base}.scales"] = scales
+        tensors[f"{base}.biases"] = biases
+        expected_rows.append(
+            mx.dequantize(
+                weight,
+                scales,
+                biases,
+                group_size=32,
+                bits=bits,
+                mode="affine",
+            )
+        )
+
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: filename for key in tensors}}),
+        encoding="utf-8",
+    )
+
+    embedding = DiskBackedShardedEmbedding(
+        tmp_path,
+        source_prefix,
+        num_embeddings=8,
+        dims=160,
+        num_shards=2,
+    )
+    values = embedding(mx.array([[1, 6]], dtype=mx.int32))
+    mx.eval(values)
+    expected = mx.stack([expected_rows[0][1], expected_rows[1][2]])[None]
+
+    assert mx.allclose(values, expected, atol=2e-2, rtol=2e-2).item()
+    assert embedding.last_touched_shards == (0, 1)
+    assert embedding.rows_read == 2
+    assert embedding._shard_specs[0][3:] == (bits, 32)
+    embedding.close()
+
+
 def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
     compute = tmp_path / "compute"
     ple = tmp_path / "ple"
@@ -339,4 +462,9 @@ def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
         ),
         encoding="utf-8",
     )
-    assert compat.configure_qwen4_exp_runtime(compute) == "mmap"
+    try:
+        assert compat.configure_qwen4_exp_runtime(compute) == "mmap"
+    finally:
+        from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
+
+        configure_ple_runtime(compute, mode="resident")
