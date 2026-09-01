@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mmap
 import os
@@ -37,6 +38,83 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+_TEXT_MROPE_EQUAL_PLANES: dict[int, tuple[int, bool]] = {}
+_LAST_QSA_PATH_LOG: tuple[Any, ...] | None = None
+logger = logging.getLogger("omlx.qwen4_qsa")
+
+
+def _broadcast_text_mrope_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing/2-D text ids, or 3-D MRoPE that is a text broadcast.
+
+    Parent LanguageModel tiles identical ``(1, L)`` positions to ``(3, 1, L)``
+    for text-only mRoPE. Real image grids differ across the three planes and
+    must stay on the official mask+SDPA path.
+    """
+    if position_ids is None:
+        return True
+    if not isinstance(position_ids, mx.array):
+        return False
+    if position_ids.ndim == 2:
+        return tuple(position_ids.shape) == (1, length)
+    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
+        return False
+    cache_key = id(position_ids)
+    cached = _TEXT_MROPE_EQUAL_PLANES.get(cache_key)
+    if cached is not None and cached[0] == length:
+        return cached[1]
+    same = bool(
+        mx.array_equal(position_ids[0], position_ids[1]).item()
+        and mx.array_equal(position_ids[1], position_ids[2]).item()
+    )
+    if len(_TEXT_MROPE_EQUAL_PLANES) >= 8:
+        _TEXT_MROPE_EQUAL_PLANES.clear()
+    _TEXT_MROPE_EQUAL_PLANES[cache_key] = (length, same)
+    return same
+
+
+def _split_text_mrope_positions(
+    position_ids: Optional[mx.array],
+    batch: int,
+    length: int,
+    past_len: int,
+) -> tuple[mx.array, mx.array]:
+    """Indexer text ids vs rotary ids for the gathered QSA arms."""
+    if position_ids is None:
+        text_position_ids = mx.arange(
+            past_len, past_len + length, dtype=mx.int32
+        )[None]
+        rotary_position_ids = mx.broadcast_to(
+            text_position_ids,
+            (3, batch, length),
+        )
+        return text_position_ids, rotary_position_ids
+    if position_ids.ndim == 3:
+        return position_ids[0], position_ids
+    return position_ids, position_ids
+
+
+def _log_qsa_prefill_path(
+    path: str,
+    *,
+    kv_len: int,
+    query: int,
+    position_ndim: int | None,
+) -> None:
+    global _LAST_QSA_PATH_LOG
+    key = (path, kv_len, query, position_ndim)
+    if key == _LAST_QSA_PATH_LOG:
+        return
+    _LAST_QSA_PATH_LOG = key
+    logger.info(
+        "qwen4 QSA prefill path=%s query=%d kv_len=%d position_ids.ndim=%s",
+        path,
+        query,
+        kv_len,
+        position_ndim,
+    )
 
 
 @dataclass(frozen=True)
@@ -1030,13 +1108,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array],
         length: int,
     ) -> bool:
-        """Accept absent or shape-matched 2-D text positions, never MRoPE."""
+        """Accept absent, 2-D text, or broadcast-identical 3-D text mRoPE."""
 
-        return position_ids is None or bool(
-            isinstance(position_ids, mx.array)
-            and position_ids.ndim == 2
-            and position_ids.shape == (1, length)
-        )
+        return _broadcast_text_mrope_position_ids(position_ids, length)
 
     def _gathered_text_prefill_eligible(
         self,
@@ -1137,17 +1211,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len, past_len + length, dtype=mx.int32
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, keys = self.rotary_emb.apply_rotary(
             queries,
             keys,
@@ -1238,19 +1304,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len,
-                past_len + 1,
-                dtype=mx.int32,
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, new_keys = self.rotary_emb.apply_rotary(
             queries,
             new_keys,
@@ -1306,6 +1362,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        query = int(x.shape[1]) if x.ndim == 3 else 0
+        kv_len = int(getattr(cache, "offset", 0) or 0) + query
+        position_ndim = (
+            int(position_ids.ndim) if isinstance(position_ids, mx.array) else None
+        )
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -1324,8 +1385,21 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
+            _log_qsa_prefill_path(
+                "gathered",
+                kv_len=kv_len,
+                query=query,
+                position_ndim=position_ndim,
+            )
             return self._gathered_text_prefill(x, cache, position_ids)
 
+        if query > 1:
+            _log_qsa_prefill_path(
+                "mask_dense",
+                kv_len=kv_len,
+                query=query,
+                position_ndim=position_ndim,
+            )
         qsa_mask = self.indexer(
             x,
             cache,

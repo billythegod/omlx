@@ -684,7 +684,39 @@ def test_qwen4_gathered_qsa_fails_closed_for_multimodal_positions(monkeypatch):
     assert output.shape == hidden.shape
 
 
-def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
+def test_qwen4_gathered_qsa_routes_broadcast_text_mrope(monkeypatch):
+    """Parent LM tiles identical text positions to (3,1,L). That is still text."""
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    text_ids = mx.arange(20, dtype=mx.int32)[None]
+    position_ids = mx.broadcast_to(text_ids[None], (3, 1, 20))
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    actual = attention(
+        hidden,
+        mask="causal",
+        cache=QSAKVCache(),
+        position_ids=position_ids,
+    )
+    mx.eval(actual)
+
+    assert calls, "broadcast text mRoPE must take gathered QSA, not mask+dense SDPA"
+    assert actual.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_fails_closed_for_batched_requests(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
     from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention

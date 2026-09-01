@@ -3399,7 +3399,33 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    @contextmanager
+    def _qwen4_gathered_core_charge(self, enabled: bool):
+        """Price Qwen4 QSA core as gathered for text-only prefills only."""
+        monitor = self.memory_monitor
+        if monitor is None:
+            yield
+            return
+        previous = bool(getattr(monitor, "qwen4_charge_gathered_core", False))
+        monitor.qwen4_charge_gathered_core = bool(enabled)
+        try:
+            yield
+        finally:
+            monitor.qwen4_charge_gathered_core = previous
+
     def _do_external_prefill(
+        self,
+        request: "Request",
+        tokens: list[int],
+        existing_cache: list[Any] | None,
+        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
+    ) -> tuple[list[Any], list[int]]:
+        with self._qwen4_gathered_core_charge(vlm_embeds is None):
+            return self._do_external_prefill_impl(
+                request, tokens, existing_cache, vlm_embeds
+            )
+
+    def _do_external_prefill_impl(
         self,
         request: "Request",
         tokens: list[int],
@@ -3872,21 +3898,43 @@ class Scheduler:
         static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        if tracker is not None:
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
-            if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
-            recent_reclaim = tracker.recent_reclaim_bytes
+        # Gathered QSA prices a ~2K core, not Q×kv_len. A leftover dense
+        # last_delta/EWMA would still refuse that cheap chunk. Only ignore
+        # history while that cheaper charge is active — other models must
+        # keep max(last_delta, EWMA, static) or a real dense spike undercharges.
+        # `is True` so a MagicMock monitor in tests cannot trip this gate.
+        ignore_dense_history = (
+            getattr(self.memory_monitor, "qwen4_charge_gathered_core", False)
+            is True
+        )
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
-            per_token = max(per_token, static_per_token)
+            per_token = static_per_token
+        if tracker is not None:
+            ewma = float(tracker.bytes_per_token)
+            recent_reclaim = tracker.recent_reclaim_bytes
+            outlier_ratio = PrefillTransientTracker._EWMA_OUTLIER_RATIO
+            dense_history_is_stale = (
+                ignore_dense_history
+                and static_per_token > 0
+                and ewma > static_per_token * outlier_ratio
+            )
+            if ewma > 0 and not dense_history_is_stale:
+                per_token = max(per_token, ewma)
+            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                measured = tracker.last_delta_bytes / tracker.last_n_tokens
+                if (
+                    ignore_dense_history
+                    and static_per_token > 0
+                    and measured > static_per_token * outlier_ratio
+                ):
+                    measured = 0.0
+                if measured > 0:
+                    per_token = max(per_token, measured)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
             static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY

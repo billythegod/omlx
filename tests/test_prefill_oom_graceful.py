@@ -505,6 +505,48 @@ def test_predicted_transient_zero_without_signals():
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
 
 
+def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
+    """A leftover dense last_delta must not refuse gathered QSA static."""
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    monitor.qwen4_charge_gathered_core = True
+    tracker = PrefillTransientTracker()
+    tracker.update(4096, int(69.58 * _GB))
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+    predicted = ns._predicted_chunk_transient(4096, 233_472)
+    dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted < dense_poison / 8
+    assert 147 * _GB + predicted < 214 * _GB
+    # Without the gathered flag, that same leftover gulp must still bind.
+    monitor.qwen4_charge_gathered_core = False
+    dense_predicted = ns._predicted_chunk_transient(4096, 233_472)
+    assert dense_predicted == pytest.approx(dense_poison, rel=1e-3)
+
+
 def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     """A pool drop must remain priced until the next chunk reallocates it."""
     static_prediction = 11.18 * _GB
