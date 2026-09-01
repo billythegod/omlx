@@ -249,8 +249,8 @@ class MemoryMonitor:
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
-        # When True, Qwen4 QSA prefill is priced as gathered (token budget)
-        # rather than dense Q x kv_len. Set only for text-only prefills.
+        # Fallback for estimate_chunk_transient_bytes when the caller omits
+        # gathered_core=. Scheduler paths pass the argument explicitly.
         self.qwen4_charge_gathered_core: bool = False
 
         # PagedCacheManager for KV cache memory measurement
@@ -691,8 +691,11 @@ class MemoryMonitor:
         if num_tokens <= 0:
             return 0
         if self._prefill_memory_profile is not None:
-            return self._prefill_memory_profile.estimate_resident_kv_bytes(
-                num_tokens, chunk_tokens=chunk_tokens
+            return (
+                self._prefill_memory_profile.estimate_resident_kv_bytes(
+                    num_tokens, chunk_tokens=chunk_tokens
+                )
+                + self._fixed_state_bytes
             )
         total = self.estimate_prompt_kv_bytes(num_tokens)
 
@@ -840,7 +843,19 @@ class MemoryMonitor:
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
         return attn + kv + self._ane_prefill_transient_bytes
 
-    def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
+    def is_qwen4_gathered_prefill_profile(self) -> bool:
+        """True when this monitor prices Qwen4 QSA gathered-core prefill."""
+        return isinstance(
+            self._prefill_memory_profile, _Qwen4ExpPrefillMemoryProfile
+        )
+
+    def estimate_chunk_transient_bytes(
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool | None = None,
+    ) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
 
         Isolates the per-chunk attention transient — the spike that drives
@@ -855,14 +870,20 @@ class MemoryMonitor:
         and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
+
+        ``gathered_core`` prices Qwen4 QSA as a gathered core instead of
+        dense Q×kv_len. Scheduler paths pass it explicitly. When omitted,
+        ``qwen4_charge_gathered_core`` is the fallback for older tests.
         """
+        if gathered_core is None:
+            gathered_core = bool(self.qwen4_charge_gathered_core)
         if self._prefill_memory_profile is not None:
             profile = self._prefill_memory_profile
             if isinstance(profile, _Qwen4ExpPrefillMemoryProfile):
                 return profile.estimate_prefill_transient_bytes(
                     n_tokens,
                     kv_len,
-                    gathered_core=self.qwen4_charge_gathered_core,
+                    gathered_core=bool(gathered_core),
                 )
             return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)

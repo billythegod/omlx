@@ -716,6 +716,55 @@ def test_qwen4_gathered_qsa_routes_broadcast_text_mrope(monkeypatch):
     assert actual.shape == hidden.shape
 
 
+def test_qwen4_gathered_qsa_prefill_matches_official_broadcast_text_mrope(
+    monkeypatch,
+):
+    """Equal-plane 3-D text mRoPE gathered prefill matches the official path."""
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    plane = mx.arange(20, dtype=mx.int32)
+    position_ids = mx.stack([plane, plane, plane])[:, None, :]
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    fast_cache = QSAKVCache()
+    actual = attention(
+        hidden,
+        mask="causal",
+        cache=fast_cache,
+        position_ids=position_ids,
+    )
+
+    monkeypatch.setattr(
+        Qwen4ExpAttention,
+        "_gathered_text_prefill_eligible",
+        staticmethod(lambda *args, **kwargs: False),
+    )
+    reference_cache = QSAKVCache()
+    expected = attention(
+        hidden,
+        mask="causal",
+        cache=reference_cache,
+        position_ids=position_ids,
+    )
+    mx.eval(actual, expected)
+
+    assert calls, "materialized equal-plane 3-D text must take gathered QSA"
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert fast_cache.offset == reference_cache.offset == 20
+
+
 def test_qwen4_gathered_qsa_fails_closed_for_batched_requests(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language

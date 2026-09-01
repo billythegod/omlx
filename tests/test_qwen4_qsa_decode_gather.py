@@ -238,8 +238,8 @@ def test_qwen4_decode_gather_eligibility_fails_closed_for_general_paths():
     assert attention._gathered_text_decode_eligible(
         token, None, cache, mx.array([[10]], dtype=mx.int32), None, False
     )
-    # Parent LM tiles identical text positions to (3, 1, 1). That is still text.
-    assert attention._gathered_text_decode_eligible(
+    # 3-D equal planes are a decode-follow-up. Prefill still accepts them.
+    assert not attention._gathered_text_decode_eligible(
         token,
         None,
         cache,

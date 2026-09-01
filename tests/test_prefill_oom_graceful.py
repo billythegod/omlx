@@ -134,6 +134,9 @@ def _throttle_ctx(
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )
+    ns._estimate_chunk_transient_bytes = (
+        Scheduler._estimate_chunk_transient_bytes.__get__(ns, Scheduler)
+    )
     ns._admission_transient_bound = Scheduler._admission_transient_bound.__get__(
         ns, Scheduler
     )
@@ -532,19 +535,59 @@ def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
         num_attention_heads=24,
         prefill_memory_profile=profile,
     )
-    monitor.qwen4_charge_gathered_core = True
     tracker = PrefillTransientTracker()
-    tracker.update(4096, int(69.58 * _GB))
+    tracker.update(4096, int(69.58 * _GB), gathered_core=False)
     ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
     ns._prefill_transient_tracker = tracker
-    predicted = ns._predicted_chunk_transient(4096, 233_472)
+    predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
     dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
     assert predicted < dense_poison / 8
     assert 147 * _GB + predicted < 214 * _GB
-    # Without the gathered flag, that same leftover gulp must still bind.
-    monitor.qwen4_charge_gathered_core = False
-    dense_predicted = ns._predicted_chunk_transient(4096, 233_472)
+    # Without gathered pricing, that same leftover gulp must still bind.
+    dense_predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=False
+    )
     assert dense_predicted == pytest.approx(dense_poison, rel=1e-3)
+
+
+def test_predicted_transient_keeps_gathered_spike_from_this_request():
+    """A gathered chunk's own measured spike must still bind the next chunk."""
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    tracker = PrefillTransientTracker()
+    tracker.update(4096, int(69.58 * _GB), gathered_core=True)
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+    dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
+    predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
+    assert predicted == pytest.approx(dense_poison, rel=1e-3)
 
 
 def test_adaptive_throttle_charges_recently_reclaimed_footprint():
@@ -910,6 +953,9 @@ def test_step_prefill_reclaims_before_first_guard():
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
+    ns._qwen4_text_gathered_pricing = Scheduler._qwen4_text_gathered_pricing.__get__(
+        ns, Scheduler
+    )
 
     with (
         patch.object(
@@ -933,6 +979,7 @@ def test_step_prefill_reclaims_before_first_guard():
         loop_label="chunked_step",
         kv_len=0,
         requested_step=2,
+        gathered_core=False,
     )
 
 
