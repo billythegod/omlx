@@ -1404,6 +1404,54 @@ def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
     assert batch.index_offset == 5
     assert batch.index_keys.shape[1] == 5
     assert batch.index_position_ids.shape[-1] == 5
+
+
+def test_qwen4_batch_extend_unifies_2d_and_3d_indexer_positions():
+    """MTP late-join mixed gathered 2-D text positions with mask_dense 3-D mRoPE.
+
+    That used to raise ``[concatenate] ... dimensions 3 and 2`` at
+    ``BatchQSAKVCache.extend``.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    left = _warm_qsa_row(4, 0)
+    right = _warm_qsa_row(2, 40)
+    right.index_position_ids = mx.broadcast_to(
+        right.index_position_ids[None],
+        (3, *right.index_position_ids.shape),
+    )
+    left_batch = left.to_batch([0])
+    right_batch = right.to_batch([0])
+
+    left_batch.extend(right_batch)
+    mx.eval(left_batch.index_position_ids, left_batch.index_keys)
+
+    assert left_batch.index_position_ids.ndim == 3
+    assert left_batch.index_position_ids.shape[0] == 3
+    assert left_batch.index_keys.shape[0] == 2
+    extracted_right = left_batch.extract(1)
+    assert extracted_right.index_position_ids.ndim == 3
+    assert extracted_right.index_position_ids.shape[-1] == 2
+
+
+def test_qwen4_batch_merge_unifies_mixed_indexer_position_ranks():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    text = _warm_qsa_row(3, 10)
+    mrope = _warm_qsa_row(1, 30)
+    mrope.index_position_ids = mx.broadcast_to(
+        mrope.index_position_ids[None],
+        (3, *mrope.index_position_ids.shape),
+    )
+    merged = BatchQSAKVCache.merge([text, mrope])
+    mx.eval(merged.index_position_ids)
+    assert merged.index_position_ids.ndim == 3
+    assert merged.index_position_ids.shape[0] == 3
+    assert merged.offset.tolist() == [3, 1]
+
+
 def _make_bound_qwen4_language_model(config):
     from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
 

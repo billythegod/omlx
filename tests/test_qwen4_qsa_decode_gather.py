@@ -403,3 +403,16 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
         (256**-0.5, False, "native"),
     ]
     assert mx.array_equal(actual, expected).item()
+
+
+def test_python_cache_offset_accepts_batched_mx_array():
+    """Batched MTP decode used to crash the QSA path log on ``int(offset)``."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    assert language._python_cache_offset(None) == 0
+    assert language._python_cache_offset(0) == 0
+    assert language._python_cache_offset(11) == 11
+    assert language._python_cache_offset(mx.array(7, dtype=mx.int32)) == 7
+    assert language._python_cache_offset(mx.array([7], dtype=mx.int32)) == 7
+    assert language._python_cache_offset(mx.array([10, 20], dtype=mx.int32)) == 20

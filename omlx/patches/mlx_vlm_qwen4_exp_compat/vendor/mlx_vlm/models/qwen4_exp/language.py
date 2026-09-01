@@ -117,6 +117,62 @@ def _log_qsa_prefill_path(
     )
 
 
+def _python_cache_offset(offset: Any) -> int:
+    """Scalar KV length for logging. Batched offsets use the longest row.
+
+    ``BatchQSAKVCache.offset`` is an ``mx.array`` of per-row lengths. ``int()``
+    on that array raises ``[convert] Only length-1 arrays...`` and used to
+    abort the engine before eligibility could fail closed onto the official
+    path. Logging still wants one number; the longest row is the conservative
+    choice for ``kv_len``.
+    """
+    if offset is None:
+        return 0
+    if isinstance(offset, (int, np.integer)):
+        return int(offset)
+    shape = getattr(offset, "shape", None)
+    if shape is None:
+        try:
+            return int(offset)
+        except (TypeError, ValueError):
+            return 0
+    size = 1
+    for dim in shape:
+        size *= int(dim)
+    if size <= 1:
+        value = offset.reshape(-1)[0] if size == 1 else offset
+        return int(value.item()) if hasattr(value, "item") else int(value)
+    return int(mx.max(offset).item())
+
+
+def _promote_index_positions_to_3d(positions: mx.array, planes: int) -> mx.array:
+    if positions.ndim == 3:
+        if int(positions.shape[0]) != planes:
+            raise ValueError(
+                "QSA indexer mRoPE plane count mismatch during cache extend: "
+                f"{tuple(int(d) for d in positions.shape)} vs planes={planes}"
+            )
+        return positions
+    return mx.broadcast_to(positions[None], (planes, *positions.shape))
+
+
+def _unify_index_position_list(
+    positions: list[mx.array],
+) -> list[mx.array]:
+    """Promote 2-D text indexer positions to 3-D mRoPE so batch concat matches.
+
+    Gathered QSA stores the text plane as ``(B, S)``. The official mask_dense
+    path stores full mRoPE as ``(3, B, S)``. MTP late-join ``extend`` used to
+    concatenate those ranks and raise ``[concatenate] ... dimensions 3 and 2``.
+    """
+    if len(positions) < 2:
+        return positions
+    if all(item.ndim == positions[0].ndim for item in positions):
+        return positions
+    planes = next((int(item.shape[0]) for item in positions if item.ndim == 3), 3)
+    return [_promote_index_positions_to_3d(item, planes) for item in positions]
+
+
 @dataclass(frozen=True)
 class Qwen4ExpMTPRuntime:
     """Lightning MTP construction decision for the next model load."""
@@ -700,10 +756,11 @@ class BatchQSAKVCache:
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
+        left_pos, right_pos = _unify_index_position_list([left[1], right[1]])
         self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
-        position_axis = 1 if sample_positions.ndim == 3 else 0
+        position_axis = 1 if left_pos.ndim == 3 else 0
         self.index_position_ids = mx.concatenate(
-            [left[1], right[1]], axis=position_axis
+            [left_pos, right_pos], axis=position_axis
         )
         self.index_offset = target
 
@@ -754,9 +811,10 @@ class BatchQSAKVCache:
             for cache in caches
         ]
         out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
-        position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+        unified_positions = _unify_index_position_list([row[1] for row in rows])
+        position_axis = 1 if unified_positions[0].ndim == 3 else 0
         out.index_position_ids = mx.concatenate(
-            [row[1] for row in rows], axis=position_axis
+            unified_positions, axis=position_axis
         )
         out.index_offset = target
         return out
@@ -1363,7 +1421,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         target_verify: bool = False,
     ) -> mx.array:
         query = int(x.shape[1]) if x.ndim == 3 else 0
-        kv_len = int(getattr(cache, "offset", 0) or 0) + query
+        kv_len = _python_cache_offset(getattr(cache, "offset", 0)) + query
         position_ndim = (
             int(position_ids.ndim) if isinstance(position_ids, mx.array) else None
         )
