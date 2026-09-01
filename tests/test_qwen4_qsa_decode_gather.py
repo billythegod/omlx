@@ -274,6 +274,26 @@ def test_qwen4_decode_gather_eligibility_fails_closed_for_general_paths():
     )
 
 
+def test_qwen4_text_mrope_equal_plane_cache_does_not_reuse_dead_ids():
+    """CPython can recycle id() once a temporary mx.array is collected."""
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    equal = mx.array([[[10]], [[10]], [[10]]], dtype=mx.int32)
+    unequal = mx.array([[[10]], [[10]], [[9]]], dtype=mx.int32)
+    assert language._broadcast_text_mrope_position_ids(equal, 1)
+    assert not language._broadcast_text_mrope_position_ids(unequal, 1)
+
+    for _ in range(64):
+        assert language._broadcast_text_mrope_position_ids(
+            mx.array([[[4]], [[4]], [[4]]], dtype=mx.int32), 1
+        )
+        assert not language._broadcast_text_mrope_position_ids(
+            mx.array([[[4]], [[4]], [[3]]], dtype=mx.int32), 1
+        )
+
+
 @pytest.mark.parametrize("key_tokens", [4097, 32769])
 def test_qwen4_decode_gather_stays_budget_bounded_at_long_cache(
     monkeypatch,

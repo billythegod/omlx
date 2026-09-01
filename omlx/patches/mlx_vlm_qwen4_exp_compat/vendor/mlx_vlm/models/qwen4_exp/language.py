@@ -38,7 +38,8 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
-_TEXT_MROPE_EQUAL_PLANES: dict[int, tuple[int, bool]] = {}
+# Identity cache: keep the array alive so CPython cannot recycle id().
+_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
 _LAST_QSA_PATH_LOG: tuple[Any, ...] | None = None
 logger = logging.getLogger("omlx.qwen4_qsa")
 
@@ -61,17 +62,16 @@ def _broadcast_text_mrope_position_ids(
         return tuple(position_ids.shape) == (1, length)
     if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
         return False
-    cache_key = id(position_ids)
-    cached = _TEXT_MROPE_EQUAL_PLANES.get(cache_key)
-    if cached is not None and cached[0] == length:
-        return cached[1]
+    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
+        if cached_ids is position_ids and cached_len == length:
+            return cached_same
     same = bool(
         mx.array_equal(position_ids[0], position_ids[1]).item()
         and mx.array_equal(position_ids[1], position_ids[2]).item()
     )
-    if len(_TEXT_MROPE_EQUAL_PLANES) >= 8:
-        _TEXT_MROPE_EQUAL_PLANES.clear()
-    _TEXT_MROPE_EQUAL_PLANES[cache_key] = (length, same)
+    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
+    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
+        del _TEXT_MROPE_EQUAL_PLANES[:-8]
     return same
 
 
