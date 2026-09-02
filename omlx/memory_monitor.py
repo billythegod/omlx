@@ -249,10 +249,6 @@ class MemoryMonitor:
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
-        # Fallback for estimate_chunk_transient_bytes when the caller omits
-        # gathered_core=. Scheduler paths pass the argument explicitly.
-        self.qwen4_charge_gathered_core: bool = False
-
         # PagedCacheManager for KV cache memory measurement
         self._paged_cache_manager: Optional["PagedCacheManager"] = None
         self._block_size: int = 256  # Default block size
@@ -854,7 +850,7 @@ class MemoryMonitor:
         n_tokens: int,
         kv_len: int,
         *,
-        gathered_core: bool | None = None,
+        gathered_core: bool = False,
     ) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
 
@@ -872,18 +868,15 @@ class MemoryMonitor:
         Returns 0 when model info is unavailable.
 
         ``gathered_core`` prices Qwen4 QSA as a gathered core instead of
-        dense Q×kv_len. Scheduler paths pass it explicitly. When omitted,
-        ``qwen4_charge_gathered_core`` is the fallback for older tests.
+        dense Q×kv_len.
         """
-        if gathered_core is None:
-            gathered_core = bool(self.qwen4_charge_gathered_core)
         if self._prefill_memory_profile is not None:
             profile = self._prefill_memory_profile
             if isinstance(profile, _Qwen4ExpPrefillMemoryProfile):
                 return profile.estimate_prefill_transient_bytes(
                     n_tokens,
                     kv_len,
-                    gathered_core=bool(gathered_core),
+                    gathered_core=gathered_core,
                 )
             return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)

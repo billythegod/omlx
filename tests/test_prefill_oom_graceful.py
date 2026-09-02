@@ -134,9 +134,6 @@ def _throttle_ctx(
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )
-    ns._estimate_chunk_transient_bytes = (
-        Scheduler._estimate_chunk_transient_bytes.__get__(ns, Scheduler)
-    )
     ns._admission_transient_bound = Scheduler._admission_transient_bound.__get__(
         ns, Scheduler
     )
@@ -607,7 +604,7 @@ def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     static_prediction = 11.18 * _GB
     released = 6.34 * _GB
     monitor = SimpleNamespace(
-        estimate_chunk_transient_bytes=lambda _n, _kv: (
+        estimate_chunk_transient_bytes=lambda _n, _kv, *, gathered_core=False: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
         estimate_prompt_kv_bytes=lambda _n: 0,
@@ -653,7 +650,7 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
         512 * Scheduler._PREFILL_TRANSIENT_SAFETY
     )
     monitor = SimpleNamespace(
-        estimate_chunk_transient_bytes=lambda _n, _kv: (
+        estimate_chunk_transient_bytes=lambda _n, _kv, *, gathered_core=False: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
         estimate_prompt_kv_bytes=lambda _n: 0,
@@ -1133,7 +1130,7 @@ def test_adaptive_chunk_size_ignores_observed_max():
     before = _call(ns, 2048, kv_len=5000)
     assert before < 2048, "precondition: the throttle must actually shrink"
 
-    ns._prefill_transient_tracker._observed_max_bytes = 8 * _GB
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 8 * _GB
     after = _call(ns, 2048, kv_len=5000)
     assert after == before
 
@@ -1151,7 +1148,7 @@ def test_guard_abort_gate_charges_observed_max():
     assert _guard_call(ns, 2048, kv_len=50_000) < 2048
 
     # 2GB observed max no longer fits under the 1GB headroom: abort.
-    ns._prefill_transient_tracker._observed_max_bytes = 2 * _GB
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 2 * _GB
     with pytest.raises(PrefillMemoryExceededError):
         _guard_call(ns, 2048, kv_len=50_000)
 
@@ -1166,7 +1163,7 @@ def test_guard_shrink_math_unchanged_by_observed_max():
     before = _guard_call(ns, 2048, kv_len=50_000)
     assert before < 2048
 
-    ns._prefill_transient_tracker._observed_max_bytes = 512 * 1024**2
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 512 * 1024**2
     after = _guard_call(ns, 2048, kv_len=50_000)
     assert after == before
 

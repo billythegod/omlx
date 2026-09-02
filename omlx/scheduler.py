@@ -3437,17 +3437,6 @@ class Scheduler:
         existing_cache: list[Any] | None,
         vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
     ) -> tuple[list[Any], list[int]]:
-        return self._do_external_prefill_impl(
-            request, tokens, existing_cache, vlm_embeds
-        )
-
-    def _do_external_prefill_impl(
-        self,
-        request: "Request",
-        tokens: list[int],
-        existing_cache: list[Any] | None,
-        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
-    ) -> tuple[list[Any], list[int]]:
         """Run prefill externally (outside BatchGenerator) for a single request.
 
         Processes tokens[0:N-1] through the model. The last token tokens[N-1]
@@ -3909,21 +3898,6 @@ class Scheduler:
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
-    def _estimate_chunk_transient_bytes(
-        self, n_tokens: int, kv_len: int, *, gathered_core: bool
-    ) -> int:
-        """Call the monitor with an explicit gathered_core flag.
-
-        Test doubles often still take ``(n_tokens, kv_len)`` only.
-        """
-        estimate = self.memory_monitor.estimate_chunk_transient_bytes
-        try:
-            return int(
-                estimate(n_tokens, kv_len, gathered_core=gathered_core)
-            )
-        except TypeError:
-            return int(estimate(n_tokens, kv_len))
-
     def _predicted_chunk_transient(
         self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
     ) -> float:
@@ -3948,8 +3922,10 @@ class Scheduler:
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
         if self.memory_monitor is not None:
-            static = self._estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens, gathered_core=gathered_core
+            static = self.memory_monitor.estimate_chunk_transient_bytes(
+                n_tokens,
+                kv_len + n_tokens,
+                gathered_core=gathered_core,
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens

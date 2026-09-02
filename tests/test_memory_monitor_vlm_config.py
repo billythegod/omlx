@@ -163,10 +163,12 @@ def test_qwen4_prefill_profile_gathered_core_caps_score_matrix():
         prefill_memory_profile=profile,
     )
     query, kv_len = 4096, 233_472
-    monitor.qwen4_charge_gathered_core = False
-    dense = monitor.estimate_chunk_transient_bytes(query, kv_len)
-    monitor.qwen4_charge_gathered_core = True
-    gathered = monitor.estimate_chunk_transient_bytes(query, kv_len)
+    dense = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=False
+    )
+    gathered = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=True
+    )
     assert gathered * 8 < dense
     # 147GB resident + this gathered gulp stays under the 214GB safety cap.
     assert gathered < 12 * 1024**3
