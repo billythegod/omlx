@@ -6031,6 +6031,53 @@ class TestVLMPositionStateClearing:
         assert eval_mock.call_count == 1
         assert eval_mock.call_args.args[0] is seeded
 
+    def test_cached_vlm_prefill_builds_start_offset_views_on_engine_stream(
+        self, mock_tokenizer
+    ):
+        """Restored-prefix VLM views must not come from the worker default stream.
+
+        A default-stream slice at the head of the chunk graph leaves a
+        cross-stream fence that the Qwen ANE prefill primitive can never
+        satisfy while it blocks on the engine-stream buffer (#3305).
+        """
+        model = self._make_vlm_model()
+        engine_stream = mx.new_stream(mx.cpu)
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, stream=engine_stream
+        )
+        request = Request(
+            request_id="vlm-cached-001",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6]
+        request.num_prompt_tokens = 6
+        request.cached_tokens = 2
+        embeds = mx.zeros((1, 6, 8))
+        extra = {"position_ids": mx.zeros((3, 1, 6), dtype=mx.int32)}
+        seen_streams = []
+        real_advance = scheduler_module._advance_vlm_extra
+
+        def advance_spy(extra_kwargs, n):
+            seen_streams.append((n, mx.default_stream(mx.cpu)))
+            return real_advance(extra_kwargs, n)
+
+        with patch.object(
+            scheduler_module, "_advance_vlm_extra", side_effect=advance_spy
+        ):
+            scheduler._do_external_prefill(
+                request,
+                tokens=[3, 4, 5, 6],
+                existing_cache=[],
+                vlm_embeds=(embeds, extra, 2),
+            )
+
+        # First advance skips the cached prefix, second advances past the chunk.
+        assert seen_streams == [(2, engine_stream), (3, engine_stream)]
+        chunk_kwargs = model.call_args.kwargs
+        assert chunk_kwargs["inputs_embeds"].shape == (1, 3, 8)
+        assert chunk_kwargs["vlm_extra_kwargs"]["position_ids"].shape == (3, 1, 3)
+
     def test_fresh_text_only_prefill_does_not_seed_or_evaluate_mrope(self):
         previous = mx.array([[123]])
         language_model = SimpleNamespace(_rope_deltas=previous)
