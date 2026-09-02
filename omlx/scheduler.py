@@ -3947,17 +3947,6 @@ class Scheduler:
         static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        # Gathered QSA prices a ~2K core, not Q×kv_len. A leftover dense
-        # last_delta/EWMA would still refuse that cheap chunk. Ignore that
-        # leftover only when this chunk is priced gathered AND the last
-        # recorded sample was not itself gathered (a gathered spike on this
-        # request must still bind). `is True` so a MagicMock cannot trip it.
-        last_gathered = getattr(
-            self._prefill_transient_tracker, "last_sample_gathered", None
-        )
-        ignore_dense_history = (
-            gathered_core is True and last_gathered is not True
-        )
         if self.memory_monitor is not None:
             static = self._estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens, gathered_core=gathered_core
@@ -3966,24 +3955,18 @@ class Scheduler:
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
         if tracker is not None:
-            ewma = float(tracker.bytes_per_token)
+            # Dense SDPA and gathered QSA have different cost curves. The
+            # tracker keeps their measured histories separate, so switching
+            # paths cannot reintroduce a stale dense charge after the first
+            # gathered sample.
+            ewma = tracker.bytes_per_token_for(gathered_core)
             recent_reclaim = tracker.recent_reclaim_bytes
-            outlier_ratio = PrefillTransientTracker._EWMA_OUTLIER_RATIO
-            dense_history_is_stale = (
-                ignore_dense_history
-                and static_per_token > 0
-                and ewma > static_per_token * outlier_ratio
-            )
-            if ewma > 0 and not dense_history_is_stale:
+            if ewma > 0:
                 per_token = max(per_token, ewma)
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                measured = tracker.last_delta_bytes / tracker.last_n_tokens
-                if (
-                    ignore_dense_history
-                    and static_per_token > 0
-                    and measured > static_per_token * outlier_ratio
-                ):
-                    measured = 0.0
+            last_n_tokens = tracker.last_n_tokens_for(gathered_core)
+            last_delta_bytes = tracker.last_delta_bytes_for(gathered_core)
+            if last_n_tokens > 0 and last_delta_bytes > 0:
+                measured = last_delta_bytes / last_n_tokens
                 if measured > 0:
                     per_token = max(per_token, measured)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
@@ -4020,7 +4003,10 @@ class Scheduler:
         )
         tracker = self._prefill_transient_tracker
         if tracker is not None:
-            bound = max(bound, float(tracker.observed_max_bytes))
+            bound = max(
+                bound,
+                float(tracker.observed_max_bytes_for(gathered_core)),
+            )
         return bound
 
     def _prefill_abort_cap(self) -> int:
@@ -4223,7 +4209,9 @@ class Scheduler:
             # is diagnosable from one log line instead of re-deriving it.
             tracker = self._prefill_transient_tracker
             observed_max = (
-                float(tracker.observed_max_bytes) if tracker is not None else 0.0
+                float(tracker.observed_max_bytes_for(gathered_core))
+                if tracker is not None
+                else 0.0
             )
             ane_reservation = (
                 float(getattr(self.memory_monitor, "_ane_prefill_transient_bytes", 0))
@@ -4849,9 +4837,11 @@ class Scheduler:
             kv_len,
             delta / 1024**2,
             (delta / max(n_tokens, 1)) / 1024,
-            self._prefill_transient_tracker.bytes_per_token / 1024,
-            self._prefill_transient_tracker.observed_max_bytes / 1024**2,
-            self._prefill_transient_tracker.samples,
+            self._prefill_transient_tracker.bytes_per_token_for(gathered_core)
+            / 1024,
+            self._prefill_transient_tracker.observed_max_bytes_for(gathered_core)
+            / 1024**2,
+            self._prefill_transient_tracker.samples_for(gathered_core),
         )
 
     def _supports_skip_lm_head(self) -> bool:

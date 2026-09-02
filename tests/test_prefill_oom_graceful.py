@@ -545,6 +545,18 @@ def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
     dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
     assert predicted < dense_poison / 8
     assert 147 * _GB + predicted < 214 * _GB
+    # Recording the first gathered observation must not make the next
+    # gathered chunk inherit the dense EWMA. Before the histories were split,
+    # this second prediction jumped from ~5.47 GiB to ~64.96 GiB.
+    tracker.update(
+        4096,
+        int(predicted / Scheduler._PREFILL_TRANSIENT_SAFETY),
+        gathered_core=True,
+    )
+    next_predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
+    assert next_predicted == pytest.approx(predicted, rel=1e-6)
     # Without gathered pricing, that same leftover gulp must still bind.
     dense_predicted = ns._predicted_chunk_transient(
         4096, 233_472, gathered_core=False
