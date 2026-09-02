@@ -9,7 +9,6 @@ import weakref
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -574,23 +573,35 @@ class BatchQSAKVCache:
 
     @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
-        length = 0 if cache.index_keys is None else cache.index_offset
+        length = (
+            0
+            if cache.index_keys is None
+            else getattr(cache, "index_offset", cache.index_keys.shape[1])
+        )
         if isinstance(length, mx.array):
+            if length.size != 1:
+                raise ValueError(
+                    "QSA index length must be scalar after row normalization"
+                )
             length = int(length.item())
+        else:
+            length = int(length)
         left = target - length
         if cache.index_keys is None:
+            offset = cache.offset
+            batch_size = offset.shape[0] if isinstance(offset, mx.array) else 1
             keys = mx.zeros(
-                (cache.offset.shape[0], 0, sample_keys.shape[-1]),
+                (batch_size, 0, sample_keys.shape[-1]),
                 dtype=sample_keys.dtype,
             )
             if sample_positions.ndim == 3:
                 positions = mx.zeros(
-                    (sample_positions.shape[0], cache.offset.shape[0], 0),
+                    (sample_positions.shape[0], batch_size, 0),
                     dtype=sample_positions.dtype,
                 )
             else:
                 positions = mx.zeros(
-                    (cache.offset.shape[0], 0), dtype=sample_positions.dtype
+                    (batch_size, 0), dtype=sample_positions.dtype
                 )
         else:
             keys = cache.index_keys[:, :length]
@@ -620,7 +631,19 @@ class BatchQSAKVCache:
     def extend(self, other):
         if not isinstance(other, BatchQSAKVCache):
             raise TypeError(f"Cannot extend BatchQSAKVCache with {type(other)}")
-        self.kv_cache.extend(other.kv_cache)
+
+        for cache in (self, other):
+            if (cache.index_keys is None) != (cache.index_position_ids is None):
+                raise ValueError("QSA raw keys and positions must be extended together")
+            if cache.index_keys is None:
+                if cache.kv_cache.size():
+                    raise ValueError("Cannot extend QSA KV state without indexer state")
+            elif cache.index_offset != cache.kv_cache.size():
+                raise ValueError(
+                    "QSA extend requires aligned KV and indexer widths, got "
+                    f"kv={cache.kv_cache.size()} and indexer={cache.index_offset}"
+                )
+
         sample_keys = (
             self.index_keys if self.index_keys is not None else other.index_keys
         )
@@ -643,15 +666,20 @@ class BatchQSAKVCache:
         else:
             sample_positions = other_positions
         if sample_keys is None or sample_positions is None:
+            self.kv_cache.extend(other.kv_cache)
             return
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
-        self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        index_keys = mx.concatenate([left[0], right[0]], axis=0)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        self.index_position_ids = mx.concatenate(
+        index_position_ids = mx.concatenate(
             [left[1], right[1]], axis=position_axis
         )
+
+        self.kv_cache.extend(other.kv_cache)
+        self.index_keys = index_keys
+        self.index_position_ids = index_position_ids
         self.index_offset = target
 
     def extract(self, idx):
@@ -677,59 +705,82 @@ class BatchQSAKVCache:
 
     @classmethod
     def merge(cls, caches):
-        caches = list(caches)
-        out = cls([0] * len(caches))
-        if not caches:
+        rows = []
+        for cache in caches:
+            if isinstance(cache, cls):
+                batch_size = int(cache.offset.shape[0])
+                if cache.kv_cache.keys is None:
+                    if cache.index_keys is not None:
+                        raise ValueError(
+                            "Cannot merge a QSA batch with indexer state but no KV state"
+                        )
+                    rows.extend(QSAKVCache() for _ in range(batch_size))
+                else:
+                    rows.extend(cache.extract(idx) for idx in range(batch_size))
+            elif isinstance(cache, QSAKVCache):
+                rows.append(cache)
+            else:
+                raise TypeError(f"Cannot merge QSA cache with {type(cache)}")
+
+        out = cls([0] * len(rows))
+        if not rows:
             return out
-        out.kv_cache = BatchKVCache.merge(caches)
-        sample = next((cache for cache in caches if cache.index_keys is not None), None)
+
+        lengths = []
+        for row in rows:
+            kv_length = int(row.offset)
+            if row.keys is None:
+                if kv_length:
+                    raise ValueError("QSA cache has a non-zero offset without KV state")
+            elif kv_length > row.keys.shape[2]:
+                raise ValueError("QSA cache offset exceeds its KV storage")
+
+            if (row.index_keys is None) != (row.index_position_ids is None):
+                raise ValueError("QSA raw keys and positions must be merged together")
+            index_length = 0 if row.index_keys is None else row.index_keys.shape[1]
+            if row.index_position_ids is not None and (
+                row.index_position_ids.ndim not in {2, 3}
+                or row.index_position_ids.shape[-1] != index_length
+            ):
+                raise ValueError("QSA raw keys and positions are misaligned")
+            if index_length != kv_length:
+                raise ValueError(
+                    "QSA merge requires aligned KV and indexer lengths, got "
+                    f"kv={kv_length} and indexer={index_length}"
+                )
+            lengths.append(index_length)
+
+        out.kv_cache = BatchKVCache.merge(rows)
+        sample = next((row for row in rows if row.index_keys is not None), None)
         if sample is None:
             return out
         # Pick the widest position rank across every cache, not the first
         # non-None sample (#3294 item 2): promotion only widens, so a 2-D
         # first sample would strand a 3-D row at concatenate time.
         widest_positions = sample.index_position_ids
-        for cache in caches:
-            pos = cache.index_position_ids
+        for row in rows:
+            pos = row.index_position_ids
             if pos is not None and pos.ndim > widest_positions.ndim:
                 widest_positions = pos
-        # Row length comes from the *indexer* state, not the KV offset
-        # (#3294 item 4). Singleton QSAKVCache.index_keys is a property
-        # already sliced to its valid length; BatchQSAKVCache keeps a raw
-        # capacity buffer, so its valid length is index_offset. The old code
-        # passed cache.offset — an int for singletons but an mx.array of
-        # per-row offsets for batch inputs, making max() and
-        # mx.array([cache.offset]) ill-defined — and conflated KV length
-        # with indexer length. The two coincide whenever the caches are
-        # consistent, so this is behaviour-preserving except where they
-        # diverge, which is exactly the mis-slice this fix removes.
-        def _valid_index_length(cache):
-            if cache.index_keys is None:
-                return 0
-            if isinstance(cache, BatchQSAKVCache):
-                return int(cache.index_offset)
-            return int(cache.index_keys.shape[1])
-
-        lengths = [_valid_index_length(cache) for cache in caches]
-        target = max(lengths)
-        rows = [
+        target = out.kv_cache.size()
+        if target != max(lengths):
+            raise ValueError(
+                "QSA merge produced different KV and indexer widths, got "
+                f"kv={target} and indexer={max(lengths)}"
+            )
+        padded_rows = [
             cls._pad_index(
-                SimpleNamespace(
-                    index_keys=cache.index_keys,
-                    index_position_ids=cache.index_position_ids,
-                    index_offset=length,
-                    offset=mx.array([length]),
-                ),
+                row,
                 target,
                 sample.index_keys,
                 widest_positions,
             )
-            for cache, length in zip(caches, lengths)
+            for row in rows
         ]
-        out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
+        out.index_keys = mx.concatenate([row[0] for row in padded_rows], axis=0)
         position_axis = 1 if widest_positions.ndim == 3 else 0
         out.index_position_ids = mx.concatenate(
-            [row[1] for row in rows], axis=position_axis
+            [row[1] for row in padded_rows], axis=position_axis
         )
         out.index_offset = target
         return out
