@@ -380,6 +380,8 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -399,22 +401,20 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        # Residency is a throughput decision, so it uses the ceiling that does
-        # not move with instantaneous pressure. Asking the admission ceiling
-        # here read vm_stat right after the previous model unloaded, before the
-        # OS had returned its pages: the ceiling dipped, a table that fits got
-        # forced to SSD, and the swapped-in model ran at 14.1 instead of 35.3
-        # tok/s for the rest of its life in the process.
-        ceiling = self._residency_ceiling()
-        if ceiling <= 0:
-            ceiling = self._fallback_admission_ceiling()
-        if ceiling <= 0:
-            ceiling = self._current_ceiling()
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
         if forced:
             logger.warning(
                 "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB residency ceiling (mmap needs %.1fGB). Decode will be "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
                 "roughly 2.5x slower than a resident load.",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
@@ -430,10 +430,16 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> object | None:
         """Apply a forced mmap decision without mutating persisted settings."""
 
-        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
+        enabled, forced, _ = self._qwen4_ple_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
         if not enabled or not forced or settings is None:
             return settings
         effective = copy.copy(settings)
@@ -1518,6 +1524,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
+            qwen4_admission_ceiling = None
+            if (
+                (entry.config_model_type or "").replace("-", "_").lower()
+                == "qwen4_exp"
+            ):
+                candidate = self._current_ceiling()
+                if candidate <= 0:
+                    candidate = self._fallback_admission_ceiling()
+                if candidate > 0:
+                    qwen4_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1605,9 +1621,18 @@ class EnginePool:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
+            load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
+                ceiling=qwen4_admission_ceiling,
+            )
+            qwen4_admission_override = load_settings is not admission_settings
+            runtime_load_settings = (
+                load_settings if qwen4_admission_override else runtime_settings
+            )
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                load_settings,
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
@@ -1751,10 +1776,15 @@ class EnginePool:
             await self._load_engine(
                 model_id,
                 force_lm=force_lm,
-                runtime_settings=runtime_settings,
+                runtime_settings=runtime_load_settings,
             )
 
             loaded = self._entries[model_id]
+            if qwen4_admission_override and expected_signature is not None:
+                # Automatic mmap is local to this admission attempt. Keep the
+                # user's requested variant as the reuse key so the next request
+                # does not reload the model merely because pressure recovered.
+                loaded.runtime_settings_signature = expected_signature
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
