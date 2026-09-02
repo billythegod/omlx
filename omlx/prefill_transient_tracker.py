@@ -61,6 +61,11 @@ class PrefillTransientTracker:
         # need to allocate that pool again on the next chunk, so the scheduler
         # prices it once until a positive measurement confirms reallocation.
         self._recent_reclaim_bytes: int = 0
+        # True if the last recorded chunk was priced as gathered QSA core.
+        # None means no tagged sample yet. Used so leftover *dense* history
+        # can be ignored on a gathered Qwen4 chunk without discarding a
+        # spike measured on this same gathered request.
+        self._last_sample_gathered: bool | None = None
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
         """Accumulate footprint released since the last positive sample."""
@@ -78,7 +83,12 @@ class PrefillTransientTracker:
         self._recent_reclaim_bytes = 0
 
     def update(
-        self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
+        self,
+        n_tokens: int,
+        transient_bytes: int,
+        *,
+        floor_sample: bool = False,
+        gathered_core: bool | None = None,
     ) -> None:
         """Record one chunk observation.
 
@@ -150,6 +160,8 @@ class PrefillTransientTracker:
         self._samples += 1
         self._last_delta_bytes = transient_bytes
         self._last_n_tokens = n_tokens
+        if gathered_core is not None:
+            self._last_sample_gathered = bool(gathered_core)
 
     def predict(self, n_tokens: int, *, safety_factor: float = 1.2) -> int:
         """Predicted transient bytes for a chunk of `n_tokens`.
@@ -191,6 +203,11 @@ class PrefillTransientTracker:
         """Footprint released since the last positive chunk measurement."""
         return self._recent_reclaim_bytes
 
+    @property
+    def last_sample_gathered(self) -> bool | None:
+        """Whether the last tagged sample was a gathered QSA core charge."""
+        return self._last_sample_gathered
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
         self._ewma_per_token = 0.0
@@ -199,3 +216,4 @@ class PrefillTransientTracker:
         self._last_n_tokens = 0
         self._observed_max_bytes = 0
         self._recent_reclaim_bytes = 0
+        self._last_sample_gathered = None

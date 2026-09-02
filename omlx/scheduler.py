@@ -3417,7 +3417,31 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _qwen4_text_gathered_pricing(self, text_only: bool) -> bool:
+        """True when this engine can price Qwen4 text prefill as gathered QSA.
+
+        Callers that do not know whether the request is text-only must pass
+        False. Preflight and prefill then share an argument instead of a
+        mutable flag on the shared monitor.
+        """
+        if text_only is not True:
+            return False
+        monitor = getattr(self, "memory_monitor", None)
+        checker = getattr(monitor, "is_qwen4_gathered_prefill_profile", None)
+        return callable(checker) and checker() is True
+
     def _do_external_prefill(
+        self,
+        request: "Request",
+        tokens: list[int],
+        existing_cache: list[Any] | None,
+        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None = None,
+    ) -> tuple[list[Any], list[int]]:
+        return self._do_external_prefill_impl(
+            request, tokens, existing_cache, vlm_embeds
+        )
+
+    def _do_external_prefill_impl(
         self,
         request: "Request",
         tokens: list[int],
@@ -3446,6 +3470,7 @@ class Scheduler:
             RuntimeError: If memory limit exceeded during prefill.
         """
         n_tokens = len(tokens)
+        gathered_core = self._qwen4_text_gathered_pricing(vlm_embeds is None)
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is.
             cache = existing_cache or make_prompt_cache(self.model)
@@ -3583,6 +3608,7 @@ class Scheduler:
                 request_id=request.request_id,
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
+                gathered_core=gathered_core,
             )
 
             # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
@@ -3597,6 +3623,7 @@ class Scheduler:
                 progress=processed_tokens,
                 loop_label="external",
                 request_id=request.request_id,
+                gathered_core=gathered_core,
             )
             if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
@@ -3657,6 +3684,7 @@ class Scheduler:
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
                 requested_step=prefill_step_size,
+                gathered_core=gathered_core,
             )
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
@@ -3881,7 +3909,24 @@ class Scheduler:
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
     _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
-    def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
+    def _estimate_chunk_transient_bytes(
+        self, n_tokens: int, kv_len: int, *, gathered_core: bool
+    ) -> int:
+        """Call the monitor with an explicit gathered_core flag.
+
+        Test doubles often still take ``(n_tokens, kv_len)`` only.
+        """
+        estimate = self.memory_monitor.estimate_chunk_transient_bytes
+        try:
+            return int(
+                estimate(n_tokens, kv_len, gathered_core=gathered_core)
+            )
+        except TypeError:
+            return int(estimate(n_tokens, kv_len))
+
+    def _predicted_chunk_transient(
+        self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
+    ) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
 
         The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
@@ -3902,21 +3947,45 @@ class Scheduler:
         static_per_token = 0.0
         recent_reclaim = 0
         tracker = self._prefill_transient_tracker
-        if tracker is not None:
-            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
-                per_token = max(
-                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
-                )
-            if tracker.bytes_per_token > 0:
-                per_token = max(per_token, tracker.bytes_per_token)
-            recent_reclaim = tracker.recent_reclaim_bytes
+        # Gathered QSA prices a ~2K core, not Q×kv_len. A leftover dense
+        # last_delta/EWMA would still refuse that cheap chunk. Ignore that
+        # leftover only when this chunk is priced gathered AND the last
+        # recorded sample was not itself gathered (a gathered spike on this
+        # request must still bind). `is True` so a MagicMock cannot trip it.
+        last_gathered = getattr(
+            self._prefill_transient_tracker, "last_sample_gathered", None
+        )
+        ignore_dense_history = (
+            gathered_core is True and last_gathered is not True
+        )
         if self.memory_monitor is not None:
-            static = self.memory_monitor.estimate_chunk_transient_bytes(
-                n_tokens, kv_len + n_tokens
+            static = self._estimate_chunk_transient_bytes(
+                n_tokens, kv_len + n_tokens, gathered_core=gathered_core
             )
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
-            per_token = max(per_token, static_per_token)
+            per_token = static_per_token
+        if tracker is not None:
+            ewma = float(tracker.bytes_per_token)
+            recent_reclaim = tracker.recent_reclaim_bytes
+            outlier_ratio = PrefillTransientTracker._EWMA_OUTLIER_RATIO
+            dense_history_is_stale = (
+                ignore_dense_history
+                and static_per_token > 0
+                and ewma > static_per_token * outlier_ratio
+            )
+            if ewma > 0 and not dense_history_is_stale:
+                per_token = max(per_token, ewma)
+            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                measured = tracker.last_delta_bytes / tracker.last_n_tokens
+                if (
+                    ignore_dense_history
+                    and static_per_token > 0
+                    and measured > static_per_token * outlier_ratio
+                ):
+                    measured = 0.0
+                if measured > 0:
+                    per_token = max(per_token, measured)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
             static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
@@ -3924,7 +3993,9 @@ class Scheduler:
         )
         return max(base_prediction, reallocation_prediction)
 
-    def _admission_transient_bound(self, n_tokens: int, kv_len: int) -> float:
+    def _admission_transient_bound(
+        self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
+    ) -> float:
         """Transient charge for admission and the guard's pass/abort gates.
 
         The largest FLOOR-SIZE chunk transient observed this session is a
@@ -3944,7 +4015,9 @@ class Scheduler:
         shrink arithmetic stay on ``_predicted_chunk_transient``; a flat
         size-invariant bound would zero out their proportional response.
         """
-        bound = self._predicted_chunk_transient(n_tokens, kv_len)
+        bound = self._predicted_chunk_transient(
+            n_tokens, kv_len, gathered_core=gathered_core
+        )
         tracker = self._prefill_transient_tracker
         if tracker is not None:
             bound = max(bound, float(tracker.observed_max_bytes))
@@ -4084,6 +4157,7 @@ class Scheduler:
         progress: int,
         loop_label: str,
         request_id: str | None = None,
+        gathered_core: bool = False,
     ) -> int:
         """Clamp/abort a prefill chunk so its predicted peak can never reach
         the physical Metal cap (the uncatchable async OOM crash).
@@ -4106,12 +4180,16 @@ class Scheduler:
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens)
         current = self._current_usage_bytes()
-        if current + self._admission_transient_bound(n_tokens, kv_len) <= cap:
+        if current + self._admission_transient_bound(
+            n_tokens, kv_len, gathered_core=gathered_core
+        ) <= cap:
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
         current = self._reclaim_prefill_headroom()
-        min_transient = self._admission_transient_bound(min_chunk, kv_len)
+        min_transient = self._admission_transient_bound(
+            min_chunk, kv_len, gathered_core=gathered_core
+        )
         if current + min_transient > cap:
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
@@ -4192,7 +4270,9 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        per_token = self._predicted_chunk_transient(n_tokens, kv_len) / n_tokens
+        per_token = self._predicted_chunk_transient(
+            n_tokens, kv_len, gathered_core=gathered_core
+        ) / n_tokens
         safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
         n_fit = max(min_chunk, min(n_tokens, safe_n))
         # Same quantization as the adaptive throttle: an off-grid size here
@@ -4247,6 +4327,7 @@ class Scheduler:
         request_id: str,
         loop_label: str,
         kv_len: int = 0,
+        gathered_core: bool = False,
     ) -> int:
         """Size the next prefill chunk so its predicted peak stays under a
         safety margin below the hard cap.
@@ -4303,7 +4384,9 @@ class Scheduler:
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
         # measurement so it tracks growth with kv_len instead of lagging behind
         # a long-run average.
-        per_token = self._predicted_chunk_transient(requested, kv_len) / requested
+        per_token = self._predicted_chunk_transient(
+            requested, kv_len, gathered_core=gathered_core
+        ) / requested
         predictor = "measured" if per_token > 0 else "none"
 
         # Keep each chunk's predicted peak under the LOWER of the dynamic
@@ -4678,6 +4761,7 @@ class Scheduler:
         loop_label: str,
         kv_len: int = 0,
         requested_step: int | None = None,
+        gathered_core: bool = False,
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker.
 
@@ -4752,7 +4836,10 @@ class Scheduler:
             )
             return
         self._prefill_transient_tracker.update(
-            n_tokens, delta, floor_sample=n_tokens <= min_chunk
+            n_tokens,
+            delta,
+            floor_sample=n_tokens <= min_chunk,
+            gathered_core=gathered_core,
         )
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
@@ -5175,11 +5262,14 @@ class Scheduler:
         # if even prefill_min_chunk_tokens would exceed the cap; #1405
         # cleanup paths in _schedule_waiting / _advance_chunked_prefills
         # convert that into a finish_reason="error" output for the client.
+        # Chunked prefill is text-only (VLM never builds _PrefillState).
+        gathered_core = self._qwen4_text_gathered_pricing(True)
         n = self._adaptive_chunk_size(
             n,
             request_id=state.request.request_id,
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
+            gathered_core=gathered_core,
         )
 
         # Pre-chunk safety guard (mirrors the external loop): never submit a
@@ -5190,6 +5280,7 @@ class Scheduler:
             progress=state.tokens_processed,
             loop_label="chunked_step",
             request_id=state.request.request_id,
+            gathered_core=gathered_core,
         )
         if getattr(state.request, "benchmark_trace", False):
             state.request.benchmark_prefill_chunks.append(int(n))
@@ -5229,6 +5320,7 @@ class Scheduler:
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
             requested_step=prefill_step_size,
+            gathered_core=gathered_core,
         )
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
@@ -8359,6 +8451,7 @@ class Scheduler:
                     num_prompt_tokens=request.num_prompt_tokens,
                     cached_tokens=request.cached_tokens or 0,
                     request_id=request.request_id,
+                    text_only=getattr(request, "vlm_inputs_embeds", None) is None,
                 )
             except Exception:
                 self._release_paged_cache_for_request(request.request_id)
@@ -9619,6 +9712,7 @@ class Scheduler:
             num_prompt_tokens=prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
+            text_only=getattr(request, "vlm_inputs_embeds", None) is None,
         )
         if est is None:
             return None  # can't estimate, skip
@@ -9677,6 +9771,7 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int,
         current: int,
+        text_only: bool = False,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
@@ -9729,7 +9824,12 @@ class Scheduler:
         kv_exact = int(
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
-        transient = int(self._admission_transient_bound(floor_chunk, kv_len))
+        gathered_core = self._qwen4_text_gathered_pricing(text_only)
+        transient = int(
+            self._admission_transient_bound(
+                floor_chunk, kv_len, gathered_core=gathered_core
+            )
+        )
         if kv_exact <= 0 and transient <= 0:
             return None
         return _AdmissionEstimate(
@@ -9788,6 +9888,7 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
+        text_only: bool = False,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
 
@@ -9813,6 +9914,7 @@ class Scheduler:
             num_prompt_tokens=num_prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
+            text_only=text_only,
         )
         if est is None:
             return
@@ -9873,6 +9975,7 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
+        text_only: bool = False,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
 
@@ -9896,6 +9999,7 @@ class Scheduler:
             num_prompt_tokens=num_prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
+            text_only=text_only,
         )
         if est is None:
             return None

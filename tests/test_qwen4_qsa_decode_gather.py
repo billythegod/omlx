@@ -238,11 +238,20 @@ def test_qwen4_decode_gather_eligibility_fails_closed_for_general_paths():
     assert attention._gathered_text_decode_eligible(
         token, None, cache, mx.array([[10]], dtype=mx.int32), None, False
     )
+    # 3-D equal planes are a decode-follow-up. Prefill still accepts them.
     assert not attention._gathered_text_decode_eligible(
         token,
         None,
         cache,
         mx.array([[[10]], [[10]], [[10]]], dtype=mx.int32),
+        None,
+        False,
+    )
+    assert not attention._gathered_text_decode_eligible(
+        token,
+        None,
+        cache,
+        mx.array([[[10]], [[10]], [[9]]], dtype=mx.int32),
         None,
         False,
     )
@@ -263,6 +272,26 @@ def test_qwen4_decode_gather_eligibility_fails_closed_for_general_paths():
     assert not attention._gathered_text_decode_eligible(
         token, None, incomplete, None, None, False
     )
+
+
+def test_qwen4_text_mrope_equal_plane_cache_does_not_reuse_dead_ids():
+    """CPython can recycle id() once a temporary mx.array is collected."""
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    equal = mx.array([[[10]], [[10]], [[10]]], dtype=mx.int32)
+    unequal = mx.array([[[10]], [[10]], [[9]]], dtype=mx.int32)
+    assert language._broadcast_text_mrope_position_ids(equal, 1)
+    assert not language._broadcast_text_mrope_position_ids(unequal, 1)
+
+    for _ in range(64):
+        assert language._broadcast_text_mrope_position_ids(
+            mx.array([[[4]], [[4]], [[4]]], dtype=mx.int32), 1
+        )
+        assert not language._broadcast_text_mrope_position_ids(
+            mx.array([[[4]], [[4]], [[3]]], dtype=mx.int32), 1
+        )
 
 
 @pytest.mark.parametrize("key_tokens", [4097, 32769])
@@ -374,3 +403,16 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
         (256**-0.5, False, "native"),
     ]
     assert mx.array_equal(actual, expected).item()
+
+
+def test_python_cache_offset_accepts_batched_mx_array():
+    """Batched MTP decode used to crash the QSA path log on ``int(offset)``."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    assert language._python_cache_offset(None) == 0
+    assert language._python_cache_offset(0) == 0
+    assert language._python_cache_offset(11) == 11
+    assert language._python_cache_offset(mx.array(7, dtype=mx.int32)) == 7
+    assert language._python_cache_offset(mx.array([7], dtype=mx.int32)) == 7
+    assert language._python_cache_offset(mx.array([10, 20], dtype=mx.int32)) == 20
