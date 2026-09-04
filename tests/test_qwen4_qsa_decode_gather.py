@@ -418,3 +418,81 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     )
     monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
     assert language._gathered_min_query_tokens() == 16
+
+
+def test_qwen4_trim_keeps_pooled_index_prefix_exact():
+    """trim() clamps the pooled frontier instead of re-pooling every block."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    ratio = config.indexer_compress_ratio
+    indexer = attention.indexer
+
+    cache = _crossover_cache(config, attention, length=14, seed=51)
+    pooled_before = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(pooled_before)
+    assert cache._pooled_index_offset == 14 // ratio
+
+    # Speculative window of 3 rows, then reject two of them (MTP rollback).
+    window = mx.random.normal((1, 3, config.hidden_size))
+    mx.eval(attention(window, mask="causal", cache=cache, target_verify=True))
+    assert cache.trim(2) == 2
+    assert cache.offset == 15
+    # Pooled blocks below the new complete count survive the trim.
+    assert cache._pooled_index_keys is not None
+    assert cache._pooled_index_offset == 15 // ratio
+
+    incremental = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    cache._invalidate_pooled_indexer()
+    full = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(incremental, full)
+    assert incremental.shape == full.shape == (1, 15 // ratio, config.indexer_head_dim)
+    assert mx.array_equal(incremental, full).item()
+
+    # A trim that crosses a completed block boundary drops that block too.
+    assert cache.trim(3) == 3
+    assert cache._pooled_index_offset == 12 // ratio
+    again = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    cache._invalidate_pooled_indexer()
+    again_full = cache.pooled_indexer_keys(
+        ratio, indexer.k_layernorm, indexer._apply_rope, cache_tag=indexer
+    )
+    mx.eval(again, again_full)
+    assert mx.array_equal(again, again_full).item()
+
+
+def test_qwen4_trim_then_decode_matches_official_after_partial_invalidation(
+    monkeypatch,
+):
+    """Verify -> rollback -> decode stays exact with the retained pooled prefix."""
+    config = _tiny_text_config()
+    language = _language()
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    fast_cache = _crossover_cache(config, attention, length=12, seed=61)
+    reference_cache = _crossover_cache(config, attention, length=12, seed=61)
+
+    window = mx.random.normal((1, 4, config.hidden_size))
+    mx.eval(
+        attention(window, mask="causal", cache=fast_cache, target_verify=True),
+        attention(window, mask="causal", cache=reference_cache, target_verify=True),
+    )
+    assert fast_cache.trim(2) == reference_cache.trim(2) == 2
+    # Reference: force a full re-pool as the previous behaviour did.
+    reference_cache._invalidate_pooled_indexer()
+
+    token = mx.random.normal((1, 1, config.hidden_size))
+    actual = attention(token, mask=None, cache=fast_cache)
+    expected = attention(token, mask=None, cache=reference_cache)
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()

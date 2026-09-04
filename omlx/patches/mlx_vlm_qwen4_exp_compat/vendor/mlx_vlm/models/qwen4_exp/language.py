@@ -490,7 +490,18 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        self._invalidate_pooled_indexer()
+        # Pooled blocks strictly below the new complete-block count are built
+        # from raw keys that trim does not touch, so keep them and only clamp
+        # the pooled frontier.  Lightning MTP trims after every rejected
+        # draft; a full invalidation re-pooled every block of the context on
+        # the next call (1.75 ms/layer at 206k tokens).
+        if self._pooled_index_keys is not None and self._pooled_index_ratio:
+            self._pooled_index_offset = min(
+                self._pooled_index_offset,
+                self._index_offset // self._pooled_index_ratio,
+            )
+        else:
+            self._invalidate_pooled_indexer()
 
     @property
     def indexer_nbytes(self):
