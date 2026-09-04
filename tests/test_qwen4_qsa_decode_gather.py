@@ -111,6 +111,8 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
 
 
 def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
+    # The fixture prefill is 10 rows; lower the gathered width gate for it.
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
@@ -374,3 +376,45 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
         (256**-0.5, False, "native"),
     ]
     assert mx.array_equal(actual, expected).item()
+
+
+def _crossover_cache(config, attention, length=12, seed=23):
+    """Prefill ``length`` tokens so completed blocks exceed the QSA budget."""
+    mx.random.seed(seed)
+    cache = _language().QSAKVCache()
+    prefix = mx.random.normal((1, length, config.hidden_size))
+    mx.eval(attention(prefix, mask="causal", cache=cache))
+    return cache
+
+
+def _language():
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    return language
+
+
+def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
+    """Narrow multi-row windows (MTP passes) stay on the cheaper official path."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    narrow = mx.random.normal((1, 4, config.hidden_size))
+    wide = mx.random.normal((1, 16, config.hidden_size))
+
+    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
+    assert language._gathered_min_query_tokens() == 16
+    assert not attention._gathered_text_prefill_eligible(
+        narrow, "causal", cache, None, None, False
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, None, None, False
+    )
+
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    assert attention._gathered_text_prefill_eligible(
+        narrow, "causal", cache, None, None, False
+    )
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
+    assert language._gathered_min_query_tokens() == 16

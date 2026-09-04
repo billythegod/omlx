@@ -74,6 +74,25 @@ def _broadcast_text_mrope_position_ids(
     return same
 
 
+def _gathered_min_query_tokens() -> int:
+    """Query rows below which the official mask+SDPA path is faster.
+
+    Measured on an M5 Max at 12k/48k/206k context (Qwen3.8-Flash-Next
+    geometry, native kernels): the per-row gather of ``token_budget`` K/V
+    rows costs more than MLX's masked SDPA over the full cache until about
+    eight query rows, and the official path wins by 1.4-3x for the 1-4 row
+    windows Lightning MTP issues.  Real prefill chunks are far wider.
+    ``OMLX_QWEN4_GATHERED_MIN_QUERY`` overrides the default of 16.
+    """
+    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            pass
+    return 16
+
+
 def _split_text_mrope_positions(
     position_ids: Optional[mx.array],
     batch: int,
@@ -1268,7 +1287,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if not (
             x.ndim == 3
             and x.shape[0] == 1
-            and x.shape[1] > 1
+            # Narrow multi-row windows (Lightning MTP history/verify passes)
+            # are cheaper on the official masked path; see
+            # _gathered_min_query_tokens.
+            and x.shape[1] >= _gathered_min_query_tokens()
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
