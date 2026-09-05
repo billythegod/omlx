@@ -24,6 +24,7 @@ from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     MemoryMonitor,
+    make_prefill_memory_profile,
 )
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 from omlx.scheduler import Scheduler, _PrefillEvictionNeeded, _PrefillState
@@ -46,6 +47,34 @@ def _monitor(head_dim):
         num_attention_heads=32,
     )
     return m
+
+
+def _qwen4_monitor():
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=make_prefill_memory_profile(
+            config, compute_dtype_size=2
+        ),
+    )
+    return monitor
 
 
 def test_chunk_transient_unsupported_vector_head_dim_scales_with_kv_len():
@@ -152,13 +181,18 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0):
+def _call(ns, requested, kv_len=0, *, gathered_core=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._adaptive_chunk_size(
-            ns, requested, request_id="r", loop_label="test", kv_len=kv_len
+            ns,
+            requested,
+            request_id="r",
+            loop_label="test",
+            kv_len=kv_len,
+            gathered_core=gathered_core,
         )
 
 
@@ -198,13 +232,18 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     assert result < 2048
 
 
-def _guard_call(ns, n, kv_len=0):
+def _guard_call(ns, n, kv_len=0, *, gathered_core=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
     ):
         return Scheduler._guard_prefill_chunk(
-            ns, n, kv_len=kv_len, progress=0, loop_label="test"
+            ns,
+            n,
+            kv_len=kv_len,
+            progress=0,
+            loop_label="test",
+            gathered_core=gathered_core,
         )
 
 
@@ -622,42 +661,166 @@ def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
     assert dense_predicted == pytest.approx(max(dense_poison, dense_static), rel=1e-3)
 
 
-def test_predicted_transient_keeps_gathered_spike_from_this_request():
-    """A gathered chunk's own measured spike must still bind the next chunk."""
-    from omlx.memory_monitor import make_prefill_memory_profile
-
-    config = SimpleNamespace(
-        model_type="qwen4_exp",
-        num_hidden_layers=48,
-        num_attention_heads=24,
-        num_key_value_heads=2,
-        head_dim=256,
-        indexer_n_heads=4,
-        indexer_head_dim=128,
-        indexer_budget=2048,
-        indexer_compress_ratio=4,
-        full_attention_interval=4,
-        layer_types=None,
-    )
-    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
-    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
-    monitor.set_model_info(
-        num_layers=48,
-        num_kv_heads=2,
-        head_dim=256,
-        dtype_size=2,
-        num_attention_heads=24,
-        prefill_memory_profile=profile,
-    )
+def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
+    monitor = _qwen4_monitor()
     tracker = PrefillTransientTracker()
-    tracker.update(4096, int(69.58 * _GB), gathered_core=True)
-    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
-    ns._prefill_transient_tracker = tracker
-    dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
-    predicted = ns._predicted_chunk_transient(
-        4096, 233_472, gathered_core=True
+    measured_tokens = 1600
+    kv_len = 188_416
+    measured_static = monitor.estimate_chunk_transient_bytes(
+        measured_tokens, kv_len + measured_tokens, gathered_core=True
+    ) + monitor.estimate_prompt_kv_bytes(measured_tokens)
+    tracker.observe_flat_overhead(
+        measured_tokens,
+        20 * _GB,
+        static_bytes=measured_static,
+        request_id="r",
+        gathered_core=True,
     )
-    assert predicted == pytest.approx(dense_poison, rel=1e-3)
+    ns = _throttle_ctx(current=0, hard=240 * _GB, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    candidate = 2048
+    candidate_static = monitor.estimate_chunk_transient_bytes(
+        candidate, kv_len + candidate, gathered_core=True
+    ) + monitor.estimate_prompt_kv_bytes(candidate)
+    predicted = ns._predicted_chunk_transient(
+        candidate, kv_len, gathered_core=True
+    )
+
+    assert predicted == pytest.approx(
+        candidate_static * Scheduler._PREFILL_TRANSIENT_SAFETY
+        + tracker.flat_overhead_charge_for(True)
+    )
+    assert predicted < 20 * _GB / measured_tokens * candidate
+
+
+def test_non_qwen4_prediction_keeps_existing_measured_rate_behavior():
+    monitor = _monitor(head_dim=192)
+    tracker = PrefillTransientTracker()
+    tracker.update(1600, 20 * _GB)
+    ns = _throttle_ctx(current=0, hard=240 * _GB, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    predicted = ns._predicted_chunk_transient(2048, 188_416)
+
+    assert predicted >= 20 * _GB / 1600 * 2048
+
+
+def test_qwen4_real_chunk_callsite_tracks_deltas_and_expands_one_tier():
+    monitor = _qwen4_monitor()
+    ns = _throttle_ctx(current=0, hard=240 * _GB, monitor=monitor)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    samples = [(100 * _GB, 110 * _GB), (110 * _GB, 109 * _GB)] + [
+        (109 * _GB, 109 * _GB)
+    ] * 5
+    for pre, post in samples:
+        ns._record_chunk_transient(
+            512,
+            pre,
+            post,
+            request_id="r",
+            loop_label="test",
+            kv_len=180_000,
+            requested_step=2048,
+            gathered_core=True,
+        )
+
+    tracker = ns._prefill_transient_tracker
+    assert tracker.flat_overhead_bytes_for(True) > 0
+    assert tracker.reclaim_debt_bytes_for(True) == _GB
+    assert tracker.expansion_limit_for(True, request_id="r") == 1024
+    ns._fake_current = 0
+    ns.requests = {}
+    ns.config = SimpleNamespace(model_name="qwen4")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    assert _call(ns, 2048, kv_len=180_000, gathered_core=True) == 1024
+
+
+@pytest.mark.parametrize(
+    ("trace", "expected_limit"),
+    [
+        (
+            [
+                (160_000, 1024, 8 * _GB),
+                (166_000, 1024, 0),
+                (172_000, 1024, 32 * 1024**2),
+                (178_000, 1024, -32 * 1024**2),
+                (184_000, 1024, 0),
+                (190_000, 1024, 0),
+            ],
+            2048,
+        ),
+        (
+            [
+                (350_000, 512, 4 * _GB),
+                (350_512, 512, 0),
+                (351_024, 512, 16 * 1024**2),
+                (351_536, 512, -16 * 1024**2),
+                (352_048, 512, 0),
+                (352_560, 512, 0),
+            ],
+            1024,
+        ),
+    ],
+    ids=("160k-190k", "350k"),
+)
+def test_qwen4_long_context_plateau_replays(trace, expected_limit):
+    monitor = _qwen4_monitor()
+    ns = _throttle_ctx(current=0, hard=240 * _GB, monitor=monitor)
+    for kv_len, n_tokens, delta in trace:
+        Scheduler._record_chunk_transient(
+            ns,
+            n_tokens,
+            100 * _GB,
+            100 * _GB + delta,
+            request_id="r",
+            loop_label="replay",
+            kv_len=kv_len,
+            requested_step=2048,
+            gathered_core=True,
+        )
+
+    assert ns._prefill_transient_tracker.expansion_limit_for(
+        True, request_id="r"
+    ) == expected_limit
+    ns._fake_current = 0
+    ns.requests = {}
+    ns.config = SimpleNamespace(model_name="qwen4")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    assert _call(ns, 2048, kv_len=trace[-1][0], gathered_core=True) == expected_limit
+
+
+def test_qwen4_plateau_never_bypasses_abort_cap():
+    monitor = _qwen4_monitor()
+    ns = _throttle_ctx(current=0, hard=5 * _GB, monitor=monitor, abort=5 * _GB)
+    ns._prefill_transient_tracker.observe_flat_overhead(
+        512,
+        6 * _GB,
+        static_bytes=100 * 1024**2,
+        request_id="r",
+        gathered_core=True,
+    )
+    for _ in range(5):
+        ns._prefill_transient_tracker.observe_flat_overhead(
+            512,
+            0,
+            static_bytes=100 * 1024**2,
+            request_id="r",
+            gathered_core=True,
+        )
+    ns._fake_current = 0
+
+    chosen = _guard_call(ns, 2048, kv_len=180_000, gathered_core=True)
+    predicted = ns._admission_transient_bound(
+        chosen, 180_000, gathered_core=True
+    )
+    assert predicted <= ns._prefill_abort_cap()
 
 
 def test_adaptive_throttle_charges_recently_reclaimed_footprint():

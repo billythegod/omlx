@@ -3940,7 +3940,20 @@ class Scheduler:
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
+        qwen4_flat_overhead = bool(
+            MemoryMonitor is not None
+            and isinstance(self.memory_monitor, MemoryMonitor)
+            and self.memory_monitor.is_qwen4_gathered_prefill_profile()
+        )
         if tracker is not None:
+            if qwen4_flat_overhead:
+                # Qwen4's profile (#3461) owns every token-scaled term. Raw
+                # process-footprint growth is pool noise/fixed allocation and
+                # must not be divided by one chunk then scaled to another.
+                return (
+                    static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+                    + tracker.flat_overhead_charge_for(gathered_core)
+                )
             # Dense SDPA and gathered QSA have different cost curves. The
             # tracker keeps their measured histories separate, so switching
             # paths cannot reintroduce a stale dense charge after the first
@@ -4252,11 +4265,26 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        per_token = self._predicted_chunk_transient(
-            n_tokens, kv_len, gathered_core=gathered_core
-        ) / n_tokens
-        safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
-        n_fit = max(min_chunk, min(n_tokens, safe_n))
+        qwen4_flat_overhead = bool(
+            MemoryMonitor is not None
+            and isinstance(self.memory_monitor, MemoryMonitor)
+            and self.memory_monitor.is_qwen4_gathered_prefill_profile()
+        )
+        if qwen4_flat_overhead:
+            n_fit = Scheduler._largest_fitting_prefill_chunk(
+                self,
+                n_tokens,
+                min_chunk,
+                cap - current,
+                kv_len,
+                gathered_core=gathered_core,
+            )
+        else:
+            per_token = self._predicted_chunk_transient(
+                n_tokens, kv_len, gathered_core=gathered_core
+            ) / n_tokens
+            safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
+            n_fit = max(min_chunk, min(n_tokens, safe_n))
         # Same quantization as the adaptive throttle: an off-grid size here
         # would reintroduce the near-miss buffers _snap_chunk_size exists to
         # avoid.
@@ -4274,6 +4302,31 @@ class Scheduler:
                 cap / 1024**3,
             )
         return n_fit
+
+    def _largest_fitting_prefill_chunk(
+        self,
+        requested: int,
+        min_chunk: int,
+        headroom: float,
+        kv_len: int,
+        *,
+        gathered_core: bool,
+    ) -> int:
+        """Binary-search Qwen4's nonlinear static-plus-flat prediction."""
+        low, high = 1, max(1, requested // min_chunk)
+        best = min_chunk
+        while low <= high:
+            units = (low + high) // 2
+            candidate = min(requested, units * min_chunk)
+            predicted = self._predicted_chunk_transient(
+                candidate, kv_len, gathered_core=gathered_core
+            )
+            if predicted <= headroom:
+                best = candidate
+                low = units + 1
+            else:
+                high = units - 1
+        return best
 
     def _snap_chunk_size(self, n: int, requested: int) -> int:
         """Quantize a throttled chunk to a multiple of the min-chunk floor.
@@ -4361,6 +4414,18 @@ class Scheduler:
 
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
+        monitor = self.memory_monitor
+        qwen4_flat_overhead = bool(
+            MemoryMonitor is not None
+            and isinstance(monitor, MemoryMonitor)
+            and monitor.is_qwen4_gathered_prefill_profile()
+        )
+        if qwen4_flat_overhead:
+            expansion_limit = self._prefill_transient_tracker.expansion_limit_for(
+                gathered_core, request_id=request_id
+            )
+            if expansion_limit > 0:
+                requested = min(requested, max(min_chunk, expansion_limit))
 
         # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
@@ -4418,7 +4483,17 @@ class Scheduler:
                 # cleanly instead of crawling at floor-size chunks.
                 return requested
             headroom = max(target - current, 0)
-            n_fit = int(headroom / per_token)
+            if qwen4_flat_overhead:
+                n_fit = Scheduler._largest_fitting_prefill_chunk(
+                    self,
+                    requested,
+                    min_chunk,
+                    headroom,
+                    kv_len,
+                    gathered_core=gathered_core,
+                )
+            else:
+                n_fit = int(headroom / per_token)
 
         n = max(min_chunk, min(requested, n_fit))
 
@@ -4771,6 +4846,50 @@ class Scheduler:
         charge.
         """
         delta = post_bytes - pre_bytes
+        monitor = getattr(self, "memory_monitor", None)
+        if (
+            MemoryMonitor is not None
+            and isinstance(monitor, MemoryMonitor)
+            and monitor.is_qwen4_gathered_prefill_profile()
+        ):
+            min_chunk = max(1, self._prefill_min_chunk_tokens)
+            representative = n_tokens >= min_chunk and not (
+                getattr(self, "_prefill_speed_priority", False)
+                and requested_step is not None
+                and n_tokens < requested_step
+            )
+            static = monitor.estimate_chunk_transient_bytes(
+                n_tokens,
+                kv_len + n_tokens,
+                gathered_core=gathered_core,
+            ) + monitor.estimate_prompt_kv_bytes(n_tokens)
+            self._prefill_transient_tracker.observe_flat_overhead(
+                n_tokens,
+                delta,
+                static_bytes=static,
+                request_id=request_id,
+                gathered_core=gathered_core,
+                representative=representative,
+            )
+            logger.debug(
+                "[throttle:%s] qwen4-flat rid=%s n=%d kv_len=%d "
+                "delta=%.2fMB static=%.2fMB overhead=%.2fMB debt=%.2fMB",
+                loop_label,
+                request_id,
+                n_tokens,
+                kv_len,
+                delta / 1024**2,
+                static / 1024**2,
+                self._prefill_transient_tracker.flat_overhead_bytes_for(
+                    gathered_core
+                )
+                / 1024**2,
+                self._prefill_transient_tracker.reclaim_debt_bytes_for(
+                    gathered_core
+                )
+                / 1024**2,
+            )
+            return
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
         # priced, and any positive growth confirms the pool reallocation and

@@ -25,6 +25,12 @@ class _TransientHistory:
     last_delta_bytes: int = 0
     last_n_tokens: int = 0
     observed_max_bytes: int = 0
+    flat_overhead_bytes: int = 0
+    reclaim_debt_bytes: int = 0
+    stable_streak: int = 0
+    stable_chunk_size: int = 0
+    expansion_limit: int = 0
+    request_id: str = ""
 
 
 class PrefillTransientTracker:
@@ -54,6 +60,9 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    _FLAT_OVERHEAD_NOISE_BYTES = 64 * 1024**2
+    _FLAT_OVERHEAD_STABLE_CHUNKS = 5
+    _PREFILL_CHUNK_TIERS = (32, 64, 128, 256, 512, 1024, 2048)
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -163,6 +172,81 @@ class PrefillTransientTracker:
         history.samples += 1
         history.last_delta_bytes = transient_bytes
         history.last_n_tokens = n_tokens
+
+    def observe_flat_overhead(
+        self,
+        n_tokens: int,
+        delta_bytes: int,
+        *,
+        static_bytes: int,
+        request_id: str,
+        gathered_core: bool = False,
+        representative: bool = True,
+    ) -> None:
+        """Track Qwen4 process-footprint noise as flat, never per-token work."""
+        if n_tokens <= 0:
+            return
+        history = self._history(gathered_core)
+        if history.request_id != request_id:
+            history.request_id = request_id
+            history.stable_streak = 0
+            history.stable_chunk_size = 0
+            history.expansion_limit = 0
+
+        noise = max(self._FLAT_OVERHEAD_NOISE_BYTES, max(0, static_bytes) // 10)
+        if delta_bytes < -noise:
+            history.stable_streak = 0
+            history.stable_chunk_size = 0
+            history.reclaim_debt_bytes += -delta_bytes
+            return
+
+        # A positive delta first repays a preceding pool release. Only net-new
+        # growth beyond both that repayment and the static profile is overhead.
+        reallocated = min(history.reclaim_debt_bytes, max(0, delta_bytes))
+        history.reclaim_debt_bytes -= reallocated
+        residual = delta_bytes - reallocated - max(0, static_bytes)
+        if residual <= noise:
+            if not representative:
+                return
+            if history.stable_chunk_size == n_tokens:
+                history.stable_streak += 1
+            else:
+                history.stable_chunk_size = n_tokens
+                history.stable_streak = 1
+            if history.stable_streak == self._FLAT_OVERHEAD_STABLE_CHUNKS:
+                history.flat_overhead_bytes //= 2
+                history.expansion_limit = next(
+                    (tier for tier in self._PREFILL_CHUNK_TIERS if tier > n_tokens),
+                    self._PREFILL_CHUNK_TIERS[-1],
+                )
+            return
+
+        history.stable_streak = 0
+        history.stable_chunk_size = 0
+        if not representative:
+            return
+        history.flat_overhead_bytes = max(history.flat_overhead_bytes, residual)
+        history.samples += 1
+        history.last_delta_bytes = delta_bytes
+        history.last_n_tokens = n_tokens
+
+    def flat_overhead_bytes_for(self, gathered_core: bool) -> int:
+        return self._history(gathered_core).flat_overhead_bytes
+
+    def reclaim_debt_bytes_for(self, gathered_core: bool) -> int:
+        return self._history(gathered_core).reclaim_debt_bytes
+
+    def flat_overhead_charge_for(self, gathered_core: bool) -> int:
+        history = self._history(gathered_core)
+        return max(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+
+    def expansion_limit_for(
+        self, gathered_core: bool, *, request_id: str = ""
+    ) -> int:
+        history = self._history(gathered_core)
+        if request_id and history.request_id != request_id:
+            return 0
+        return history.expansion_limit
 
     def predict(
         self,
