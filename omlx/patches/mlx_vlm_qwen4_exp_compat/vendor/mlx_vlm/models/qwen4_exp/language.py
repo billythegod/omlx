@@ -1426,8 +1426,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             target_verify,
         ):
+            cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
 
+        if cache is not None and x.ndim == 3 and x.shape[1] > 1:
+            cache._omlx_last_prefill_gathered = False
         qsa_mask = self.indexer(
             x,
             cache,

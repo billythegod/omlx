@@ -492,6 +492,7 @@ class _PrefillState:
     sampler: Any = None
     sm: Any = None
     per_row_lps: Any = None
+    qwen4_gathered_core: bool | None = None
 
 
 @dataclass
@@ -3431,6 +3432,20 @@ class Scheduler:
         checker = getattr(monitor, "is_qwen4_gathered_prefill_profile", None)
         return callable(checker) and checker() is True
 
+    @staticmethod
+    def _qwen4_actual_gathered_pricing(
+        cache: list[Any], predicted: bool
+    ) -> bool:
+        """Return the QSA route that the just-finished chunk actually used."""
+        routes = [
+            route
+            for item in cache
+            if isinstance(
+                route := getattr(item, "_omlx_last_prefill_gathered", None), bool
+            )
+        ]
+        return all(routes) if routes else predicted
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -3675,6 +3690,20 @@ class Scheduler:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
             _throttle_post = get_phys_footprint()
+            actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
+                prompt_cache, gathered_core
+            )
+            if actual_gathered_core != gathered_core:
+                logger.info(
+                    "Qwen4 prefill pricing route corrected after execution: "
+                    "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
+                    request.request_id,
+                    "gathered" if gathered_core else "mask_dense",
+                    "gathered" if actual_gathered_core else "mask_dense",
+                    n_to_process,
+                    base_size + processed_tokens,
+                )
+            gathered_core = actual_gathered_core
             self._record_chunk_transient(
                 n_to_process,
                 _throttle_pre,
@@ -5366,7 +5395,9 @@ class Scheduler:
         # cleanup paths in _schedule_waiting / _advance_chunked_prefills
         # convert that into a finish_reason="error" output for the client.
         # Chunked prefill is text-only (VLM never builds _PrefillState).
-        gathered_core = self._qwen4_text_gathered_pricing(True)
+        if state.qwen4_gathered_core is None:
+            state.qwen4_gathered_core = self._qwen4_text_gathered_pricing(True)
+        gathered_core = state.qwen4_gathered_core
         n = self._adaptive_chunk_size(
             n,
             request_id=state.request.request_id,
@@ -5415,6 +5446,20 @@ class Scheduler:
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
+        actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
+            state.cache, gathered_core
+        )
+        if actual_gathered_core != gathered_core:
+            logger.info(
+                "Qwen4 prefill pricing route corrected after execution: "
+                "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
+                state.request.request_id,
+                "gathered" if gathered_core else "mask_dense",
+                "gathered" if actual_gathered_core else "mask_dense",
+                n,
+                state.base_size + state.tokens_processed,
+            )
+        state.qwen4_gathered_core = actual_gathered_core
         self._record_chunk_transient(
             n,
             _throttle_pre,
@@ -5423,7 +5468,7 @@ class Scheduler:
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
             requested_step=prefill_step_size,
-            gathered_core=gathered_core,
+            gathered_core=actual_gathered_core,
         )
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n

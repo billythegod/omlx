@@ -694,6 +694,35 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
     assert predicted < 20 * _GB / measured_tokens * candidate
 
 
+def test_qwen4_mask_dense_chunk_does_not_poison_gathered_admission():
+    """Replay the 143k false rejection from the live server log."""
+    monitor = _qwen4_monitor()
+    ns = _throttle_ctx(current=84.27 * _GB, hard=121.6 * _GB, monitor=monitor)
+    actual = Scheduler._qwen4_actual_gathered_pricing(
+        [SimpleNamespace(_omlx_last_prefill_gathered=False)], True
+    )
+
+    Scheduler._record_chunk_transient(
+        ns,
+        2048,
+        0,
+        int(28_164.64 * 1024**2),
+        request_id="dense-prefix",
+        loop_label="incident-replay",
+        kv_len=126_976,
+        requested_step=2048,
+        gathered_core=actual,
+    )
+
+    tracker = ns._prefill_transient_tracker
+    assert tracker.flat_overhead_bytes_for(False) > 0
+    assert tracker.flat_overhead_bytes_for(True) == 0
+    gathered_floor = ns._predicted_chunk_transient(
+        32, 142_784, gathered_core=True
+    )
+    assert 84.27 * _GB + gathered_floor < 0.90 * 121.6 * _GB
+
+
 def test_non_qwen4_prediction_keeps_existing_measured_rate_behavior():
     monitor = _monitor(head_dim=192)
     tracker = PrefillTransientTracker()
