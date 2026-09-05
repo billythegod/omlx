@@ -121,8 +121,10 @@ def _log_qsa_prefill_path(
     query: int,
     position_ndim: int | None,
 ) -> None:
+    # kv_len grows by `query` on every prefill, so including it makes the
+    # dedup miss every time (context streams in -> spams one line per token).
     global _LAST_QSA_PATH_LOG
-    key = (path, kv_len, query, position_ndim)
+    key = (path, query, position_ndim)
     if key == _LAST_QSA_PATH_LOG:
         return
     _LAST_QSA_PATH_LOG = key
