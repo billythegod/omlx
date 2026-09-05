@@ -1997,6 +1997,7 @@ class Scheduler:
         self._prefill_transient_tracker = PrefillTransientTracker(
             model_id=_tracker_model_id
         )
+        self._sdpa256_bounded_route_active: bool | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -4028,6 +4029,14 @@ class Scheduler:
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
+
+    def _sdpa256_bounded_route_changed(self, active: bool) -> None:
+        """Retire measurements when SDPA256 changes memory regimes."""
+        previous = getattr(self, "_sdpa256_bounded_route_active", None)
+        active = bool(active)
+        self._sdpa256_bounded_route_active = active
+        if previous != active and (previous is not None or active):
+            self._prefill_transient_tracker.reset_history()
 
     def _sdpa256_unfused_headroom(self) -> int:
         """Live headroom (bytes) for one unfused SDPA transient, under the

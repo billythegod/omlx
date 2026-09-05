@@ -505,6 +505,62 @@ def test_predicted_transient_zero_without_signals():
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
 
 
+def test_bounded_qwen4_route_drops_unfused_dense_history():
+    """A route flip to bounded array-mask SDPA must retire unfused samples."""
+    from omlx import memory_monitor
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    routes = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.get(256)
+    memory_monitor.register_tiled_prefill_head_dim(
+        256,
+        min_query_len=16,
+        min_kv_len=8192,
+        kv_tile=1024,
+        supports_array_mask=True,
+    )
+    try:
+        tracker = PrefillTransientTracker()
+        tracker.update(2048, int(25.4 * 1024**2 * 2048))
+        ns = _throttle_ctx(
+            current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor
+        )
+        ns._prefill_transient_tracker = tracker
+        Scheduler._sdpa256_bounded_route_changed(ns, False)
+        Scheduler._sdpa256_bounded_route_changed(ns, True)
+
+        predicted = ns._predicted_chunk_transient(2048, 174_000)
+        stale = 25.4 * 1024**2 * 2048 * Scheduler._PREFILL_TRANSIENT_SAFETY
+        assert predicted < stale / 8
+    finally:
+        if routes is None:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+        else:
+            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS[256] = routes
+
+
 def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
     """A leftover dense last_delta must not refuse gathered QSA static."""
     from omlx.memory_monitor import make_prefill_memory_profile
@@ -554,11 +610,16 @@ def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
         4096, 233_472, gathered_core=True
     )
     assert next_predicted == pytest.approx(predicted, rel=1e-6)
-    # Without gathered pricing, that same leftover gulp must still bind.
+    # Without gathered pricing, the larger of that gulp and dense fp32 static
+    # pricing must bind.
     dense_predicted = ns._predicted_chunk_transient(
         4096, 233_472, gathered_core=False
     )
-    assert dense_predicted == pytest.approx(dense_poison, rel=1e-3)
+    dense_static = (
+        monitor.estimate_chunk_transient_bytes(4096, 233_472 + 4096)
+        + monitor.estimate_prompt_kv_bytes(4096)
+    ) * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert dense_predicted == pytest.approx(max(dense_poison, dense_static), rel=1e-3)
 
 
 def test_predicted_transient_keeps_gathered_spike_from_this_request():
