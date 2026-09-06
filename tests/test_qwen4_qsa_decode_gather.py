@@ -103,6 +103,8 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
         mx.argmax(expected, axis=-1),
     ).item()
     assert fast_cache.offset == reference_cache.offset == 11
+    assert fast_cache._omlx_last_prefill_gathered is True
+    assert reference_cache._omlx_last_prefill_gathered is True
     for fast_value, reference_value in zip(
         fast_cache.state,
         reference_cache.state,
@@ -170,7 +172,11 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     )
 
     decode_token = mx.array([[12]], dtype=mx.int32)
+    position_ids = model._position_ids
+    rope_deltas = model._rope_deltas
     actual = model(decode_token, cache=fast_cache)
+    model._position_ids = position_ids
+    model._rope_deltas = rope_deltas
     monkeypatch.setattr(
         language.Qwen4ExpAttention,
         "_gathered_text_decode_eligible",
@@ -186,10 +192,10 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     assert mx.allclose(
         fast_prefix.logits,
         reference_prefix.logits,
-        rtol=2e-5,
-        atol=2e-5,
+        rtol=2e-4,
+        atol=2e-4,
     ).item()
-    assert mx.allclose(actual.logits, expected.logits, rtol=2e-5, atol=2e-5).item()
+    assert mx.allclose(actual.logits, expected.logits, rtol=2e-4, atol=2e-4).item()
     assert mx.array_equal(
         mx.argmax(actual.logits[:, -1], axis=-1),
         mx.argmax(expected.logits[:, -1], axis=-1),

@@ -3419,6 +3419,11 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _qwen4_prefill_accounting_enabled(self) -> bool:
+        monitor = getattr(self, "memory_monitor", None)
+        checker = getattr(monitor, "is_qwen4_gathered_prefill_profile", None)
+        return callable(checker) and checker() is True
+
     def _qwen4_text_gathered_pricing(self, text_only: bool) -> bool:
         """True when this engine can price Qwen4 text prefill as gathered QSA.
 
@@ -3426,11 +3431,7 @@ class Scheduler:
         False. Preflight and prefill then share an argument instead of a
         mutable flag on the shared monitor.
         """
-        if text_only is not True:
-            return False
-        monitor = getattr(self, "memory_monitor", None)
-        checker = getattr(monitor, "is_qwen4_gathered_prefill_profile", None)
-        return callable(checker) and checker() is True
+        return text_only is True and Scheduler._qwen4_prefill_accounting_enabled(self)
 
     @staticmethod
     def _qwen4_actual_gathered_pricing(
@@ -3690,20 +3691,21 @@ class Scheduler:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
             _throttle_post = get_phys_footprint()
-            actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
-                prompt_cache, gathered_core
-            )
-            if actual_gathered_core != gathered_core:
-                logger.info(
-                    "Qwen4 prefill pricing route corrected after execution: "
-                    "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
-                    request.request_id,
-                    "gathered" if gathered_core else "mask_dense",
-                    "gathered" if actual_gathered_core else "mask_dense",
-                    n_to_process,
-                    base_size + processed_tokens,
+            if Scheduler._qwen4_prefill_accounting_enabled(self):
+                actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
+                    prompt_cache, gathered_core
                 )
-            gathered_core = actual_gathered_core
+                if actual_gathered_core != gathered_core:
+                    logger.info(
+                        "Qwen4 prefill pricing route corrected after execution: "
+                        "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
+                        request.request_id,
+                        "gathered" if gathered_core else "mask_dense",
+                        "gathered" if actual_gathered_core else "mask_dense",
+                        n_to_process,
+                        base_size + processed_tokens,
+                    )
+                gathered_core = actual_gathered_core
             self._record_chunk_transient(
                 n_to_process,
                 _throttle_pre,
@@ -3969,11 +3971,7 @@ class Scheduler:
             static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             static_per_token = float(static) / n_tokens
             per_token = static_per_token
-        qwen4_flat_overhead = bool(
-            MemoryMonitor is not None
-            and isinstance(self.memory_monitor, MemoryMonitor)
-            and self.memory_monitor.is_qwen4_gathered_prefill_profile()
-        )
+        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         if tracker is not None:
             if qwen4_flat_overhead:
                 # Qwen4's profile (#3461) owns every token-scaled term. Raw
@@ -4294,11 +4292,7 @@ class Scheduler:
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
-        qwen4_flat_overhead = bool(
-            MemoryMonitor is not None
-            and isinstance(self.memory_monitor, MemoryMonitor)
-            and self.memory_monitor.is_qwen4_gathered_prefill_profile()
-        )
+        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         if qwen4_flat_overhead:
             n_fit = Scheduler._largest_fitting_prefill_chunk(
                 self,
@@ -4443,12 +4437,7 @@ class Scheduler:
 
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
-        monitor = self.memory_monitor
-        qwen4_flat_overhead = bool(
-            MemoryMonitor is not None
-            and isinstance(monitor, MemoryMonitor)
-            and monitor.is_qwen4_gathered_prefill_profile()
-        )
+        qwen4_flat_overhead = Scheduler._qwen4_prefill_accounting_enabled(self)
         if qwen4_flat_overhead:
             expansion_limit = self._prefill_transient_tracker.expansion_limit_for(
                 gathered_core, request_id=request_id
@@ -4688,6 +4677,9 @@ class Scheduler:
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
+        routes = getattr(self, "_qwen4_prefill_route_by_request", None)
+        if routes is not None:
+            routes.pop(request_id, None)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -4838,9 +4830,13 @@ class Scheduler:
         return current >= self._memory_limit_bytes
 
     def _record_prefill_reclaim(self, request_id: str, reclaimed_bytes: int) -> None:
-        self._prefill_transient_tracker.record_external_reclaim(
-            request_id, reclaimed_bytes
-        )
+        if not Scheduler._qwen4_prefill_accounting_enabled(self):
+            return
+        route = getattr(self, "_qwen4_prefill_route_by_request", {}).get(request_id)
+        if route is not None:
+            self._prefill_transient_tracker.record_external_reclaim(
+                request_id, reclaimed_bytes, gathered_core=route
+            )
 
     def _record_chunk_transient(
         self,
@@ -4897,6 +4893,10 @@ class Scheduler:
                 kv_len + n_tokens,
                 gathered_core=gathered_core,
             ) + monitor.estimate_prompt_kv_bytes(n_tokens)
+            routes = getattr(self, "_qwen4_prefill_route_by_request", None)
+            if routes is None:
+                routes = self._qwen4_prefill_route_by_request = {}
+            routes[request_id] = gathered_core
             self._prefill_transient_tracker.observe_flat_overhead(
                 n_tokens,
                 delta,
@@ -5400,9 +5400,10 @@ class Scheduler:
         # cleanup paths in _schedule_waiting / _advance_chunked_prefills
         # convert that into a finish_reason="error" output for the client.
         # Chunked prefill is text-only (VLM never builds _PrefillState).
-        if state.qwen4_gathered_core is None:
+        qwen4_accounting = Scheduler._qwen4_prefill_accounting_enabled(self)
+        if qwen4_accounting and state.qwen4_gathered_core is None:
             state.qwen4_gathered_core = self._qwen4_text_gathered_pricing(True)
-        gathered_core = state.qwen4_gathered_core
+        gathered_core = state.qwen4_gathered_core or False
         n = self._adaptive_chunk_size(
             n,
             request_id=state.request.request_id,
@@ -5451,20 +5452,22 @@ class Scheduler:
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
-        actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
-            state.cache, gathered_core
-        )
-        if actual_gathered_core != gathered_core:
-            logger.info(
-                "Qwen4 prefill pricing route corrected after execution: "
-                "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
-                state.request.request_id,
-                "gathered" if gathered_core else "mask_dense",
-                "gathered" if actual_gathered_core else "mask_dense",
-                n,
-                state.base_size + state.tokens_processed,
+        actual_gathered_core = gathered_core
+        if qwen4_accounting:
+            actual_gathered_core = Scheduler._qwen4_actual_gathered_pricing(
+                state.cache, gathered_core
             )
-        state.qwen4_gathered_core = actual_gathered_core
+            if actual_gathered_core != gathered_core:
+                logger.info(
+                    "Qwen4 prefill pricing route corrected after execution: "
+                    "rid=%s predicted=%s actual=%s query=%d kv_len=%d",
+                    state.request.request_id,
+                    "gathered" if gathered_core else "mask_dense",
+                    "gathered" if actual_gathered_core else "mask_dense",
+                    n,
+                    state.base_size + state.tokens_processed,
+                )
+            state.qwen4_gathered_core = actual_gathered_core
         self._record_chunk_transient(
             n,
             _throttle_pre,

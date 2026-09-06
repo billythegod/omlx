@@ -251,9 +251,18 @@ class TestFlatOverhead:
             request_id="r",
         )
 
+        t.observe_flat_overhead(
+            2048,
+            10_000 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+            gathered_core=True,
+        )
         # The retained 27 GB is already included in current footprint.
         assert t.flat_overhead_charge_for(False) == 0
-        t.record_external_reclaim("r", 12_500 * self.MB)
+        t.record_external_reclaim(
+            "r", 12_500 * self.MB, gathered_core=False
+        )
         assert t.flat_overhead_charge_for(False) == 12_500 * self.MB
         assert t.flat_overhead_charge_for(True) == 0
 

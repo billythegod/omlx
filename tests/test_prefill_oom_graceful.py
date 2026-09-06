@@ -694,6 +694,17 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
     assert predicted < 20 * _GB / measured_tokens * candidate
 
 
+@pytest.mark.parametrize(
+    ("markers", "predicted", "expected"),
+    [([], True, True), ([True, True], False, True), ([True, False], True, False)],
+)
+def test_qwen4_actual_route_uses_cache_markers_or_prediction(
+    markers, predicted, expected
+):
+    cache = [SimpleNamespace(_omlx_last_prefill_gathered=value) for value in markers]
+    assert Scheduler._qwen4_actual_gathered_pricing(cache, predicted) is expected
+
+
 def test_qwen4_mask_dense_chunk_does_not_poison_gathered_admission():
     """Replay the 143k false rejection from the live server log."""
     monitor = _qwen4_monitor()
@@ -729,7 +740,8 @@ def test_qwen4_mask_dense_chunk_does_not_poison_gathered_admission():
         + monitor.estimate_prompt_kv_bytes(2048)
     ) * Scheduler._PREFILL_TRANSIENT_SAFETY
     assert dense_retained == pytest.approx(static_prediction)
-    tracker.record_external_reclaim("dense-prefix", int(12.5 * _GB))
+    assert ns._qwen4_prefill_route_by_request == {"dense-prefix": False}
+    Scheduler._record_prefill_reclaim(ns, "dense-prefix", int(12.5 * _GB))
     dense_reallocation = ns._predicted_chunk_transient(
         2048, 141_312, gathered_core=False
     )
@@ -754,6 +766,20 @@ def test_non_qwen4_prediction_keeps_existing_measured_rate_behavior():
     predicted = ns._predicted_chunk_transient(2048, 188_416)
 
     assert predicted >= 20 * _GB / 1600 * 2048
+
+
+def test_qwen4_route_and_reclaim_accounting_are_model_scoped():
+    generic = SimpleNamespace(
+        memory_monitor=_monitor(head_dim=192),
+        _qwen4_prefill_route_by_request={"r": True},
+        _prefill_transient_tracker=MagicMock(),
+    )
+    qwen4 = SimpleNamespace(memory_monitor=_qwen4_monitor())
+
+    assert not Scheduler._qwen4_prefill_accounting_enabled(generic)
+    assert Scheduler._qwen4_prefill_accounting_enabled(qwen4)
+    Scheduler._record_prefill_reclaim(generic, "r", 1024)
+    generic._prefill_transient_tracker.record_external_reclaim.assert_not_called()
 
 
 def test_qwen4_real_chunk_callsite_tracks_deltas_and_expands_one_tier():
@@ -1193,12 +1219,18 @@ def test_record_chunk_transient_keeps_partial_context_sample():
     assert tracker.last_delta_bytes == partial_delta
 
 
-def test_step_prefill_reclaims_before_first_guard():
+@pytest.mark.parametrize(
+    ("monitor", "expected_gathered", "expected_state_route"),
+    [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
+)
+def test_step_prefill_reclaims_before_first_guard(
+    monitor, expected_gathered, expected_state_route
+):
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
         request=request,
-        cache=[],
+        cache=[SimpleNamespace(state=None, _omlx_last_prefill_gathered=True)],
         tokens_remaining=sched_mod.mx.array([[1, 2, 3]]),
         last_token=[4],
         tokens_processed=0,
@@ -1209,7 +1241,8 @@ def test_step_prefill_reclaims_before_first_guard():
         total_length=4,
     )
     ns = SimpleNamespace(
-        config=SimpleNamespace(prefill_step_size=2, model_name=""),
+        config=SimpleNamespace(prefill_step_size=2, model_name="qwen4"),
+        memory_monitor=monitor,
         _stream="stream",
         _memory_limit_bytes=0,
         _glm_dsa_adaptive_prefill=None,
@@ -1262,8 +1295,9 @@ def test_step_prefill_reclaims_before_first_guard():
         loop_label="chunked_step",
         kv_len=0,
         requested_step=2,
-        gathered_core=False,
+        gathered_core=expected_gathered,
     )
+    assert state.qwen4_gathered_core is expected_state_route
 
 
 # --------------------------------------------------------------------------

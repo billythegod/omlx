@@ -233,6 +233,7 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
         mask = calls[0]
         assert isinstance(mask, mx.array)
         assert 1 <= mask.ndim <= 4
+        assert cache._omlx_last_prefill_gathered is False
     finally:
         for mod, fn in sdpa_snap.items():
             mod.scaled_dot_product_attention = fn
