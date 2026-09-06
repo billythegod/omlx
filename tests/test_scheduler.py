@@ -6138,6 +6138,57 @@ class TestVLMPositionStateClearing:
         model.clear_vlm_position_state.assert_called_once()
         seed_mrope.assert_called_once_with(model, request)
 
+    def test_vlm_external_prefill_never_slices_embeds_longer_than_tokens(
+        self, mock_tokenizer
+    ):
+        """Regression (#3240): an external-prefill chunk must never exceed the
+        tokens actually left in the input array.
+
+        VLM ``inputs_embeds`` always spans one row wider than the token side
+        (the final token is deferred to ``insert()`` for the first decode
+        step), and MLX slices silently clamp at the array edge. So a chunk
+        inflated past the remaining tail — e.g. the prefill throttle raising
+        a short tail back to the ``prefill_min_chunk_tokens`` floor — fed the
+        model 152 input_ids columns against 153 embeds rows and Qwen4Exp's
+        PLE died with the reported off-by-one:
+        "[reshape] Cannot reshape array of size 1556480 into shape (1,153,4,2560)".
+        The floor stub reproduces that inflation and the assertion pins the
+        invariant at the model boundary.
+        """
+        model = self._make_vlm_model()
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=4),
+            stream=mx.new_stream(mx.cpu),
+        )
+        # Floor-always throttle stubs: mimics the throttle state that
+        # inflates every chunk to the min-chunk floor.
+        scheduler._adaptive_chunk_size = lambda requested, **kw: 256
+        scheduler._guard_prefill_chunk = lambda n_tokens, **kw: n_tokens
+
+        request = Request(
+            request_id="vlm-tail-chunk",
+            prompt="image prompt",
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        embeds = mx.zeros((1, 10, 4), dtype=mx.float32)
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=request.prompt_token_ids,
+            existing_cache=[],
+            vlm_embeds=(embeds, {}, 0),
+        )
+
+        assert model.call_count > 0
+        for model_call in model.call_args_list:
+            input_ids = model_call.args[0]
+            inputs_embeds = model_call.kwargs["inputs_embeds"]
+            assert inputs_embeds.shape[1] == input_ids.shape[1]
+
 
 class TestBuildStateMachineStopStrings:
     """Tests for _build_state_machine stop-string tokenization.
