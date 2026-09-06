@@ -6380,6 +6380,9 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
+        if self._model_has_unreconstructible_cache():
+            return
+
         block_size = self.config.paged_cache_block_size
         self._boundary_snapshot_diagnostics.record(
             "capture_attempt",
@@ -6817,6 +6820,9 @@ class Scheduler:
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
         """Capture cache snapshot exactly at block boundaries for safe reuse."""
+        if self._model_has_unreconstructible_cache():
+            return
+
         if self.block_aware_cache is None:
             return
 
@@ -8193,20 +8199,7 @@ class Scheduler:
     _EXTRA_RECONSTRUCTIBLE_CACHE_TYPES = frozenset({"SizedArraysCache"})
 
     def _prefix_reuse_supports_cache_class(self, class_name: str) -> bool:
-        """True when ``class_name`` has a recognized reconstruction path.
-
-        Reconstruction dispatches on the stored ``type(cache).__name__`` through
-        ``CacheTypeRegistry``. Preserve existing handling for registered names
-        and explicitly supported sliceable classes. Registration is a trust
-        boundary, not proof that a handler preserves every field: handler-level
-        round-trip tests are still required.
-
-        An *unregistered* class is the problem. ``detect_cache_type`` falls back
-        to structural sniffing, so any ``KVCache`` subclass looks like a plain
-        ``KVCache``, gets ``DefaultCacheHandler`` (``supports_block_slicing =
-        True``) and is rebuilt as a vanilla ``KVCache`` with its extra state
-        dropped. Only that case is refused here.
-        """
+        """Check explicit reconstruction support; structural KV detection is lossy."""
         if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
             return True
         if class_name in self._EXTRA_RECONSTRUCTIBLE_CACHE_TYPES:
@@ -8221,9 +8214,6 @@ class Scheduler:
         """Recursive per-layer form of :meth:`_prefix_reuse_supports_cache_class`."""
         if layer is None:
             return True
-        # Test doubles carry no real cache contract.
-        if type(layer).__module__.startswith("unittest.mock"):
-            return True
         sub_caches = getattr(layer, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
             # CacheList itself round-trips, but only if every sub-cache does:
@@ -8234,20 +8224,9 @@ class Scheduler:
         return self._prefix_reuse_supports_cache_class(type(layer).__name__)
 
     def _model_has_unreconstructible_cache(self) -> bool:
-        """True when ``model.make_cache()`` builds cache layers of a class the
-        paged prefix round trip silently downgrades.
+        """Refuse paged storage and reuse for unsupported cache layouts.
 
-        Unlimited-OCR's ``RingSlidingKVCache`` subclasses ``KVCache`` and is not
-        in the registry, so it is sniffed as a plain ``KVCache``, rebuilt as one,
-        and loses ``window_size`` / ``prefill_length`` / ``_ring_pos``. The model
-        then attends over an unbounded history, which can alter generation.
-        The pre-existing rotating guard cannot catch it:
-        it runs only for *exact* prefix hits and inspects the *already
-        reconstructed* cache, which is a plain ``KVCache`` by then.
-
-        Probed once per scheduler and memoized. A probe that raises is **not**
-        memoized and refuses reuse for that request, so a transient failure can
-        never be recorded as "safe" and then silently reused.
+        Memoize successful probes only; retry cache-construction failures.
         """
         cached = getattr(self, "_unreconstructible_cache_model", None)
         if cached is not None:
@@ -8258,7 +8237,7 @@ class Scheduler:
         except Exception as e:
             logger.warning(
                 "Could not probe model cache classes (%s: %s); refusing prefix cache "
-                "reuse for this request rather than risking a silent downgrade",
+                "storage and reuse for this request",
                 type(e).__name__,
                 e,
             )
@@ -8269,9 +8248,7 @@ class Scheduler:
         for layer in layers:
             if not self._cache_layer_is_reconstructible(layer):
                 logger.info(
-                    "Prefix cache reuse disabled: model builds %s layers, which "
-                    "have no cache-type handler and would be rebuilt as plain "
-                    "KVCache, dropping their state",
+                    "Prefix cache storage and reuse disabled: unsupported %s layers",
                     type(layer).__name__,
                 )
                 result = True
@@ -8284,10 +8261,7 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
-        # Check prefix cache for cached KV state. Models whose cache layers do
-        # not survive reconstruction skip the lookup entirely and fall through
-        # to full prefill below — including on partial hits, which bypass the
-        # exact-hit guard further down.
+        # Check support before lookup, including partial prefix hits.
         if (
             self.block_aware_cache is not None
             and not self._model_has_unreconstructible_cache()
@@ -11182,9 +11156,15 @@ class Scheduler:
                 raw_cache = getattr(response, "prompt_cache", None)
                 if raw_cache is not None:
                     try:
-                        # SpecPrefill: sparse KV data can't be stored in
-                        # paged cache (hash mismatch with full token IDs).
-                        if request.specprefill_indices is not None:
+                        # Sparse or unsupported layouts cannot round-trip through
+                        # paged storage. Skip tensor extraction as well as writing.
+                        if (
+                            request.specprefill_indices is not None
+                            or (
+                                self.block_aware_cache is not None
+                                and self._model_has_unreconstructible_cache()
+                            )
+                        ):
                             raw_cache = None
 
                         # For paged cache, extract actual tensor states
@@ -11297,7 +11277,10 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
-                    skip_store = getattr(request, "skip_cache_store", False)
+                    skip_store = (
+                        getattr(request, "skip_cache_store", False)
+                        or self._model_has_unreconstructible_cache()
+                    )
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None

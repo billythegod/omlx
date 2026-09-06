@@ -614,16 +614,7 @@ class TestSchedulerAddRequest:
     def test_partial_hit_refused_when_model_builds_unregistered_cache(
         self, mock_model, mock_tokenizer
     ):
-        """A model whose own make_cache() returns an *unregistered* cache class
-        must not reuse a paged prefix at all — not even a partial one.
-
-        An unregistered ``KVCache`` subclass is sniffed structurally, handed the
-        default handler and rebuilt as a plain ``KVCache``, silently dropping its
-        window state (Unlimited-OCR's ``RingSlidingKVCache`` carries
-        window_size/prefill_length/_ring_pos). The pre-existing rotating guard
-        only covers *exact* hits and inspects the already-reconstructed cache,
-        so a partial hit slipped through and corrupted generation.
-        """
+        """Reject unknown cache classes before a partial hit loses their state."""
         from omlx.cache.paged_cache import BlockTable
 
         RingSlidingKVCache = type("RingSlidingKVCache", (), {})
@@ -698,13 +689,7 @@ class TestSchedulerAddRequest:
     def test_supported_non_plain_cache_models_keep_prefix_cache(
         self, mock_model, mock_tokenizer, cache_class_name
     ):
-        """The guard must only refuse classes the round trip cannot rebuild.
-
-        Rotating/arrays/MiniMax layers have registry handlers and chunked and
-        TurboQuant layers are block-sliceable, so all of them keep prefix reuse.
-        Refusing them would cost a full re-prefill on every request for no
-        correctness gain.
-        """
+        """Known non-plain cache classes must retain prefix reuse."""
         from omlx.cache.paged_cache import BlockTable
 
         mock_model.make_cache = lambda: [type(cache_class_name, (), {})()]
@@ -766,12 +751,7 @@ class TestSchedulerAddRequest:
     def test_probe_failure_refuses_reuse_and_is_not_memoized(
         self, mock_model, mock_tokenizer
     ):
-        """A failed probe must fail closed and stay retryable.
-
-        Memoizing a transient failure as "safe" would restore exactly the silent
-        downgrade this guard exists to prevent, so the failure path refuses reuse
-        and records nothing.
-        """
+        """Refuse reuse on probe failure and retry after recovery."""
 
         def _boom():
             raise RuntimeError("cannot build cache")
@@ -6982,3 +6962,39 @@ class TestHybridDecodeKvEvalDefault:
             model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
         )
         assert scheduler._decode_eval_kv_cache_interval == 0
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_unsupported_cache_skips_boundary_storage(mock_model, mock_tokenizer, phase):
+    from mlx_lm.models.cache import KVCache
+
+    class UnknownKVCache(KVCache):
+        pass
+
+    mock_model.make_cache = lambda: [UnknownKVCache()]
+    scheduler = Scheduler(
+        mock_model, mock_tokenizer, SchedulerConfig(paged_cache_block_size=4)
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._boundary_snapshot_store = MagicMock()
+    request = Request("unsupported", [1, 2, 3, 4], SamplingParams())
+    scheduler.add_request(request)
+    with (
+        patch.object(scheduler, "_extract_boundary_snapshot") as extract,
+        patch.object(scheduler, "_prefill_snapshot_value") as materialize,
+    ):
+        if phase == "prefill":
+            scheduler._on_prefill_boundary_snapshot(
+                request.request_id, mock_model.make_cache(), 4
+            )
+        else:
+            scheduler._maybe_capture_boundary_snapshot(request, 0)
+    extract.assert_not_called()
+    materialize.assert_not_called()
+    assert not scheduler._boundary_snapshot_store.mock_calls
+    assert request.request_id not in scheduler._boundary_cache_snapshots
+
+
+def test_mock_cache_has_no_implicit_reconstruction_support(mock_model, mock_tokenizer):
+    scheduler = Scheduler(mock_model, mock_tokenizer)
+    assert not scheduler._cache_layer_is_reconstructible(MagicMock())
