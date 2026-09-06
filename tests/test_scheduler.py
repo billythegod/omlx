@@ -6298,20 +6298,7 @@ class TestVLMPositionStateClearing:
     def test_vlm_external_prefill_never_slices_embeds_longer_than_tokens(
         self, mock_tokenizer
     ):
-        """Regression (#3240): an external-prefill chunk must never exceed the
-        tokens actually left in the input array.
-
-        VLM ``inputs_embeds`` always spans one row wider than the token side
-        (the final token is deferred to ``insert()`` for the first decode
-        step), and MLX slices silently clamp at the array edge. So a chunk
-        inflated past the remaining tail — e.g. the prefill throttle raising
-        a short tail back to the ``prefill_min_chunk_tokens`` floor — fed the
-        model 152 input_ids columns against 153 embeds rows and Qwen4Exp's
-        PLE died with the reported off-by-one:
-        "[reshape] Cannot reshape array of size 1556480 into shape (1,153,4,2560)".
-        The floor stub reproduces that inflation and the assertion pins the
-        invariant at the model boundary.
-        """
+        """An oversized chunk must keep token and embedding slice lengths equal."""
         model = self._make_vlm_model()
         scheduler = Scheduler(
             model=model,

@@ -1337,20 +1337,7 @@ def test_speed_priority_guard_passes_full_chunk_that_fits():
 
 
 def test_adaptive_throttle_tail_below_floor_never_grows_chunk():
-    """Regression (#3240): the min-chunk floor must never INFLATE a chunk
-    beyond what the caller asked for. A prefill tail shorter than
-    prefill_min_chunk_tokens used to be raised back up to the floor
-    (max(min_chunk, min(requested, n_fit))), and the external-prefill loop
-    has no clamp after the throttle — so the chunk sized the token slice and
-    the VLM inputs_embeds slice differently (embeds always covers the +1
-    final token the token stream defers for the first decode step). MLX
-    slices silently clamp, so the model received e.g. 152 input_ids columns
-    against 153 embeds rows, and Qwen4Exp's PLE died with the reported
-    off-by-one:
-    "[reshape] Cannot reshape array of size 1556480 into shape (1,153,4,2560)".
-    The throttle's documented contract is ">= 1, <= requested"; the floor is
-    an admission bound, not a padding requirement.
-    """
+    """A throttled tail must not grow to the minimum chunk size."""
     hard = 40 * _GB
     ns = _throttle_ctx(
         current=39.5 * _GB, hard=hard, samples_bpt=2 * 1024**2, min_chunk=256

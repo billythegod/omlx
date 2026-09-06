@@ -3625,11 +3625,7 @@ class Scheduler:
                     request.remaining_tokens = tokens[processed_tokens:]
                 raise
 
-            # A chunk may never exceed the tokens actually left: the token
-            # row and the VLM inputs_embeds (one row wider — the +1 final
-            # token deferred to insert()) are sliced with the same size and
-            # MLX clamps silently, so an oversized chunk desynchronizes them
-            # and Qwen4Exp's PLE dies on an off-by-one reshape (#3240).
+            # Keep token and embedding slices aligned at the final prefill chunk.
             n_to_process = min(n_to_process, remaining)
             if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
@@ -4448,16 +4444,7 @@ class Scheduler:
                 bucket = self._PREFILL_STEP_TIERS[1]  # 512
             n = max(min_chunk, min(n, bucket))
 
-        # The floor is an admission bound, not a padding requirement: when a
-        # prefill tail is shorter than min_chunk, both floor above must never
-        # grow the chunk past what the caller had to work with. Returning
-        # more than requested breaks the documented ">= 1, <= requested"
-        # contract, and the external-prefill loop slices the token row and
-        # the VLM inputs_embeds (which spans the +1 final token the token
-        # stream defers) with the same chunk size — MLX clamps silently, so
-        # an oversized chunk desynchronizes the two by exactly the rows left
-        # on each side and Qwen4Exp's PLE dies on an off-by-one reshape
-        # (#3240).
+        # The minimum chunk must not enlarge a short tail or boundary slice.
         n = min(requested, n)
 
         n = self._snap_chunk_size(n, requested)
@@ -5285,10 +5272,7 @@ class Scheduler:
             request_id=state.request.request_id,
             gathered_core=gathered_core,
         )
-        # Same invariant as the external loop (#3240): the throttle may
-        # shrink but never grow a chunk past the tokens actually left —
-        # otherwise tokens_processed drifts past the rows actually cached
-        # (skewed progress and boundary-snapshot totals).
+        # Count only tokens actually passed to the model.
         n = min(n, remaining)
         if getattr(state.request, "benchmark_trace", False):
             state.request.benchmark_prefill_chunks.append(int(n))
