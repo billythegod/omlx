@@ -231,8 +231,15 @@ class PrefillTransientTracker:
         """Footprint released since the last positive chunk measurement."""
         return self._recent_reclaim_bytes
 
+    def reset_history(self, *, gathered_core: bool = False) -> None:
+        """Drop observations for one execution regime."""
+        if gathered_core:
+            self._gathered_history = _TransientHistory()
+        else:
+            self._dense_history = _TransientHistory()
+
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
-        self._dense_history = _TransientHistory()
-        self._gathered_history = _TransientHistory()
+        self.reset_history()
+        self.reset_history(gathered_core=True)
         self._recent_reclaim_bytes = 0
