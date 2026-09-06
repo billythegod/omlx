@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
-import time
 import mmap
 import os
 import struct
@@ -40,9 +38,6 @@ _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 # Identity cache: keep the array alive so CPython cannot recycle id().
 _TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
-_LAST_QSA_PATH_LOG: dict[tuple[str, int, int | None], float] = {}
-_QSA_PATH_LOG_MIN_INTERVAL_S = 5.0
-logger = logging.getLogger("omlx.qwen4_qsa")
 
 
 def _broadcast_text_mrope_position_ids(
@@ -77,15 +72,7 @@ def _broadcast_text_mrope_position_ids(
 
 
 def _gathered_min_query_tokens() -> int:
-    """Query rows below which the official mask+SDPA path is faster.
-
-    Measured on an M5 Max at 12k/48k/206k context (Qwen3.8-Flash-Next
-    geometry, native kernels): the per-row gather of ``token_budget`` K/V
-    rows costs more than MLX's masked SDPA over the full cache until about
-    eight query rows, and the official path wins by 1.4-3x for the 1-4 row
-    windows Lightning MTP issues.  Real prefill chunks are far wider.
-    ``OMLX_QWEN4_GATHERED_MIN_QUERY`` overrides the default of 16.
-    """
+    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
     raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
     if raw:
         try:
@@ -114,72 +101,6 @@ def _split_text_mrope_positions(
     if position_ids.ndim == 3:
         return position_ids[0], position_ids
     return position_ids, position_ids
-
-
-def _log_qsa_prefill_path(
-    path: str,
-    *,
-    kv_len: int,
-    query: int,
-    position_ndim: int | None,
-) -> None:
-    # Consecutive-key dedup alone never fires: a decode loop alternates
-    # (path, query, ndim) every cycle (ndim 3 <-> None in interleaved
-    # requests) and kv_len changes on every call. Throttle each distinct
-    # key to one line per interval instead.
-    global _LAST_QSA_PATH_LOG
-    key = (path, query, position_ndim)
-    now = time.monotonic()
-    last = _LAST_QSA_PATH_LOG.get(key)
-    if last is not None and now - last < _QSA_PATH_LOG_MIN_INTERVAL_S:
-        return
-    _LAST_QSA_PATH_LOG[key] = now
-    logger.info(
-        "qwen4 QSA prefill path=%s query=%d kv_len=%d position_ids.ndim=%s",
-        path,
-        query,
-        kv_len,
-        position_ndim,
-    )
-
-
-def _python_cache_offset(offset: Any) -> int:
-    """Scalar KV length for logging. Batched offsets use the longest row.
-
-    ``BatchQSAKVCache.offset`` is an ``mx.array`` of per-row lengths. ``int()``
-    on that array raises ``[convert] Only length-1 arrays...`` and used to
-    abort the engine before eligibility could fail closed onto the official
-    path. Logging still wants one number; the longest row is the conservative
-    choice for ``kv_len``.
-    """
-    if offset is None:
-        return 0
-    if isinstance(offset, (int, np.integer)):
-        return int(offset)
-    shape = getattr(offset, "shape", None)
-    if shape is None:
-        try:
-            return int(offset)
-        except (TypeError, ValueError):
-            return 0
-    size = 1
-    for dim in shape:
-        size *= int(dim)
-    if size <= 1:
-        value = offset.reshape(-1)[0] if size == 1 else offset
-        return int(value.item()) if hasattr(value, "item") else int(value)
-    return int(mx.max(offset).item())
-
-
-def _promote_index_positions_to_3d(positions: mx.array, planes: int) -> mx.array:
-    if positions.ndim == 3:
-        if int(positions.shape[0]) != planes:
-            raise ValueError(
-                "QSA indexer mRoPE plane count mismatch during cache extend: "
-                f"{tuple(int(d) for d in positions.shape)} vs planes={planes}"
-            )
-        return positions
-    return mx.broadcast_to(positions[None], (planes, *positions.shape))
 
 
 @dataclass(frozen=True)
@@ -522,11 +443,7 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        # Pooled blocks strictly below the new complete-block count are built
-        # from raw keys that trim does not touch, so keep them and only clamp
-        # the pooled frontier.  Lightning MTP trims after every rejected
-        # draft; a full invalidation re-pooled every block of the context on
-        # the next call (1.75 ms/layer at 206k tokens).
+        # Trim leaves completed prefix blocks intact; only re-pool the new tail.
         if self._pooled_index_keys is not None and self._pooled_index_ratio:
             self._pooled_index_offset = min(
                 self._pooled_index_offset,
@@ -1579,11 +1496,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
-        query = int(x.shape[1]) if x.ndim == 3 else 0
-        kv_len = _python_cache_offset(getattr(cache, "offset", 0)) + query
-        position_ndim = (
-            int(position_ids.ndim) if isinstance(position_ids, mx.array) else None
-        )
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -1603,23 +1515,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             target_verify,
         ):
             cache._omlx_last_prefill_gathered = True
-            _log_qsa_prefill_path(
-                "gathered",
-                kv_len=kv_len,
-                query=query,
-                position_ndim=position_ndim,
-            )
             return self._gathered_text_prefill(x, cache, position_ids)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
-        if query > 1:
-            _log_qsa_prefill_path(
-                "mask_dense",
-                kv_len=kv_len,
-                query=query,
-                position_ndim=position_ndim,
-            )
         qsa_mask = self.indexer(
             x,
             cache,

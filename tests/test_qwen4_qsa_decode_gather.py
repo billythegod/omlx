@@ -503,3 +503,35 @@ def test_qwen4_trim_then_decode_matches_official_after_partial_invalidation(
     expected = attention(token, mask=None, cache=reference_cache)
     mx.eval(actual, expected)
     assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_batched_decode_does_not_read_gpu_scalars(monkeypatch):
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    cache = language.BatchQSAKVCache([0, 0])
+    hidden = mx.random.normal((2, 1, config.hidden_size))
+    mx.eval(attention.parameters(), hidden)
+
+    def unexpected_scalar_read(*args, **kwargs):
+        raise AssertionError("Batched attention must not read GPU scalars")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.array, "item", unexpected_scalar_read)
+        for _ in range(3):
+            positions = mx.broadcast_to(cache.offset[None, :, None], (3, 2, 1))
+            mx.eval(attention(hidden, cache=cache, position_ids=positions))
+
+    assert cache.offset.tolist() == [3, 3]
+
+
+def test_qwen4_prefill_memory_marker_tracks_query_width():
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    cache = _crossover_cache(config, attention)
+
+    mx.eval(attention(mx.zeros((1, 4, config.hidden_size)), cache=cache))
+    assert cache._omlx_last_prefill_gathered is False
+    mx.eval(attention(mx.zeros((1, 16, config.hidden_size)), cache=cache))
+    assert cache._omlx_last_prefill_gathered is True

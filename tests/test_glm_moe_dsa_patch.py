@@ -821,9 +821,7 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
 
-    # 512 tokens x 2 = 1024 routes: the affine block kernels only engage from
-    # _AFFINE_NATIVE_MIN_ROUTES (below that the sorted stock gather_qmm is
-    # faster — measured in switch_layers.py).
+    # Reach the 1024-route affine block threshold.
     x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
     indices = mx.array(
         [[[(i + j) % 8 for j in range(2)] for i in range(512)]],
@@ -885,9 +883,7 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
     monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
 
-    # 512 tokens x 2 = 1024 routes: the affine block kernels only engage from
-    # _AFFINE_NATIVE_MIN_ROUTES (below that the sorted stock gather_qmm is
-    # faster — measured in switch_layers.py).
+    # Reach the 1024-route affine block threshold.
     x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
     indices = mx.array(
         [[[(i + j) % 8 for j in range(2)] for i in range(512)]],
@@ -1337,10 +1333,7 @@ def test_glm_adaptive_decode_clears_only_on_the_512_step_cadence():
 
 
 def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatch):
-    """8..110-token windows (DFlash block-8 verify, batched decode) used to be
-    sent down the affine block kernel at 2-2.7x the cost of the sorted stock
-    gather_qmm (measured on M1 Ultra, GLM-5.3 oQ2e). Below
-    _AFFINE_NATIVE_MIN_ROUTES the block kernel must stay out."""
+    """Small affine windows use stock gather_qmm after sorting."""
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("mlx.nn")
     from omlx.custom_kernels.glm_moe_dsa import fast

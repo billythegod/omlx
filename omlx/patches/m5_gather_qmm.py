@@ -59,11 +59,6 @@ logger = logging.getLogger(__name__)
 # ml-explore/mlx#3856: sorted row offsets overflow int16 past this count.
 _MAX_SORTED_ROWS = 32768
 
-# Advertises to callers (e.g. the scheduler's prefill-chunk policy) that
-# oversized sorted calls are segmented rather than demoted to the unsorted
-# kernel, so a wide chunk keeps the NAX rhs path.
-SEGMENTS_SORTED_ROWS = True
-
 _original_gather_qmm = None
 _defective: bool | None = None
 
