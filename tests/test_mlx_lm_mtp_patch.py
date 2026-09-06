@@ -2945,3 +2945,28 @@ class TestReconcileChunked:
             assert target._next_tokens.item() == expected_token
         finally:
             generator.close()
+
+
+def test_chain_rollback_finds_the_method_behind_the_vlm_adapter():
+    """On the server the batch does not see the LanguageModel: it sees
+    ``VLMModelAdapter``, which does not forward ``mtp_partial_rollback``. The
+    chain rollback looked only at the wrapper, found nothing, and EVERY reject
+    fell through to "cache layer rejects chain rollback" plus a reconcile —
+    measured on a GLM-5.3 vision checkpoint at 2 tok/s with cycles=0. It now
+    looks at the inner model too.
+    """
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    calls = []
+
+    class _Language:
+        def mtp_partial_rollback(self, cache, accepted, num_drafts):
+            calls.append((accepted, num_drafts))
+            return True
+
+    class _Adapter:
+        def __init__(self):
+            self._language_model = _Language()
+
+    assert bg._chain_rollback(_Adapter(), [], 1, 3, None) is True
+    assert calls == [(1, 3)]

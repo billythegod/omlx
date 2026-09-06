@@ -3214,7 +3214,16 @@ def _chain_rollback(
         except Exception as exc:
             logger.debug("rollback_speculative_cache failed: %s", exc)
             return False
-    rollback = getattr(model, "mtp_partial_rollback", None)
+    # The mlx-vlm runtimes stamp ``mtp_partial_rollback`` on the inner
+    # LanguageModel, but the batch sees oMLX's ``VLMModelAdapter`` wrapper,
+    # which does not forward it — measured on GLM-5.3 vision: every reject
+    # raised "cache layer rejects chain rollback" and reconciled (2 tok/s).
+    rollback = None
+    for candidate in (model, getattr(model, "language_model", None),
+                      getattr(model, "_language_model", None)):
+        rollback = getattr(candidate, "mtp_partial_rollback", None)
+        if callable(rollback):
+            break
     if callable(rollback):
         try:
             return bool(rollback(prompt_cache, accepted, num_drafts))
