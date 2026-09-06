@@ -2176,9 +2176,6 @@ class EnginePool:
             return 0
         freed = max(0, before - get_phys_footprint())
         if freed > 0:
-            record_reclaim = getattr(scheduler, "_record_prefill_reclaim", None)
-            if callable(record_reclaim):
-                record_reclaim(request_id, freed)
             logger.info(
                 "Reclaimed %s of pooled Metal buffers for prefill request %s "
                 "(no idle model to evict)",

@@ -2241,7 +2241,6 @@ class TestEnginePoolPrefillEviction:
         # 45GB -> 25GB reclaim brings 25 + 10 (predicted) under the 40GB cap.
         assert admitted is True
         scheduler._reclaim_prefill_headroom.assert_called_once()
-        scheduler._record_prefill_reclaim.assert_called_once_with("req-1", 20 * gb)
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio

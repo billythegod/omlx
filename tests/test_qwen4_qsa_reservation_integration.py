@@ -37,7 +37,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
     )
     state = Scheduler._begin_prefill(
         ns,
-        SimpleNamespace(cached_tokens=128),
+        SimpleNamespace(cached_tokens=128, request_id="reservation"),
         [1] * 129,
         [cache, SimpleNamespace(offset=128)],
     )
@@ -46,10 +46,10 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         lambda caches, tokens: Scheduler._reserve_qsa_index_capacity(ns, caches, tokens)
     )
 
-    def stop(*args):
+    def stop(*args, **kwargs):
         raise RuntimeError("reservation complete")
 
-    ns._qwen4_text_gathered_pricing = stop
+    ns._adaptive_chunk_size = stop
     with pytest.raises(RuntimeError, match="reservation complete"):
         Scheduler._step_prefill_chunk(ns, state)
     assert cache._index_reserved_tokens >= 256
