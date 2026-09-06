@@ -25,6 +25,7 @@ everything else passes through to the original SDPA unchanged.
 
 import logging
 import os
+import threading
 import weakref
 
 import mlx.core as mx
@@ -54,12 +55,12 @@ _KV_TILE = 1024
 _NEG_INF = -1e30
 
 # Live guard-headroom provider for memory-aware routing (issue #2204).
-# Registered by Scheduler.__init__ as a bound method returning the bytes left
-# under the adaptive-prefill-throttle target (hard ceiling x headroom safety,
-# clamped by the abort cap), or a negative value when no ceiling is active.
-# Held as a WeakMethod so a torn-down Scheduler auto-unregisters and the route
-# falls back to the memory-bounded native fused default.
-_HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
+# Scheduler.step registers the active Scheduler on its execution thread. Each
+# engine uses its own worker, so thread-local storage keeps concurrent engines
+# from replacing one another's provider. The bound method is weakly held so a
+# torn-down Scheduler leaves that worker on the memory-bounded native fused
+# default.
+_HEADROOM_PROVIDER_LOCAL = threading.local()
 # Backward-compatible override: True = always force fused, False = never force,
 # None = memory-aware auto.
 _FORCE_TILED: bool | None = None
@@ -82,11 +83,21 @@ def _note_tiled_route(reason: str, detail: str) -> None:
 
 
 def set_unfused_headroom_provider(method) -> None:
-    """Register a bound method returning the prefill guard's live headroom in
-    bytes (negative when no ceiling is active). Lets ``_should_route`` prefer
-    the faster unfused fallback whenever its O(L^2) transient fits."""
-    global _HEADROOM_PROVIDER
-    _HEADROOM_PROVIDER = weakref.WeakMethod(method)
+    """Bind the active Scheduler's headroom provider to this worker thread."""
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    current = ref() if ref is not None else None
+    if (
+        current is not None
+        and current.__self__ is method.__self__
+        and current.__func__ is method.__func__
+    ):
+        return
+    _HEADROOM_PROVIDER_LOCAL.ref = weakref.WeakMethod(method)
+
+
+def _get_unfused_headroom_provider():
+    ref = getattr(_HEADROOM_PROVIDER_LOCAL, "ref", None)
+    return ref() if ref is not None else None
 
 
 def _parse_force_tiled_env() -> bool | None:
@@ -116,7 +127,7 @@ def _tiled_route_required(queries, keys) -> bool:
     (issues #2155 / #2204), so force the fused path only when the unfused
     transient would not fit under the guard ceiling — or when no headroom
     info is available, keeping the memory-safe #2025 behavior."""
-    provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
+    provider = _get_unfused_headroom_provider()
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
