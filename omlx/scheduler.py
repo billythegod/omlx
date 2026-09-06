@@ -3579,7 +3579,7 @@ class Scheduler:
         # The full prompt length is known here; hand it to the QSA indexer so
         # its arrays are sized once instead of doubling mid-prefill.
         self._reserve_qsa_index_capacity(
-            prompt_cache, base_size + int(input_arr.shape[1])
+            prompt_cache, _cache_base_sizes(prompt_cache) + n_tokens
         )
 
         while input_arr.shape[1] > 0:
@@ -4532,18 +4532,7 @@ class Scheduler:
                 return 0
 
     def _reserve_qsa_index_capacity(self, cache_list: Any, tokens: int) -> int:
-        """Tell QSA indexer caches their final length before the first chunk.
-
-        The indexer's capacity-backed arrays grow by doubling, which is correct
-        when the horizon is unknown (decode) and pure waste when it is known:
-        a doubling mid-prefill reallocates, memsets and copies the whole
-        indexer in one chunk (measured +12.25 GB of phys in the chunk that
-        crossed 196,608 tokens, tripping the enforcer at prefill's finish
-        line) and leaves up to 2x capacity resident — past
-        ``max_position_embeddings`` on long prompts. Reserving lands the
-        allocation on the final stepped size once and switches later grows to
-        plain steps. Non-QSA caches expose no such method and are skipped.
-        """
+        """Reserve the full prompt length on caches that expose the QSA hook."""
         if not cache_list or tokens <= 0:
             return 0
         reserved = 0
@@ -4551,15 +4540,12 @@ class Scheduler:
             reserve = getattr(c, "reserve_index_capacity", None)
             if reserve is None:
                 continue
-            try:
-                reserve(int(tokens))
-                reserved += 1
-            except Exception:
-                logger.debug("QSA index capacity reservation failed", exc_info=True)
+            reserve(int(tokens))
+            reserved += 1
         if reserved:
             logger.info(
                 f"Reserved QSA indexer capacity for {int(tokens)} tokens "
-                f"across {reserved} caches (no mid-prefill doubling)"
+                f"across {reserved} caches"
             )
         return reserved
 
@@ -5280,8 +5266,9 @@ class Scheduler:
             # mid-prefill (see _reserve_qsa_index_capacity).
             self._reserve_qsa_index_capacity(
                 state.cache,
-                state.total_length
-                or state.base_size + int(state.tokens_remaining.shape[1]),
+                _cache_base_sizes(state.cache)
+                + int(state.tokens_remaining.shape[1])
+                + len(state.last_token),
             )
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.

@@ -1,13 +1,4 @@
-"""Reserved-horizon tests for the Qwen4 QSA indexer capacity policy.
-
-Regression guard for the measured mid-prefill spike: the indexer used to
-double its capacity-backed arrays unconditionally, so a long prefill paid a
-full reallocate + memset + copy of the whole indexer at one chunk boundary
-(+12.25 GB of phys in the chunk crossing 196,608 tokens) and kept up to 2x
-capacity resident, past ``max_position_embeddings``. A prefill knows its final
-length, so it now reserves it and doubling is only used when the horizon is
-genuinely unknown (decode).
-"""
+"""QSA capacity reservation and prefix preservation tests."""
 
 # SPDX-License-Identifier: Apache-2.0
 
