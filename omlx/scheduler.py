@@ -6554,15 +6554,10 @@ class Scheduler:
         request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
+        *,
+        source: str = "prefill",
     ) -> None:
-        """Record boundary snapshots captured during prefill processing.
-
-        Called from ``_emit_prefill_boundary_snapshot`` at each block
-        boundary crossed during prefill. Keyed by ``request_id`` rather
-        than ``uid`` because the request has not been inserted into
-        ``BatchGenerator`` yet and the uid mapping does not exist —
-        routing through it dropped every snapshot silently (#TBD).
-        """
+        """Record a prefill boundary or a verified terminal response snapshot."""
         if self._model_has_unreconstructible_cache():
             return
 
@@ -6572,7 +6567,7 @@ class Scheduler:
             request_id=request_id,
             token_count=token_count,
             block_size=block_size,
-            source="prefill",
+            source=source,
         )
         if self.block_aware_cache is None:
             self._boundary_snapshot_diagnostics.record(
@@ -6581,7 +6576,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6592,7 +6587,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6603,7 +6598,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6618,7 +6613,7 @@ class Scheduler:
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,
-                source="prefill",
+                source=source,
             )
             return
 
@@ -6649,7 +6644,7 @@ class Scheduler:
                     request_id=request_id,
                     token_count=token_count,
                     block_size=block_size,
-                    source="prefill",
+                    source=source,
                     storage="memory",
                 )
                 self._boundary_cache_snapshots[request_id][token_count] = (
@@ -6679,11 +6674,12 @@ class Scheduler:
             request_id=request_id,
             token_count=token_count,
             block_size=block_size,
-            source="prefill",
+            source=source,
             storage=storage,
         )
         logger.debug(
-            "Captured prefill boundary cache snapshot for %s at %s tokens (%s)",
+            "Captured %s boundary cache snapshot for %s at %s tokens (%s)",
+            source,
             request_id,
             token_count,
             storage,
@@ -7498,60 +7494,41 @@ class Scheduler:
             )
             return None
 
-    def _verify_live_boundary_aligned(
-        self, request_id: str, uid: int, boundary_tokens: int
-    ) -> list[dict[str, Any]] | None:
-        """Return extracted cache state iff the live cache is exactly at a block
-        boundary, else None.
+    def _capture_finished_boundary_snapshot(
+        self, request: Request, cache: list[Any]
+    ) -> None:
+        """Preserve a verified terminal boundary after the generator drops its UID."""
+        if getattr(request, "skip_cache_store", False):
+            return
+        if self._boundary_cache_snapshots.get(request.request_id):
+            return
+        token_count = (
+            len(request.prompt_token_ids)
+            if request.needs_think_prefix
+            else request.num_tokens
+        )
+        block_size = self.config.paged_cache_block_size
+        if (
+            block_size <= 0
+            or token_count <= 0
+            or token_count % block_size
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
 
-        Recovery path for the store-time ``_BoundaryStoreUnavailable`` case: when
-        every decode-time boundary capture was skipped (MTP skew guard) but the
-        request finished on a block boundary, the live recurrent/rotating state
-        sits at that boundary and is safe to persist. The leaf cache ``offset``
-        must equal the boundary token count exactly — mirroring
-        ``_extract_boundary_snapshot``'s positional-consistency guard — so we
-        never label an off-boundary state with a block-boundary count.
-        """
-        if self.batch_generator is None or uid is None or uid < 0:
-            return None
-        try:
-            with self._phase_timer("store_cache_boundary_verify"):
-                _safe_sync_stream(self._stream)
-                with mx.stream(self._stream):
-                    result = self.batch_generator.extract_cache([uid])
-            if uid not in result:
-                logger.debug(
-                    "Cannot verify live cache for %s: uid %s not present",
-                    request_id,
-                    uid,
-                )
-                return None
-            cache_list, _tokens = result[uid]
-            for c in cache_list:
-                offset = _first_leaf_cache_offset(c)
-                if offset is None:
-                    continue
-                if offset != boundary_tokens:
-                    logger.debug(
-                        "Live cache for %s is off-boundary (offset %d != boundary %d); "
-                        "skipping recovery store",
-                        request_id,
-                        offset,
-                        boundary_tokens,
-                    )
-                    return None
-                break
-            extracted_cache, _ = self._extract_cache_states(cache_list)
-            if not extracted_cache:
-                return None
-            return extracted_cache
-        except Exception as e:
-            logger.debug(
-                "Failed to verify live cache for boundary store %s: %s",
-                request_id,
-                e,
-            )
-            return None
+        # Composite caches use their leading token-position leaf; later
+        # members may count pooled windows instead. Unknown positions cannot
+        # establish that recurrent state matches the emitted token sequence.
+        offsets = [
+            offset
+            for layer in cache
+            if (offset := _first_leaf_cache_offset(layer)) is not None
+        ]
+        if not offsets or any(offset != token_count for offset in offsets):
+            return
+        self._on_prefill_boundary_snapshot(
+            request.request_id, cache, token_count, source="completion"
+        )
 
     def _prepare_prompt_boundary_cache_store(
         self,
@@ -8290,22 +8267,9 @@ class Scheduler:
                 f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
             )
 
-    # Whether an in-flight store_cache is worth waiting for is decided by the
-    # overlap with it, not by the prompt's length.  What a wait can save is the
-    # re-prefill of the restorable overlap (whole blocks of the effective
-    # paged_cache_block_size -- 256 for KV models, the 2048-token boundary when
-    # the GDN split is active); what it costs is bounded by the store's own
-    # duration, which scales with the tokens THAT store copies (~13-20 us/token
-    # measured on M5 Max, hot cache off) while prefill costs ~0.6-5 ms/token
-    # across current models and machines.  So: never wait when less than one
-    # block is restorable (nothing a wait could make visible), and never wait on
-    # a store more than 16x larger than the overlap (a harness side-request
-    # that shares only the system prompt with a 100K-token turn being stored),
-    # which keeps the worst-case wait well under the prefill it avoids.  A fixed
-    # prompt floor (8192, then 4096 for the DeepSeek V4 3584-of-4096 boundary
-    # snapshot, #2471) reproduced the race one notch lower each time: agent
-    # harnesses firing a 3K follow-up instantly re-prefilled every turn (#3102).
-    # The 4K boundary-snapshot case still waits under the overlap gates.
+    # Wait only for reusable blocks. The store/overlap ratio is a heuristic
+    # limiting waits on large stores that share a small prefix; the timeout
+    # below still bounds slow storage independently of token counts.
     _CACHE_FRESHNESS_WAIT_MAX_STORE_TO_OVERLAP = 16
     _CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS = 8192
     _CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO = 0.30
@@ -8345,11 +8309,17 @@ class Scheduler:
                 continue
 
             common = self._common_prefix_len(prompt, info.tokens)
-            # Per-candidate: only whole blocks can be restored, and a store far
-            # larger than the overlap costs more to wait for than it saves. A
-            # longest-overlap store that fails here must not veto a smaller
-            # store that passes, so filter before ranking.
+            # Filter before ranking so an ineligible larger store cannot
+            # hide a smaller one whose prefix can actually be reused.
             restorable = (common // block) * block
+            if restorable == len(prompt):
+                # Match exact-hit generation kickoff in prefix preparation:
+                # GDN sidecars drop the final block; other stateful caches
+                # cannot trim to N-1 and require a full prefill.
+                if self._gdn_split_active():
+                    restorable = max(0, restorable - block)
+                elif self._detect_boundary_snapshot_need():
+                    restorable = 0
             if restorable < block:
                 continue
             if (
@@ -11435,6 +11405,9 @@ class Scheduler:
                             if extracted_cache:
                                 request._extracted_cache = extracted_cache
                                 request._model_cache_config = model_cache_config
+                                self._capture_finished_boundary_snapshot(
+                                    request, raw_cache
+                                )
                                 logger.debug(
                                     f"Extracted {len(extracted_cache)} layer states "
                                     f"for request {request_id}"
@@ -11619,63 +11592,7 @@ class Scheduler:
                                             # the current decode offset (which
                                             # speculative decode can leave off
                                             # the emitted count entirely).
-                                            #
-                                            # Recovery: when every decode-time
-                                            # capture was skipped (MTP skew
-                                            # guard) but the request itself
-                                            # finished on a block boundary, the
-                                            # live extracted cache is exactly
-                                            # that boundary-aligned snapshot —
-                                            # storing it is safe and recovers
-                                            # prefix reuse instead of throwing
-                                            # away a usable recurrent state.
-                                            block_size = (
-                                                self.config.paged_cache_block_size
-                                            )
-                                            live_cache = None
-                                            if (
-                                                block_size > 0
-                                                and len(cacheable_sequence)
-                                                % block_size
-                                                == 0
-                                            ):
-                                                # Only trust the live state when
-                                                # its leaf cache offset actually
-                                                # sits on the boundary (emitted
-                                                # length alone can be fooled by
-                                                # the MTP emit queue). uid_for_store
-                                                # may be unset when this request
-                                                # carried its own _extracted_cache,
-                                                # so resolve it here.
-                                                live_uid = (
-                                                    self.request_id_to_uid.get(
-                                                        request_id, -1
-                                                    )
-                                                )
-                                                live_cache = (
-                                                    self._verify_live_boundary_aligned(
-                                                        request_id,
-                                                        live_uid,
-                                                        len(cacheable_sequence),
-                                                    )
-                                                )
-                                            if live_cache:
-                                                token_sequence_to_store = (
-                                                    cacheable_sequence
-                                                )
-                                                cache_to_store = live_cache
-                                                intermediate_snapshots = None
-                                                logger.info(
-                                                    "Using live boundary-aligned "
-                                                    "cache for %s: request finished "
-                                                    "on block boundary "
-                                                    "(%d/%d tokens)",
-                                                    request_id,
-                                                    len(cacheable_sequence),
-                                                    len(full_token_sequence),
-                                                )
-                                            else:
-                                                raise _BoundaryStoreUnavailable()
+                                            raise _BoundaryStoreUnavailable()
                                         if boundary_override is not None:
                                             (
                                                 token_sequence_to_store,
