@@ -2428,17 +2428,9 @@ class TestEnginePoolPrefillEviction:
 
         # The helper's before/after reads both see 45GB (another engine
         # allocates while the reclaim frees, masking the delta as 0), but
-        # the loop's next reading sees the real 25GB baseline. Four scripted
-        # reads: loop #1, helper before, helper after, loop #2; further
-        # reads (decision logging) stay at the settled 25GB baseline.
+        # the loop's next reading sees the real 25GB baseline. The log uses
+        # that same sample without taking another measurement.
         phys = iter([45 * gb, 45 * gb, 45 * gb, 25 * gb])
-
-        def _phys():
-            try:
-                return next(phys)
-            except StopIteration:
-                return 25 * gb
-
         scheduler = self._reclaim_scheduler(lambda: None)
         req = PrefillEvictionRequest(
             request_id="req-1",
@@ -2463,7 +2455,7 @@ class TestEnginePoolPrefillEviction:
                 patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
                 patch(
                     "omlx.engine_pool.get_phys_footprint",
-                    side_effect=_phys,
+                    side_effect=lambda: next(phys),
                 ),
             ):
                 admitted = await pool._evict_idle_lru_for_prefill("target", req)
@@ -2606,26 +2598,22 @@ class TestEnginePoolPrefillEviction:
         assert pool._entries["busy"].engine is not None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("released_gb, expected_fit", [(25, True), (35, False)])
     async def test_noop_first_pass_escalates_second_pass_to_ane_release(
-        self, caplog
+        self, caplog, released_gb, expected_fit
     ):
-        """The observed admission sequence: the first callback's pool-side
-        re-measurement already sees headroom and runs no rung (the scheduler
-        retries anyway because its own usage reading is tighter); the second
-        callback must escalate straight to the ANE bank release instead of
-        spending the remaining retry on the pooled-buffer reclaim a no-op
-        first pass already proved useless."""
+        """A no-op callback still counts toward bank-release escalation."""
         gb = 1024**3
         pool = _make_pool(ceiling=0)
 
         state = {"pressure": 20 * gb, "released": False}
 
         def _phys():
-            return 25 * gb if state["released"] else state["pressure"]
+            return released_gb * gb if state["released"] else state["pressure"]
 
         async def _release_ane(model_id, request_id):
             state["released"] = True
-            return 17 * gb
+            return (45 - released_gb) * gb
 
         req = PrefillEvictionRequest(
             request_id="req-1",
@@ -2649,14 +2637,16 @@ class TestEnginePoolPrefillEviction:
             caplog.at_level(logging.INFO, logger="omlx.engine_pool"),
         ):
             first = await pool._evict_idle_lru_for_prefill("target", req)
-            # The scheduler's tighter usage reading still sees pressure on
-            # the retry even though the pool's first reading saw headroom.
+            # Pressure returns after the first callback found enough headroom.
             state["pressure"] = 45 * gb
             second = await pool._evict_idle_lru_for_prefill("target", req)
 
         assert first is False
-        assert second is True
-        pool._reclaim_pooled_buffers_for_prefill.assert_not_awaited()
+        assert second is expected_fit
+        if expected_fit:
+            pool._reclaim_pooled_buffers_for_prefill.assert_not_awaited()
+        else:
+            pool._reclaim_pooled_buffers_for_prefill.assert_awaited_once()
         pool._release_ane_prefill_for_headroom.assert_awaited_once()
         pool._unload_engine.assert_not_awaited()
         decisions = [
@@ -2669,6 +2659,11 @@ class TestEnginePoolPrefillEviction:
         assert "retry=1" in decisions[0]
         assert "action=release_ane" in decisions[1]
         assert "retry=2" in decisions[1]
+
+        outcome = "headroom_available" if expected_fit else "insufficient_headroom"
+        assert "outcome=headroom_available" in decisions[0]
+        assert f"outcome={outcome}" in decisions[1]
+        assert f"phys_footprint={released_gb:.2f}GB" in decisions[1]
 
 
 class TestEnginePoolStatus:

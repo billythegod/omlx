@@ -3588,13 +3588,8 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
-        # _compile_pair and _compile_gdn cache their state per module, so
-        # dropping the attributes above frees nothing while those stay
-        # populated. Cleared unconditionally rather than alongside a live
-        # state: an entry left over from an earlier slice is exactly the
-        # mapped bank this call exists to hand back. No _COMPILE_LOCK needed
-        # -- compiles and this release both run on the engine's single-worker
-        # MLX executor, so they are already serialized.
+        # Clear cached references too, including states no longer attached.
+        # Loading has finished and the engine step loop is paused for release.
         for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
             cache = getattr(module, cache_attr, None)
             if cache:

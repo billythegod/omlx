@@ -1990,11 +1990,18 @@ class EnginePool:
             self._prefill_headroom_recurring[request_id] = attempt
             while len(self._prefill_headroom_recurring) > 512:
                 self._prefill_headroom_recurring.popitem(last=False)
-            # Snapshot once per call: "a PREVIOUS pass for this request
-            # already ran". Marking at entry must not flip it for THIS call.
+            # Count no-op calls too so another attempt prioritizes bank release.
             recurring = attempt > 1
 
-            def _log_decision(action: str, outcome: str) -> None:
+            def _log_decision(outcome: str) -> None:
+                if ane_release_attempted:
+                    action = "release_ane"
+                elif reclaim_attempted:
+                    action = "reclaim_pool"
+                elif evicted_any:
+                    action = "evict_model"
+                else:
+                    action = "already_fit"
                 logger.info(
                     "[prefill-eviction] request=%s retry=%d reason=%s "
                     "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
@@ -2006,8 +2013,8 @@ class EnginePool:
                     action,
                     outcome,
                     recurring,
-                    mx.get_active_memory() / 1024**3,
-                    get_phys_footprint() / 1024**3,
+                    active / 1024**3,
+                    footprint / 1024**3,
                     self._current_model_memory / 1024**3,
                     predicted / 1024**3,
                     target / 1024**3,
@@ -2015,52 +2022,20 @@ class EnginePool:
                 )
 
             while True:
-                current = max(
-                    mx.get_active_memory(),
-                    get_phys_footprint(),
-                    self._current_model_memory,
-                )
+                active = mx.get_active_memory()
+                footprint = get_phys_footprint()
+                current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
-                    # A model eviction and/or the pooled-buffer reclaim below
-                    # created enough headroom; signal the caller to re-admit.
-                    # reclaim_attempted stands in for "the reclaim freed
-                    # memory": the helper's own footprint delta is
-                    # process-wide and can be masked by concurrent
-                    # allocation, but reaching this check with headroom
-                    # after an attempt means admission will now succeed.
-                    if ane_release_attempted:
-                        action = "release_ane"
-                    elif reclaim_attempted:
-                        action = "reclaim_pool"
-                    elif evicted_any:
-                        action = "evict_model"
-                    else:
-                        # No rung ran: the pool's own reading already sees
-                        # headroom. The entry mark above keeps this request
-                        # recurring, so when the scheduler's tighter usage
-                        # reading disagrees and sends it back, the ladder
-                        # escalates straight to the ANE-bank release instead
-                        # of spending the remaining retry on the reclaim rung
-                        # a no-op first pass already proved useless.
-                        action = "already_fit"
-                    _log_decision(action, "retry")
+                    # Use the same sample for admission and its decision log.
+                    _log_decision("headroom_available")
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
-                    # No idle model left to evict -- the "No idle model
-                    # evicted" case that used to reject outright even when
-                    # tens of GB were reclaimable. Two rungs remain: the
-                    # cheap pooled-buffer reclaim, and shedding the
-                    # requesting model's own ANE prefill banks. Ordering
-                    # matters: prefill continuously refills MLX's buffer
-                    # cache, so on a long prompt the reclaim can "succeed"
-                    # by a marginal few GB on every pass while the durable
-                    # rung is never reached — a request that already had a
-                    # reclaim pass and is back for more headroom escalates
-                    # straight to the bank release instead.
+                    # Reclaim pooled buffers first, unless this request has
+                    # already tried to obtain headroom in a previous callback.
                     if recurring and not ane_release_attempted:
                         ane_release_attempted = True
                         await self._release_ane_prefill_for_headroom(
@@ -2114,9 +2089,8 @@ class EnginePool:
                             format_size(predicted),
                             format_size(target),
                         )
-                        _log_decision("evict_model", "retry")
-                    else:
-                        _log_decision("reject", "exhausted")
+                    # The scheduler may still fit a smaller chunk.
+                    _log_decision("insufficient_headroom")
                     return evicted_any
 
                 logger.info(

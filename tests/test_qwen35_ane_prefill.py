@@ -3217,6 +3217,7 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
@@ -3250,6 +3251,7 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
 
 def test_release_clears_the_state_cache_that_pins_the_same_states():
     import gc
+
     model = _ReleasableModel()
     mlp_handle = _NativeHandle()
     gdn_handle = _NativeHandle()
@@ -3269,9 +3271,6 @@ def test_release_clears_the_state_cache_that_pins_the_same_states():
     gc.collect()
 
     assert released == 2
-    # Asserted before the cache contents: left populated, the cache keeps the
-    # mapped bank alive and the release hands back nothing, and that is the
-    # failure worth reading when this regresses.
     assert mlp_ref() is None
     assert gdn_ref() is None
     assert model.mlp._omlx_ane_prefill_cache == {}
@@ -3280,6 +3279,7 @@ def test_release_clears_the_state_cache_that_pins_the_same_states():
 
 def test_release_clears_a_stale_state_cache_entry():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
