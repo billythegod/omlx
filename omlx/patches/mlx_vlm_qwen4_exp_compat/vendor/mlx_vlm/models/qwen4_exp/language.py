@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 import mmap
 import os
 import struct
@@ -39,7 +40,8 @@ _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 # Identity cache: keep the array alive so CPython cannot recycle id().
 _TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
-_LAST_QSA_PATH_LOG: tuple[Any, ...] | None = None
+_LAST_QSA_PATH_LOG: dict[tuple[str, int, int | None], float] = {}
+_QSA_PATH_LOG_MIN_INTERVAL_S = 5.0
 logger = logging.getLogger("omlx.qwen4_qsa")
 
 
@@ -121,11 +123,17 @@ def _log_qsa_prefill_path(
     query: int,
     position_ndim: int | None,
 ) -> None:
+    # Consecutive-key dedup alone never fires: a decode loop alternates
+    # (path, query, ndim) every cycle (ndim 3 <-> None in interleaved
+    # requests) and kv_len changes on every call. Throttle each distinct
+    # key to one line per interval instead.
     global _LAST_QSA_PATH_LOG
-    key = (path, kv_len, query, position_ndim)
-    if key == _LAST_QSA_PATH_LOG:
+    key = (path, query, position_ndim)
+    now = time.monotonic()
+    last = _LAST_QSA_PATH_LOG.get(key)
+    if last is not None and now - last < _QSA_PATH_LOG_MIN_INTERVAL_S:
         return
-    _LAST_QSA_PATH_LOG = key
+    _LAST_QSA_PATH_LOG[key] = now
     logger.info(
         "qwen4 QSA prefill path=%s query=%d kv_len=%d position_ids.ndim=%s",
         path,
