@@ -28,6 +28,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
+from ..exceptions import PrefillMemoryAbortedError
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -335,7 +336,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._loaded = False
-        self._active_request = False
         # DFlash runs outside Scheduler, so memory-pressure aborts cannot use
         # EngineCore's request registry. Keep the stop events for every
         # submitted generation instead; the process memory enforcer calls
@@ -1395,8 +1395,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 queue.put(("", [], True, {"aborted": stop_event.is_set()})),
                 loop,
             )
-            self._active_request = False
-            self._unregister_stop_event(stop_event)
 
     def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
         """Return prompt IDs without re-tokenizing an already-tokenized prompt."""
@@ -1476,7 +1474,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         from ..engine_core import get_mlx_executor
 
-        loop = asyncio.get_running_loop()
         stop_event = threading.Event()
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
@@ -1556,16 +1553,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         except Exception as exc:
                             logger.debug(f"event_iter.close() raised: {exc}")
                 self._end_runtime_cache_request(cache_manager)
-                self._active_request = False
-                self._unregister_stop_event(stop_event)
 
-        self._active_request = True
         self._register_stop_event(stop_event)
         try:
-            future = loop.run_in_executor(get_mlx_executor(), _run)
+            future = get_mlx_executor().submit(_run)
         except Exception:
             self._unregister_stop_event(stop_event)
+            self._end_activity(activity_id)
             raise
+        # Use the executor future: asyncio cancellation can precede worker exit.
+        future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
+        future = asyncio.wrap_future(future)
         try:
             try:
                 (
@@ -1591,6 +1589,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 raise
         finally:
             self._end_activity(activity_id)
+
+        if stop_event.is_set():
+            raise PrefillMemoryAbortedError(
+                "Request aborted: process memory limit exceeded"
+            )
 
         if parser_session is not None:
             # Parser already converted protocol markers to <think>...</think>
@@ -1730,11 +1733,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # Admin visibility: DFlash bypasses the scheduler, so the Active
         # Models card reads this activity instead of a scheduler snapshot.
         activity_id = self._begin_activity("generate", detail="generating")
-        self._active_request = True
         self._register_stop_event(stop_event)
         try:
-            future = loop.run_in_executor(
-                get_mlx_executor(),
+            future = get_mlx_executor().submit(
                 self._run_generate_streaming,
                 prompt_tokens,
                 max_tokens,
@@ -1752,7 +1753,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
         except Exception:
             self._unregister_stop_event(stop_event)
+            self._end_activity(activity_id)
             raise
+        # Use the executor future: asyncio cancellation can precede worker exit.
+        future.add_done_callback(lambda _: self._unregister_stop_event(stop_event))
+        future = asyncio.wrap_future(future)
 
         total_text = ""
         total_completion = 0
@@ -1761,6 +1766,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         try:
             while True:
                 new_text, new_tokens, finished, metrics = await queue.get()
+
+                if metrics and metrics.get("aborted"):
+                    raise PrefillMemoryAbortedError(
+                        "Request aborted: process memory limit exceeded"
+                    )
 
                 if think_prefix_pending and new_text:
                     new_text = self._think_prefix_text() + new_text
@@ -1998,8 +2008,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._fallback_engine is not None
             and self._fallback_engine.has_active_requests()
         ):
-            return True
-        if self._active_request:
             return True
         with self._stop_events_lock:
             if self._active_stop_events:
