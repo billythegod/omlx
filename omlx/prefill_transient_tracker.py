@@ -236,9 +236,23 @@ class PrefillTransientTracker:
     def reclaim_debt_bytes_for(self, gathered_core: bool) -> int:
         return self._history(gathered_core).reclaim_debt_bytes
 
+    def record_external_reclaim(self, request_id: str, reclaimed_bytes: int) -> None:
+        """Price only observed flat overhead that a cache clear released."""
+        if reclaimed_bytes <= 0:
+            return
+        for history in (self._dense_history, self._gathered_history):
+            if history.request_id == request_id:
+                history.reclaim_debt_bytes = max(
+                    history.reclaim_debt_bytes,
+                    min(history.flat_overhead_bytes, int(reclaimed_bytes)),
+                )
+
     def flat_overhead_charge_for(self, gathered_core: bool) -> int:
         history = self._history(gathered_core)
-        return max(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+        # Retained pool growth is already present in the scheduler's current
+        # physical-footprint reading. Charging it again double-counts it.
+        # Only the portion actually reclaimed can be reallocated next chunk.
+        return min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
 
     def expansion_limit_for(
         self, gathered_core: bool, *, request_id: str = ""

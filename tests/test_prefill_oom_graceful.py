@@ -717,6 +717,27 @@ def test_qwen4_mask_dense_chunk_does_not_poison_gathered_admission():
     tracker = ns._prefill_transient_tracker
     assert tracker.flat_overhead_bytes_for(False) > 0
     assert tracker.flat_overhead_bytes_for(True) == 0
+
+    # The 26 GB retained pool is already in current footprint, so the next
+    # dense chunk pays only its static profile. If a clear really releases
+    # 12.5 GB, only that released portion becomes a one-shot charge.
+    dense_retained = ns._predicted_chunk_transient(
+        2048, 141_312, gathered_core=False
+    )
+    static_prediction = (
+        monitor.estimate_chunk_transient_bytes(2048, 143_360, gathered_core=False)
+        + monitor.estimate_prompt_kv_bytes(2048)
+    ) * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert dense_retained == pytest.approx(static_prediction)
+    tracker.record_external_reclaim("dense-prefix", int(12.5 * _GB))
+    dense_reallocation = ns._predicted_chunk_transient(
+        2048, 141_312, gathered_core=False
+    )
+    assert dense_reallocation == pytest.approx(
+        static_prediction + tracker.flat_overhead_charge_for(False)
+    )
+    assert tracker.flat_overhead_charge_for(False) <= 12.5 * _GB
+
     gathered_floor = ns._predicted_chunk_transient(
         32, 142_784, gathered_core=True
     )

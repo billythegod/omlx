@@ -4837,6 +4837,11 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
+    def _record_prefill_reclaim(self, request_id: str, reclaimed_bytes: int) -> None:
+        self._prefill_transient_tracker.record_external_reclaim(
+            request_id, reclaimed_bytes
+        )
+
     def _record_chunk_transient(
         self,
         n_tokens: int,

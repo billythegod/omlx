@@ -240,7 +240,32 @@ class TestFlatOverhead:
             request_id="r",
         )
         assert t.flat_overhead_bytes_for(False) == 570 * self.MB
-        assert t.flat_overhead_charge_for(False) == 570 * self.MB
+        assert t.flat_overhead_charge_for(False) == 0
+
+    def test_only_reclaimed_flat_overhead_is_charged_again(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            28_536 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+        )
+
+        # The retained 27 GB is already included in current footprint.
+        assert t.flat_overhead_charge_for(False) == 0
+        t.record_external_reclaim("r", 12_500 * self.MB)
+        assert t.flat_overhead_charge_for(False) == 12_500 * self.MB
+        assert t.flat_overhead_charge_for(True) == 0
+
+        # The next positive delta repays that one-shot reallocation risk.
+        t.observe_flat_overhead(
+            2048,
+            13_902 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+        )
+        assert t.flat_overhead_charge_for(False) == 0
+        assert t.flat_overhead_bytes_for(False) == 27_134 * self.MB
 
     def test_reclaim_debt_tracks_net_release(self):
         t = PrefillTransientTracker("qwen4")
