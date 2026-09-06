@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import time
 import mmap
 import os
 import struct
@@ -36,6 +38,148 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+# Identity cache: keep the array alive so CPython cannot recycle id().
+_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
+_LAST_QSA_PATH_LOG: dict[tuple[str, int, int | None], float] = {}
+_QSA_PATH_LOG_MIN_INTERVAL_S = 5.0
+logger = logging.getLogger("omlx.qwen4_qsa")
+
+
+def _broadcast_text_mrope_position_ids(
+    position_ids: Optional[mx.array],
+    length: int,
+) -> bool:
+    """True for missing/2-D text ids, or 3-D MRoPE that is a text broadcast.
+
+    Parent LanguageModel tiles identical ``(1, L)`` positions to ``(3, 1, L)``
+    for text-only mRoPE. Real image grids differ across the three planes and
+    must stay on the official mask+SDPA path.
+    """
+    if position_ids is None:
+        return True
+    if not isinstance(position_ids, mx.array):
+        return False
+    if position_ids.ndim == 2:
+        return tuple(position_ids.shape) == (1, length)
+    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
+        return False
+    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
+        if cached_ids is position_ids and cached_len == length:
+            return cached_same
+    same = bool(
+        mx.array_equal(position_ids[0], position_ids[1]).item()
+        and mx.array_equal(position_ids[1], position_ids[2]).item()
+    )
+    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
+    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
+        del _TEXT_MROPE_EQUAL_PLANES[:-8]
+    return same
+
+
+def _gathered_min_query_tokens() -> int:
+    """Query rows below which the official mask+SDPA path is faster.
+
+    Measured on an M5 Max at 12k/48k/206k context (Qwen3.8-Flash-Next
+    geometry, native kernels): the per-row gather of ``token_budget`` K/V
+    rows costs more than MLX's masked SDPA over the full cache until about
+    eight query rows, and the official path wins by 1.4-3x for the 1-4 row
+    windows Lightning MTP issues.  Real prefill chunks are far wider.
+    ``OMLX_QWEN4_GATHERED_MIN_QUERY`` overrides the default of 16.
+    """
+    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
+    if raw:
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            pass
+    return 16
+
+
+def _split_text_mrope_positions(
+    position_ids: Optional[mx.array],
+    batch: int,
+    length: int,
+    past_len: int,
+) -> tuple[mx.array, mx.array]:
+    """Indexer text ids vs rotary ids for the gathered QSA arms."""
+    if position_ids is None:
+        text_position_ids = mx.arange(
+            past_len, past_len + length, dtype=mx.int32
+        )[None]
+        rotary_position_ids = mx.broadcast_to(
+            text_position_ids,
+            (3, batch, length),
+        )
+        return text_position_ids, rotary_position_ids
+    if position_ids.ndim == 3:
+        return position_ids[0], position_ids
+    return position_ids, position_ids
+
+
+def _log_qsa_prefill_path(
+    path: str,
+    *,
+    kv_len: int,
+    query: int,
+    position_ndim: int | None,
+) -> None:
+    # Consecutive-key dedup alone never fires: a decode loop alternates
+    # (path, query, ndim) every cycle (ndim 3 <-> None in interleaved
+    # requests) and kv_len changes on every call. Throttle each distinct
+    # key to one line per interval instead.
+    global _LAST_QSA_PATH_LOG
+    key = (path, query, position_ndim)
+    now = time.monotonic()
+    last = _LAST_QSA_PATH_LOG.get(key)
+    if last is not None and now - last < _QSA_PATH_LOG_MIN_INTERVAL_S:
+        return
+    _LAST_QSA_PATH_LOG[key] = now
+    logger.info(
+        "qwen4 QSA prefill path=%s query=%d kv_len=%d position_ids.ndim=%s",
+        path,
+        query,
+        kv_len,
+        position_ndim,
+    )
+
+
+def _python_cache_offset(offset: Any) -> int:
+    """Scalar KV length for logging. Batched offsets use the longest row.
+
+    ``BatchQSAKVCache.offset`` is an ``mx.array`` of per-row lengths. ``int()``
+    on that array raises ``[convert] Only length-1 arrays...`` and used to
+    abort the engine before eligibility could fail closed onto the official
+    path. Logging still wants one number; the longest row is the conservative
+    choice for ``kv_len``.
+    """
+    if offset is None:
+        return 0
+    if isinstance(offset, (int, np.integer)):
+        return int(offset)
+    shape = getattr(offset, "shape", None)
+    if shape is None:
+        try:
+            return int(offset)
+        except (TypeError, ValueError):
+            return 0
+    size = 1
+    for dim in shape:
+        size *= int(dim)
+    if size <= 1:
+        value = offset.reshape(-1)[0] if size == 1 else offset
+        return int(value.item()) if hasattr(value, "item") else int(value)
+    return int(mx.max(offset).item())
+
+
+def _promote_index_positions_to_3d(positions: mx.array, planes: int) -> mx.array:
+    if positions.ndim == 3:
+        if int(positions.shape[0]) != planes:
+            raise ValueError(
+                "QSA indexer mRoPE plane count mismatch during cache extend: "
+                f"{tuple(int(d) for d in positions.shape)} vs planes={planes}"
+            )
+        return positions
+    return mx.broadcast_to(positions[None], (planes, *positions.shape))
 
 
 @dataclass(frozen=True)
@@ -378,7 +522,18 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        self._invalidate_pooled_indexer()
+        # Pooled blocks strictly below the new complete-block count are built
+        # from raw keys that trim does not touch, so keep them and only clamp
+        # the pooled frontier.  Lightning MTP trims after every rejected
+        # draft; a full invalidation re-pooled every block of the context on
+        # the next call (1.75 ms/layer at 206k tokens).
+        if self._pooled_index_keys is not None and self._pooled_index_ratio:
+            self._pooled_index_offset = min(
+                self._pooled_index_offset,
+                self._index_offset // self._pooled_index_ratio,
+            )
+        else:
+            self._invalidate_pooled_indexer()
 
     @property
     def indexer_nbytes(self):
@@ -1156,13 +1311,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array],
         length: int,
     ) -> bool:
-        """Accept absent or shape-matched 2-D text positions, never MRoPE."""
+        """Accept absent, 2-D text, or broadcast-identical 3-D text mRoPE."""
 
-        return position_ids is None or bool(
-            isinstance(position_ids, mx.array)
-            and position_ids.ndim == 2
-            and position_ids.shape == (1, length)
-        )
+        return _broadcast_text_mrope_position_ids(position_ids, length)
 
     def _gathered_text_prefill_eligible(
         self,
@@ -1179,7 +1330,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if not (
             x.ndim == 3
             and x.shape[0] == 1
-            and x.shape[1] > 1
+            # Narrow multi-row windows (Lightning MTP history/verify passes)
+            # are cheaper on the official masked path; see
+            # _gathered_min_query_tokens.
+            and x.shape[1] >= _gathered_min_query_tokens()
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
@@ -1204,7 +1358,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]],
         target_verify: bool,
     ) -> bool:
-        """Fail closed outside scalar-offset batch-one text decode."""
+        """Fail closed outside scalar-offset batch-one text decode.
+
+        Prefill may accept broadcast-identical 3-D text mRoPE. Decode keeps
+        the 2-D / absent predicate until that arm has its own numerical
+        parity coverage.
+        """
 
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -1215,7 +1374,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
-            and self._batch_one_text_position_ids(position_ids, 1)
+            and (
+                position_ids is None
+                or (
+                    position_ids.ndim == 2
+                    and tuple(position_ids.shape) == (1, 1)
+                )
+            )
         ):
             return False
 
@@ -1263,17 +1428,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len, past_len + length, dtype=mx.int32
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, keys = self.rotary_emb.apply_rotary(
             queries,
             keys,
@@ -1364,19 +1521,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
 
         past_len = cache.offset
-        if position_ids is None:
-            text_position_ids = mx.arange(
-                past_len,
-                past_len + 1,
-                dtype=mx.int32,
-            )[None]
-            rotary_position_ids = mx.broadcast_to(
-                text_position_ids,
-                (3, batch, length),
-            )
-        else:
-            text_position_ids = position_ids
-            rotary_position_ids = position_ids
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
         queries, new_keys = self.rotary_emb.apply_rotary(
             queries,
             new_keys,
@@ -1432,6 +1579,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        query = int(x.shape[1]) if x.ndim == 3 else 0
+        kv_len = _python_cache_offset(getattr(cache, "offset", 0)) + query
+        position_ndim = (
+            int(position_ids.ndim) if isinstance(position_ids, mx.array) else None
+        )
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -1451,10 +1603,23 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             target_verify,
         ):
             cache._omlx_last_prefill_gathered = True
+            _log_qsa_prefill_path(
+                "gathered",
+                kv_len=kv_len,
+                query=query,
+                position_ndim=position_ndim,
+            )
             return self._gathered_text_prefill(x, cache, position_ids)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
+        if query > 1:
+            _log_qsa_prefill_path(
+                "mask_dense",
+                kv_len=kv_len,
+                query=query,
+                position_ndim=position_ndim,
+            )
         qsa_mask = self.indexer(
             x,
             cache,
