@@ -226,3 +226,134 @@ class TestExecutionRegimes:
 
         assert t.observed_max_bytes == 900 * 1024**2
         assert t.observed_max_bytes_for(True) == 40 * 1024**2
+
+
+class TestFlatOverhead:
+    MB = 1024**2
+
+    def test_fixed_overhead_is_not_scaled_by_token_count(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            54,
+            571 * self.MB,
+            static_bytes=self.MB,
+            request_id="r",
+        )
+        assert t.flat_overhead_bytes_for(False) == 570 * self.MB
+        assert t.flat_overhead_charge_for(False) == 0
+
+    def test_only_reclaimed_flat_overhead_is_charged_again(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            28_536 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+        )
+
+        t.observe_flat_overhead(
+            2048,
+            10_000 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+            gathered_core=True,
+        )
+        # The retained 27 GB is already included in current footprint.
+        assert t.flat_overhead_charge_for(False) == 0
+        t.record_external_reclaim(
+            "r", 12_500 * self.MB, gathered_core=False
+        )
+        assert t.flat_overhead_charge_for(False) == 12_500 * self.MB
+        assert t.flat_overhead_charge_for(True) == 0
+
+        # The next positive delta repays that one-shot reallocation risk.
+        t.observe_flat_overhead(
+            2048,
+            13_902 * self.MB,
+            static_bytes=1402 * self.MB,
+            request_id="r",
+        )
+        assert t.flat_overhead_charge_for(False) == 0
+        assert t.flat_overhead_bytes_for(False) == 27_134 * self.MB
+
+    def test_reclaim_debt_tracks_net_release(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048, -600 * self.MB, static_bytes=100 * self.MB, request_id="r"
+        )
+        t.observe_flat_overhead(
+            2048, -400 * self.MB, static_bytes=100 * self.MB, request_id="r"
+        )
+        assert t.reclaim_debt_bytes_for(False) == 1000 * self.MB
+        t.observe_flat_overhead(
+            2048, 250 * self.MB, static_bytes=100 * self.MB, request_id="r"
+        )
+        assert t.reclaim_debt_bytes_for(False) == 750 * self.MB
+
+    def test_reallocation_does_not_become_new_flat_overhead(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048, 4 * 1024 * self.MB, static_bytes=1024 * self.MB, request_id="r"
+        )
+        t.observe_flat_overhead(
+            2048, -16 * 1024 * self.MB, static_bytes=1024 * self.MB, request_id="r"
+        )
+        t.observe_flat_overhead(
+            2048, 17 * 1024 * self.MB, static_bytes=1024 * self.MB, request_id="r"
+        )
+        assert t.flat_overhead_bytes_for(False) == 3 * 1024 * self.MB
+        assert t.reclaim_debt_bytes_for(False) == 0
+
+    def test_plateau_requires_static_covered_same_width_samples(self):
+        t = PrefillTransientTracker("qwen4")
+        static = 1024 * self.MB
+        t.observe_flat_overhead(
+            512, 2 * 1024 * self.MB, static_bytes=static, request_id="r"
+        )
+        for _ in range(4):
+            t.observe_flat_overhead(
+                512, 500 * self.MB, static_bytes=static, request_id="r"
+            )
+        assert t.expansion_limit_for(False) == 0
+        t.observe_flat_overhead(
+            512, 500 * self.MB, static_bytes=static, request_id="r"
+        )
+        assert t.expansion_limit_for(False) == 1024
+
+        t.observe_flat_overhead(
+            512, -2 * 1024 * self.MB, static_bytes=static, request_id="r"
+        )
+        assert t.expansion_limit_for(False) == 1024
+        assert t.reclaim_debt_bytes_for(False) == 2 * 1024 * self.MB
+
+    def test_plateau_expands_to_the_next_fixed_tier(self):
+        t = PrefillTransientTracker("qwen4")
+        for _ in range(5):
+            t.observe_flat_overhead(
+                96, 0, static_bytes=100 * self.MB, request_id="r"
+            )
+        assert t.expansion_limit_for(False) == 128
+
+    def test_plateau_permission_does_not_cross_requests(self):
+        t = PrefillTransientTracker("qwen4")
+        for _ in range(5):
+            t.observe_flat_overhead(
+                512, 0, static_bytes=100 * self.MB, request_id="r1"
+            )
+        assert t.expansion_limit_for(False, request_id="r1") == 1024
+        assert t.expansion_limit_for(False, request_id="r2") == 0
+        t.observe_flat_overhead(
+            512, 0, static_bytes=100 * self.MB, request_id="r2"
+        )
+        assert t.expansion_limit_for(False, request_id="r2") == 0
+
+    def test_execution_regimes_are_independent(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            500 * self.MB,
+            static_bytes=100 * self.MB,
+            request_id="r",
+        )
+        assert t.flat_overhead_bytes_for(False) == 400 * self.MB
+        assert t.flat_overhead_bytes_for(True) == 0
