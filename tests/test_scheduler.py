@@ -611,6 +611,183 @@ class TestSchedulerAddRequest:
             "req-rotating"
         )
 
+    def test_partial_hit_refused_when_model_builds_unregistered_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """A model whose own make_cache() returns an *unregistered* cache class
+        must not reuse a paged prefix at all — not even a partial one.
+
+        An unregistered ``KVCache`` subclass is sniffed structurally, handed the
+        default handler and rebuilt as a plain ``KVCache``, silently dropping its
+        window state (Unlimited-OCR's ``RingSlidingKVCache`` carries
+        window_size/prefill_length/_ring_pos). The pre-existing rotating guard
+        only covers *exact* hits and inspects the already-reconstructed cache,
+        so a partial hit slipped through and corrupted generation.
+        """
+        from omlx.cache.paged_cache import BlockTable
+
+        RingSlidingKVCache = type("RingSlidingKVCache", (), {})
+        mock_model.make_cache = lambda: [RingSlidingKVCache()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        # Partial hit: 2 of 4 tokens cached, so the exact-hit guard cannot fire.
+        block_table = BlockTable(request_id="req-ring", block_ids=[7], num_tokens=2)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [43, 44])
+        # Reconstruction hands back a plain KVCache — the ring class is lost.
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-ring",
+            prompt=[41, 42, 43, 44],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == [41, 42, 43, 44]
+        assert request.prompt_cache is None
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+
+    def test_plain_kvcache_model_still_uses_prefix_cache(
+        self, mock_model, mock_tokenizer
+    ):
+        """The guard must not disable prefix reuse for ordinary KVCache models."""
+        from omlx.cache.paged_cache import BlockTable
+
+        KVCache = type("KVCache", (), {})
+        mock_model.make_cache = lambda: [KVCache()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(request_id="req-plain", block_ids=[8], num_tokens=2)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [53, 54])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-plain",
+            prompt=[51, 52, 53, 54],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+        assert request.cached_tokens == 2
+
+    @pytest.mark.parametrize(
+        "cache_class_name",
+        [
+            # Registered: reconstruction re-dispatches on the stored class name
+            # and the boundary-snapshot path preserves the extra state.
+            "RotatingKVCache",
+            "ArraysCache",
+            "MiniMaxM3KVCache",
+            # Plainly sliceable, round-trips by block slicing.
+            "ChunkedKVCache",
+            "TurboQuantKVCache",
+        ],
+    )
+    def test_supported_non_plain_cache_models_keep_prefix_cache(
+        self, mock_model, mock_tokenizer, cache_class_name
+    ):
+        """The guard must only refuse classes the round trip cannot rebuild.
+
+        Rotating/arrays/MiniMax layers have registry handlers and chunked and
+        TurboQuant layers are block-sliceable, so all of them keep prefix reuse.
+        Refusing them would cost a full re-prefill on every request for no
+        correctness gain.
+        """
+        from omlx.cache.paged_cache import BlockTable
+
+        mock_model.make_cache = lambda: [type(cache_class_name, (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+
+        block_table = BlockTable(
+            request_id="req-supported", block_ids=[11], num_tokens=2
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [63, 64])
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-supported",
+            prompt=[61, 62, 63, 64],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+
+    def test_cache_list_refused_when_a_sub_cache_is_unregistered(
+        self, mock_model, mock_tokenizer
+    ):
+        """CacheList round-trips per sub-cache, so one unknown sub-cache is fatal."""
+        cache_list = type(
+            "CacheList",
+            (),
+            {"caches": (type("KVCache", (), {})(), type("RingSlidingKVCache", (), {})())},
+        )
+        mock_model.make_cache = lambda: [cache_list()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+
+    def test_cache_list_allowed_when_every_sub_cache_is_supported(
+        self, mock_model, mock_tokenizer
+    ):
+        """A CacheList of known sub-caches keeps prefix reuse."""
+        cache_list = type(
+            "CacheList",
+            (),
+            {"caches": (type("KVCache", (), {})(), type("RotatingKVCache", (), {})())},
+        )
+        mock_model.make_cache = lambda: [cache_list()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+
+    def test_probe_failure_refuses_reuse_and_is_not_memoized(
+        self, mock_model, mock_tokenizer
+    ):
+        """A failed probe must fail closed and stay retryable.
+
+        Memoizing a transient failure as "safe" would restore exactly the silent
+        downgrade this guard exists to prevent, so the failure path refuses reuse
+        and records nothing.
+        """
+
+        def _boom():
+            raise RuntimeError("cannot build cache")
+
+        mock_model.make_cache = _boom
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+        assert getattr(scheduler, "_unreconstructible_cache_model", None) is None
+
+        # Once the underlying cause clears, the model is probed again.
+        mock_model.make_cache = lambda: [type("KVCache", (), {})()]
+        assert scheduler._model_has_unreconstructible_cache() is False
+
     def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
         self, mock_model, mock_tokenizer
     ):
