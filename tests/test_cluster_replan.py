@@ -132,8 +132,9 @@ class _RecordingPool:
 
     async def get_engine(self, model_id):
         assert model_id == self.model_id
-        deployment = routes.get_cluster_registry().get_for_model(self.model_path)
-        self.entry.engine = _ReadyEngine(deployment)
+        if self.entry.engine is None:
+            deployment = routes.get_cluster_registry().get_for_model(self.model_path)
+            self.entry.engine = _ReadyEngine(deployment)
         return self.entry.engine
 
 
@@ -415,7 +416,12 @@ def test_replan_rejects_a_stale_approval(active_deployment):
     assert active_deployment.pool.reloads == 1
 
 
-def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "change",
+    [{"target_context_tokens": 16384}, {"path_map": {"small": "/models/new"}}],
+    ids=["context", "path"],
+)
+def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch, change):
     configure_cluster_registry(tmp_path)
     model_path = tmp_path / "models" / "nemotron"
     model_path.mkdir(parents=True)
@@ -436,7 +442,7 @@ def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
             "/admin/api/cluster/replan",
             json={
                 "deployment_id": deployment_id,
-                "target_context_tokens": 16384,
+                **change,
             },
         )
         .json()
@@ -445,7 +451,7 @@ def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
         "/admin/api/cluster/replan",
         json={
             "deployment_id": deployment_id,
-            "target_context_tokens": 16384,
+            **change,
             "approved_placement": preview["plan"]["placement_signature"],
         },
     )
@@ -455,6 +461,9 @@ def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
     # The old deployment must survive a refused replan.
     listed = _client().get("/admin/api/cluster/deployments")
     assert listed.json()["deployments"][0]["deployment_id"] == deployment_id
+
+    assert pool.entry.engine.deployment.path_map == {}
+    assert listed.json()["deployments"][0]["path_map"] == {}
 
 
 def test_replan_unknown_deployment_is_404(tmp_path, monkeypatch):
@@ -530,3 +539,36 @@ def test_replan_membership_change_adds_a_node(active_deployment):
         (item["rank"], item["node_id"]) for item in payload["deployment"]["assignments"]
     )
     assert ranks == [(0, "large"), (1, "small"), (2, "mini")]
+
+
+@pytest.mark.parametrize(
+    "old_paths,new_paths",
+    [
+        ({}, {"small": "/models/new"}),
+        ({"small": "/models/old"}, {"small": "/models/new"}),
+        ({"small": "/models/old"}, {}),
+        ({"small": "/models/old"}, {"small": "/models/old"}),
+    ],
+    ids=["add", "change", "remove", "unchanged"],
+)
+def test_replan_path_map_matches_resident_engine(
+    active_deployment, old_paths, new_paths
+):
+    pool = active_deployment.pool
+    current = replace(pool.entry.engine.deployment, path_map=old_paths)
+    pool.entry.engine.deployment = current
+    registry = routes.get_cluster_registry()
+    registry.upsert(current)
+    previous_engine = pool.entry.engine
+    reloads = pool.reloads
+    request = {"deployment_id": current.deployment_id, "path_map": new_paths}
+    client = _client()
+    preview = client.post("/admin/api/cluster/replan", json=request)
+    assert preview.status_code == 200, preview.json()
+    request["approved_placement"] = preview.json()["plan"]["placement_signature"]
+    applied = client.post("/admin/api/cluster/replan", json=request)
+    assert applied.status_code == 200, applied.json()
+    assert pool.reloads == reloads + int(old_paths != new_paths)
+    assert pool.entry.engine.deployment.path_map == new_paths
+    assert registry.get(current.deployment_id).path_map == new_paths
+    assert (pool.entry.engine is previous_engine) == (old_paths == new_paths)

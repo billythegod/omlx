@@ -3387,6 +3387,7 @@ async def _activate_and_report(
             loaded_deployment is not None
             and loaded_deployment.deployment_id == deployment.deployment_id
             and loaded_deployment.plan_hash == deployment.plan_hash
+            and loaded_deployment.path_map == deployment.path_map
         )
         if not already_loaded:
             await pool.prepare_cluster_reload(model_id)
