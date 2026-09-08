@@ -1128,6 +1128,7 @@ def build_mlx_launch_argv(
     control_host: str | None = None,
     control_port: int | None = None,
     control_token: str | None = None,
+    load_timeout: float = 1800.0,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
 
@@ -1217,6 +1218,8 @@ def build_mlx_launch_argv(
             deployment.backend,
             "--port",
             str(api_port),
+            "--load-timeout",
+            str(load_timeout),
             "--deployment-id",
             deployment.deployment_id,
             "--plan-hash",
@@ -2679,6 +2682,7 @@ class DistributedJobSupervisor:
             control_host=control_host,
             control_port=self.control_port,
             control_token=self.control_token,
+            load_timeout=self.load_timeout,
         )
         self._phase = "loading"
         try:

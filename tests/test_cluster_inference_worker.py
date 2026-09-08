@@ -50,6 +50,42 @@ def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
     _wait_for_serve_release(tmp_path, deployment_id, plan_hash, 2, timeout=0)
 
 
+@pytest.mark.parametrize("timeout", [None, 300.0, 60.0])
+def test_worker_wait_budget_allows_slow_peer_loading(tmp_path, timeout):
+    elapsed = 0.0
+
+    def advance(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+        if elapsed >= 121.0:
+            (tmp_path / "cluster-test-serve.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "deployment_id": "cluster-test",
+                        "plan_hash": "a" * 64,
+                        "world_size": 2,
+                    }
+                )
+            )
+
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    outcome = (
+        pytest.raises(TimeoutError) if timeout == 60.0 else contextlib.nullcontext()
+    )
+    with outcome:
+        _wait_for_serve_release(
+            tmp_path,
+            "cluster-test",
+            "a" * 64,
+            2,
+            clock=lambda: elapsed,
+            sleep=advance,
+            **kwargs,
+        )
+    assert elapsed == 60.0 if timeout == 60.0 else elapsed >= 121.0
+
+
 def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
     deployment_id = "cluster-test"
     marker = tmp_path / f"{deployment_id}-serve.json"

@@ -64,7 +64,7 @@ def _wait_for_serve_release(
     plan_hash: str,
     world_size: int,
     *,
-    timeout: float = 120.0,
+    timeout: float = 1800.0,
     clock: Any = time.monotonic,
     sleep: Any = time.sleep,
 ) -> None:
@@ -1454,6 +1454,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     args.deployment_id,
                     plan_hash,
                     world_size,
+                    timeout=args.load_timeout,
                 )
                 control_context = (
                     RankControlPlane(
@@ -1572,6 +1573,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-host", default="")
     parser.add_argument("--control-port", type=int, default=0)
     parser.add_argument("--control-token", default="")
+    parser.add_argument("--load-timeout", type=float, default=1800.0)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--execution-profile",

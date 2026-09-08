@@ -137,6 +137,7 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
         control_host="10.0.0.1",
         control_port=32140,
         control_token="e" * 64,
+        load_timeout=2400.0,
     )
 
     assert argv[0] == "/opt/omlx/bin/python"
@@ -144,6 +145,7 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv[argv.index("--backend") + 1] == "ring"
     assert argv[argv.index("--starting-port") + 1] == "32120"
     assert argv[argv.index("--port") + 1] == "32100"
+    assert argv[argv.index("--load-timeout") + 1] == "2400.0"
     assert argv[argv.index("--control-host") + 1] == "10.0.0.1"
     assert argv[argv.index("--control-port") + 1] == "32140"
     assert argv[argv.index("--control-token") + 1] == "e" * 64
