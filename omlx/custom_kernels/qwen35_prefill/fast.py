@@ -827,7 +827,6 @@ _qmm_nax_cache: bool | None = None
 # Bundled NAX tiles (must match qwen_q_affine_nax_variant in qwen35_prefill.cpp):
 #   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
 #   3: bn 128   4: bk 32   5: wm4 wn1
-# benchmarks/bench_qwen35_nax_qmm_variants.py compares them against stock.
 NAX_QMM_VARIANTS = range(6)
 _qmm_nax_variant_warned = False
 
