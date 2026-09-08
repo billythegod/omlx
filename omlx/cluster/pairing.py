@@ -485,6 +485,7 @@ class DeviceRegistryBridge:
                 caps=record.get("caps") or None,
                 addrs=record.get("last_addrs") or None,
                 paired_at=record.get("paired_at"),
+                http_port=record.get("http_port"),
             )
             return
         self._call(self._PUT, record)
@@ -658,13 +659,13 @@ def default_enrollment_driver(peer: dict[str, Any]) -> dict[str, Any]:
     addresses = [str(address) for address in (peer.get("addrs") or []) if address]
     if not addresses:
         raise EnrollmentDriveError("SSH enrollment requires a verified peer address")
-    result["authorized_key_installed"] = install_authorized_key(
-        public_key=peer_public_key
-    )
     for address in addresses:
         target = ssh_host_target(address)
         if pin_enrolled_host_key(hostname=target, public_key=peer_host_key):
             result["host_keys_pinned"].append(address)
+    result["authorized_key_installed"] = install_authorized_key(
+        public_key=peer_public_key
+    )
     return result
 
 
@@ -828,6 +829,7 @@ class PairingManager:
         key_store: PairingKeyStore | None = None,
         caps_provider: Callable[[], dict[str, Any]] | None = None,
         address_provider: Callable[[], list[str]] | None = None,
+        http_port: int = 8000,
         ssh_key_provider: Callable[[], str | None] | None = None,
         ssh_host_key_provider: Callable[[], str | None] | None = None,
         enrollment_driver: Callable[[dict[str, Any]], Any] | None = None,
@@ -852,6 +854,7 @@ class PairingManager:
         )
         self._caps_provider = caps_provider
         self._address_provider = address_provider
+        self.http_port = http_port
         self._ssh_key_provider = ssh_key_provider or _local_ssh_public_key
         self._ssh_host_key_provider = (
             ssh_host_key_provider or _local_ssh_host_public_key
@@ -892,8 +895,11 @@ class PairingManager:
         for candidate in candidates or []:
             raw = str(candidate).strip()
             try:
-                ipaddress.ip_address(raw.split("%", 1)[0])
+                parsed = ipaddress.ip_address(raw.split("%", 1)[0])
             except ValueError:
+                continue
+            # The sender's link-local scope is not usable on another Mac.
+            if parsed.version == 6 and parsed.is_link_local:
                 continue
             normalized = raw
             if normalized not in addresses:
@@ -986,7 +992,7 @@ class PairingManager:
                 code_salt,
             ),
             "code_salt": base64.b64encode(code_salt).decode("ascii"),
-            "http_port": None,
+            "http_port": self.http_port,
             "addrs": self.local_addrs(),
             "ssh_public_key": ssh_public_key,
             "ssh_host_public_key": ssh_host_public_key,
@@ -1106,6 +1112,7 @@ class PairingManager:
             "caps": coordinator.get("caps") or {},
             "paired_at": paired_at,
             "last_addrs": coordinator_peer["addrs"],
+            "http_port": status.get("coordinator_http_port"),
             "state": "paired",
             "role": "coordinator",
         }
@@ -1394,6 +1401,7 @@ class PairingManager:
             "caps": pending.caps,
             "paired_at": paired_at,
             "last_addrs": list(pending.addrs),
+            "http_port": pending.http_port,
             "state": "paired",
             "role": "peer",
         }
@@ -1403,6 +1411,8 @@ class PairingManager:
             # with the code; safe to persist (0600) and serve.
             "cluster_key_package": package,
             "coordinator": coordinator_material,
+            # Keep endpoint metadata outside the v1 identity tag for compatibility.
+            "coordinator_http_port": self.http_port,
             "coordinator_identity_tag": coordinator_tag,
             "peer_public_key": pending.ssh_public_key,
             "addrs": list(pending.addrs),
@@ -1465,6 +1475,7 @@ class PairingManager:
             "paired_at": paired_at,
             "cluster_key_package": package,
             "coordinator": coordinator_material,
+            "coordinator_http_port": self.http_port,
             "coordinator_identity_tag": coordinator_tag,
             "enrollment": enrollment,
         }
@@ -1510,6 +1521,7 @@ class PairingManager:
                 # persists it via complete_join, so caps/ssh key must ride
                 # here too — the poll path is the only one the UI drives.
                 "coordinator": key_record.get("coordinator") or {},
+                "coordinator_http_port": key_record.get("coordinator_http_port"),
                 "coordinator_identity_tag": key_record.get("coordinator_identity_tag"),
             }
             package = key_record.get("cluster_key_package")

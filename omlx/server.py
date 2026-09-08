@@ -2096,6 +2096,7 @@ def init_server(
         enrollment_store=get_cluster_enrollment(),
         caps_provider=announced_caps,
         address_provider=announced_addrs,
+        http_port=global_settings.server.port if global_settings else 8000,
     )
 
     # Discover models (use pinned models from settings file)

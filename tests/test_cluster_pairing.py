@@ -673,7 +673,10 @@ def test_default_enrollment_propagates_host_key_failure(monkeypatch):
         "get_or_create_ssh_key",
         lambda: SimpleNamespace(fingerprint="SHA256:local"),
     )
-    monkeypatch.setattr(ssh_keys, "install_authorized_key", lambda **_kwargs: True)
+    installed = []
+    monkeypatch.setattr(
+        ssh_keys, "install_authorized_key", lambda **kwargs: installed.append(kwargs)
+    )
     monkeypatch.setattr(
         ssh_keys,
         "pin_enrolled_host_key",
@@ -690,6 +693,8 @@ def test_default_enrollment_propagates_host_key_failure(monkeypatch):
                 "addrs": ["127.0.0.1"],
             }
         )
+
+    assert installed == []
 
 
 def test_default_enrollment_formats_ipv6_known_host_target(monkeypatch):
@@ -1187,3 +1192,52 @@ def test_join_status_rejects_substituted_coordinator_identity(tmp_path):
         joiner.complete_join(status)
 
     assert joiner.paired_devices() == []
+
+
+@pytest.mark.parametrize("coord_port,join_port", [(8000, 8000), (9123, 9234)])
+def test_pairing_preserves_ports_for_both_nodes_after_restart(
+    tmp_path, coord_port, join_port
+):
+    from omlx.cluster.discovery import DiscoveryConfig, DiscoveryService
+    from omlx.cluster.identity import NodeIdentity
+    from omlx.cluster.registry import DeviceRegistry
+
+    coord_registry = DeviceRegistry(tmp_path / "coord.json")
+    join_registry = DeviceRegistry(tmp_path / "join.json")
+    coordinator = _manager(
+        tmp_path, node_id="coord", name="Coordinator", registry=coord_registry
+    )
+    joiner = _manager(tmp_path, node_id="join", name="Joiner", registry=join_registry)
+    coordinator.http_port, joiner.http_port = coord_port, join_port
+    code = joiner.start_join()["code"]
+    request = joiner.build_join_request(code)
+    assert request["http_port"] == join_port
+    coordinator.handle_join_request(request)
+    coordinator.approve("join", code)
+    # Reload the coordinator's key store before the joiner polls approval.
+    coordinator._key_store = PairingKeyStore(tmp_path / "coord")
+    joiner.complete_join(coordinator.join_status("join"))
+    for path, remote_port in [
+        (coord_registry.path, join_port),
+        (join_registry.path, coord_port),
+    ]:
+        restored = DeviceRegistry(path)
+        assert restored.paired()[0]["http_port"] == remote_port
+        service = DiscoveryService(
+            NodeIdentity("local", "Local", 1), restored, DiscoveryConfig()
+        )
+        assert ("127.0.0.1", remote_port) in service._candidates
+
+
+def test_sender_local_ipv6_scope_does_not_block_ipv4_enrollment(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys
+
+    manager = _manager(tmp_path, node_id="local", name="Local")
+    manager._address_provider = lambda: ["fe80::1%en0", "192.168.1.2"]
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", tmp_path / "ssh")
+    monkeypatch.setattr(
+        ssh_keys, "get_or_create_ssh_key", lambda: SimpleNamespace(fingerprint="local")
+    )
+    result = default_enrollment_driver(manager.local_ssh_material())
+    assert result["host_keys_pinned"] == ["192.168.1.2"]
+    assert result["authorized_key_installed"]
