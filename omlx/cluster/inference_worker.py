@@ -520,15 +520,15 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
-    Kept beside the runtime markers and scoped by deployment and rank, so two
-    deployments never read each other's snapshots and a rank only ever loads its
-    own layer slice.
+    Kept beside the runtime markers and scoped by deployment, signed plan and
+    rank, so a changed tensor split can never restore another shard layout.
     """
 
     if not args.prompt_cache_ssd:
         return None
     root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
-    return str(root / f"{args.deployment_id}-rank-{rank}")
+    plan_hash = str(getattr(args, "plan_hash", "") or "unplanned")
+    return str(root / args.deployment_id / plan_hash / f"rank-{rank}")
 
 
 def _release_metal_memory(reason: str) -> None:
@@ -611,19 +611,30 @@ def _write_cancel_request(
     mid-collective.
     """
 
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "deployment_id": deployment_id,
-        "epoch": int(time.time() * 1000),
-        "scope": "all",
-        "reason": reason,
-    }
-    if plan_hash:
-        payload["plan_hash"] = plan_hash
     try:
         root = Path(state_dir).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{deployment_id}-cancel.json"
+        epoch = int(time.time() * 1000)
+        # A reused deployment ID can leave a marker from a future-skewed
+        # clock. Keep the edge monotonically newer so the live worker cannot
+        # mistake a watchdog request for its startup watermark.
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            previous_epoch = existing.get("epoch") if isinstance(existing, dict) else 0
+            if isinstance(previous_epoch, int) and not isinstance(previous_epoch, bool):
+                epoch = max(epoch, previous_epoch + 1)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "deployment_id": deployment_id,
+            "epoch": epoch,
+            "scope": "all",
+            "reason": reason,
+        }
+        if plan_hash:
+            payload["plan_hash"] = plan_hash
         temporary = path.with_name(path.name + ".tmp")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -1474,6 +1485,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         execution=execution,
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
+                        ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
