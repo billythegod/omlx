@@ -1257,145 +1257,140 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
-def test_disk_backed_ple_page_prefetch_returns_identical_rows(tmp_path):
-    """mincore+pread cold prefetch must not perturb gathered bytes.
-
-    Regression guard for the cold-only prefetch path in _SafeTensorMMap:
-    166-byte rows over a multi-page span straddle page boundaries often,
-    so any page-math mistake surfaces as corrupted rows.
-    """
-    import numpy as np
-
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp.language import (
-        _PLE_PAGE_SIZE,
-        DiskBackedShardedEmbedding,
-    )
-
-    prefix = (
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-    )
-    rows, dims = 4096, 83
-    dense = (
-        mx.arange(rows * dims, dtype=mx.float32).reshape(rows, dims) / 3.0
-    ).astype(mx.bfloat16)
-    filename = "model-00001-of-00001.safetensors"
-    mx.save_safetensors(
-        str(tmp_path / filename),
-        {f"{prefix}.shard_0.weight": dense},
-        metadata={"format": "mlx"},
-    )
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {f"{prefix}.shard_0.weight": filename}}),
-        encoding="utf-8",
-    )
-
-    embedding = DiskBackedShardedEmbedding(
-        tmp_path, prefix, num_embeddings=rows, dims=dims, num_shards=1
-    )
-    try:
-        reader = next(iter(embedding._readers.values()))
-        assert reader._seen_pages is not None
-        rng = np.random.default_rng(7)
-        idx = np.sort(rng.integers(0, rows, size=512))
-        values = embedding(mx.array(idx.reshape(1, -1), dtype=mx.int32))
-        expected = dense[mx.array(idx.tolist(), dtype=mx.int32)][None]
-        assert mx.array_equal(values, expected).item()
-        # Gathered pages are marked seen so warm repeats skip the pool.
-        start = reader._data_start + reader._header[
-            f"{prefix}.shard_0.weight"
-        ]["data_offsets"][0]
-        offs = start + idx * (dims * 2)
-        needed = np.unique(
-            np.concatenate(
-                (offs // _PLE_PAGE_SIZE, (offs + dims * 2 - 1) // _PLE_PAGE_SIZE)
-            )
-        )
-        assert all(reader._seen_pages[page] == 1 for page in needed.tolist())
-        # Fully-warm repeat call takes the bitmap-hit shortcut.
-        warm = embedding(mx.array(idx.reshape(1, -1), dtype=mx.int32))
-        assert mx.array_equal(warm, expected).item()
-    finally:
-        embedding.close()
-
-
-def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(tmp_path, caplog):
-    """A warm gather that lags memcpy must re-arm the bitmap exactly once.
-
-    Regression guard for the eviction re-arm: once every page is marked
-    seen, only a wall-time over-budget (the signature of evicted pages
-    turning the gather into serial minor faults) may clear the bitmap, and
-    the next gather must re-warm and re-mark through the fresh path.
-    """
-    import logging
-
-    import numpy as np
-
+@pytest.fixture
+def disk_ple_reader(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp import language as ple
-    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
-    prefix = (
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-    )
-    rows, dims = 4096, 83
-    dense = (
-        mx.arange(rows * dims, dtype=mx.float32).reshape(rows, dims) / 5.0
-    ).astype(mx.bfloat16)
-    filename = "model-00001-of-00001.safetensors"
-    mx.save_safetensors(
-        str(tmp_path / filename),
-        {f"{prefix}.shard_0.weight": dense},
-        metadata={"format": "mlx"},
-    )
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {f"{prefix}.shard_0.weight": filename}}),
-        encoding="utf-8",
-    )
-
-    embedding = DiskBackedShardedEmbedding(
-        tmp_path, prefix, num_embeddings=rows, dims=dims, num_shards=1
-    )
+    # 166-byte rows exercise reads that straddle page boundaries.
+    dense = (mx.arange(4096 * 83).reshape(4096, 83) / 3.0).astype(mx.bfloat16)
+    path = tmp_path / "ple.safetensors"
+    mx.save_safetensors(str(path), {"weight": dense})
+    reader = ple._SafeTensorMMap(path)
     try:
-        reader = next(iter(embedding._readers.values()))
-        rng = np.random.default_rng(11)
-        idx = np.sort(rng.integers(0, rows, size=512))
-        query = mx.array(idx.reshape(1, -1), dtype=mx.int32)
-        expected = dense[mx.array(idx.tolist(), dtype=mx.int32)][None]
-
-        # First call marks pages; a warm repeat under the real budget
-        # (memcpy-fast gather) must leave the bitmap intact.
-        embedding(query)
-        embedding(query)
-        assert sum(reader._seen_pages) > 0
-
-        old_floor = ple._PLE_REARM_FLOOR_SECONDS
-        old_per_row = ple._PLE_REARM_PER_ROW_SECONDS
-        try:
-            # Force the slow-gather signature: with a zero budget, any warm
-            # gather re-arms, clears the bitmap once, and the next gather
-            # re-warms through the fresh path.
-            ple._PLE_REARM_FLOOR_SECONDS = 0.0
-            ple._PLE_REARM_PER_ROW_SECONDS = 0.0
-            with caplog.at_level(
-                logging.INFO, logger="mlx_vlm.models.qwen4_exp.language"
-            ):
-                embedding(query)
-            assert sum(reader._seen_pages) == 0
-            assert reader._rearm_count == 1
-            assert "re-armed seen-page bitmap" in caplog.text
-            values = embedding(query)
-            assert sum(reader._seen_pages) > 0
-            assert mx.array_equal(values, expected).item()
-            # Rate limit: still over budget, but the interval blocks a
-            # second clear and the freshly-marked pages survive.
-            embedding(query)
-            assert sum(reader._seen_pages) > 0
-        finally:
-            ple._PLE_REARM_FLOOR_SECONDS = old_floor
-            ple._PLE_REARM_PER_ROW_SECONDS = old_per_row
+        yield ple, reader, dense
     finally:
-        embedding.close()
+        reader.close()
+
+
+@pytest.mark.parametrize("short_reads", [False, True])
+def test_disk_backed_ple_page_prefetch_returns_identical_rows(
+    disk_ple_reader, monkeypatch, short_reads
+):
+    """Read every required page once, retry short reads, and skip warm prefetch."""
+    ple, reader, dense = disk_ple_reader
+    page_size = ple._PLE_PAGE_SIZE
+    row_bytes = 83 * 2
+    base = reader._data_start + reader._header["weight"]["data_offsets"][0]
+    crossing = next(
+        row
+        for row in range(4096)
+        if (base + row * row_bytes) % page_size + row_bytes > page_size
+    )
+    indices = [crossing, crossing, 0, 1, 1000, 2000, 3000, 4000, 4095]
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    # Enumerate the byte spans independently of the prefetch endpoint formula.
+    needed_pages = {
+        offset // page_size
+        for row in indices
+        for offset in range(base + row * row_bytes, base + (row + 1) * row_bytes)
+    }
+    reads = []
+    original_pread = ple.os.pread
+
+    def record_pread(fd, size, offset):
+        limit = min(size, page_size // 3) if short_reads else size
+        data = original_pread(fd, limit, offset)
+        reads.append((offset, len(data)))
+        return data
+
+    monkeypatch.setattr(ple.os, "pread", record_pread)
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert {offset // page_size for offset, _ in reads} == needed_pages
+    file_size = reader.path.stat().st_size
+    for page in needed_pages:
+        spans = sorted(
+            (offset, length)
+            for offset, length in reads
+            if offset // page_size == page and length
+        )
+        cursor = page * page_size
+        for offset, length in spans:
+            assert offset == cursor
+            cursor += length
+        assert cursor == min((page + 1) * page_size, file_size)
+    assert all(reader._seen_pages[page] for page in needed_pages)
+
+    # Fix the measured time so a busy test host cannot trigger reactivation.
+    monkeypatch.setattr(ple, "time", SimpleNamespace(perf_counter=lambda: 0.0))
+    reads.clear()
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert reads == []
+
+
+@pytest.mark.parametrize("row_count", [0, 1, 8])
+def test_disk_backed_ple_small_gathers_skip_prefetch(
+    disk_ple_reader, monkeypatch, row_count
+):
+    _, reader, dense = disk_ple_reader
+    prefetch = MagicMock(side_effect=AssertionError("Unexpected prefetch"))
+    monkeypatch.setattr(reader, "_prefetch_missing_pages", prefetch)
+    indices = list(range(row_count))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    prefetch.assert_not_called()
+
+
+def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(
+    disk_ple_reader, monkeypatch, caplog
+):
+    """Control both clocks to verify the budget, retry, and interval boundary."""
+    ple, reader, dense = disk_ple_reader
+    indices = list(range(16))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    pread = MagicMock(wraps=ple.os.pread)
+    monkeypatch.setattr(ple.os, "pread", pread)
+    budget = (
+        ple._PLE_REARM_FLOOR_SECONDS + len(indices) * ple._PLE_REARM_PER_ROW_SECONDS
+    )
+    interval = ple._PLE_REARM_MIN_INTERVAL_SECONDS
+    caplog.set_level("INFO", logger=ple.__name__)
+
+    def gather(elapsed, now):
+        ticks = iter((0.0, elapsed))
+        monkeypatch.setattr(
+            ple,
+            "time",
+            SimpleNamespace(perf_counter=lambda: next(ticks), monotonic=lambda: now),
+        )
+        values = reader.rows("weight", indices)
+        assert mx.array_equal(values, expected).item()
+
+    gather(0.0, 1000.0)
+    assert pread.call_count > 0
+    pread.reset_mock()
+    gather(budget / 2, 1000.0)
+    assert reader._rearm_count == 0
+    assert any(reader._seen_pages)
+    pread.assert_not_called()
+
+    gather(budget * 2, 1000.0)
+    assert reader._rearm_count == 1
+    assert not any(reader._seen_pages)
+    assert "re-armed seen-page bitmap" in caplog.text
+    pread.assert_not_called()
+
+    gather(0.0, 1001.0)
+    assert pread.call_count > 0
+    assert any(reader._seen_pages)
+    pread.reset_mock()
+    gather(budget * 2, 1000.0 + interval - 1.0)
+    assert reader._rearm_count == 1
+    assert any(reader._seen_pages)
+    gather(budget * 2, 1000.0 + interval)
+    assert reader._rearm_count == 2
+    assert not any(reader._seen_pages)
+    pread.assert_not_called()
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])

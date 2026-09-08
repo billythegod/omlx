@@ -1838,32 +1838,13 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-# SSD-backed PLE row lookups hit a ~40GB mmap'd table with ~16 scattered
-# rows per token. When a page is already resident the mmap gather is a pure
-# memcpy; when it is not, the access blocks ~100us on a synchronous page
-# fault (MADV_RANDOM is correct here: rows are random, so readahead mostly
-# fetches bytes nobody asked for). Only the cold phase needs help: a
-# per-reader seen-page bitmap remembers which pages this process already
-# pulled in, and the first time a page is needed the whole batch of missing
-# pages is pread() concurrently from a thread pool so the SSD controller's
-# parallelism overlaps the waits (~4096-row gather: ~12ms parallel vs ~400ms
-# serialized page faults measured on Apple Silicon). A fully-warm call pays
-# only a bitmap probe and keeps the original memcpy gather speed.
-# Eviction honesty: the bitmap is write-once, but memory pressure makes
-# eviction the steady state (measured: a 37.5GB PLE table falls to ~24%
-# resident after hours of serving). mincore() detects eviction precisely
-# but costs ~4.5ms per shard-span call — unpayable on the hot path — so
-# instead every fully-seen gather self-instruments: if its wall time blows
-# the memcpy budget (a floor plus a per-row allowance, ~1% eviction rate
-# trips it, normal warm jitter does not), the bitmap re-arms and the next
-# gather treats every page as fresh again, re-warming the evicted ones
-# through the same concurrent pread path. Re-arm is rate-limited per
-# reader. Threads (not asyncio/io_uring) because os.pread releases the GIL
-# for the syscall duration, which is enough here.
+# Prefetch unseen pages concurrently to overlap SSD reads; keep mmap as the
+# data path. Remembering pages avoids repeating thread-pool work on warm reads.
+# os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-# Warm gather runs at ~0.1us/row; a minor fault costs ~1000x that, so this
-# budget trips on real eviction and sleeps through everything else.
+# Slow gathers may indicate page eviction. Allow normal gather overhead and
+# rate-limit retries; elapsed time is a heuristic, not a residency check.
 _PLE_REARM_FLOOR_SECONDS = 0.0005
 _PLE_REARM_PER_ROW_SECONDS = 2e-6
 _PLE_REARM_MIN_INTERVAL_SECONDS = 60.0
@@ -1943,11 +1924,7 @@ class _SafeTensorMMap:
         return mx.array(copied)
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
-        """Warm up pages behind the requested rows.
-
-        Returns True when every needed page was already marked seen (a
-        fully-warm gather whose wall time is worth timing for eviction).
-        """
+        """Prefetch unmarked pages; return whether all were already marked."""
         offsets = base_offset + row_indices * row_bytes
         needed_pages = np.unique(
             np.concatenate(
@@ -1975,15 +1952,7 @@ class _SafeTensorMMap:
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
-        """Re-arm the seen-page bitmap when a fully-seen gather lags memcpy.
-
-        A warm gather is a page-cache memcpy at ~0.1us/row; a page the OS
-        evicted after we marked it seen turns it into serial ~100us minor
-        faults. Sustained over-budget wall time is exactly that signature,
-        so clear the bitmap and let the next gather re-warm the evicted
-        pages through the concurrent pread path. Rate-limited so a reader
-        re-arms at most once per interval.
-        """
+        """Allow another prefetch after a slow gather, at most once per interval."""
         budget = _PLE_REARM_FLOOR_SECONDS + row_count * _PLE_REARM_PER_ROW_SECONDS
         if elapsed < budget:
             return
