@@ -365,13 +365,17 @@ def _sum_safetensors_blob_bytes(siblings) -> int | None:
 def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
     """Look up *.safetensors blob bytes for one repo. 0 on failure."""
     try:
-        info = api.model_info(repo_id, files_metadata=True)
+        info = api.model_info(
+            repo_id, files_metadata=True, timeout=_HF_API_TIMEOUT
+        )
     except HfHubHTTPError as e:
         if e.response is None or e.response.status_code != 401:
             logger.debug("Could not fetch blob sizes for %s: %s", repo_id, e)
             return 0
         try:
-            info = api.model_info(repo_id, files_metadata=True, token=False)
+            info = api.model_info(
+                repo_id, files_metadata=True, token=False, timeout=_HF_API_TIMEOUT
+            )
         except Exception as retry_error:
             logger.debug(
                 "Could not fetch blob sizes for %s: %s", repo_id, retry_error

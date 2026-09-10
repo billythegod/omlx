@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from huggingface_hub import HfApi
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
@@ -2587,6 +2588,34 @@ class TestCalcSafetensorsDiskSize:
 
 class TestSafetensorsBlobSize:
     """Blob-size helpers for U32-packed MLX quants (#3401)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reject_token", [False, True])
+    async def test_http_timeout_leaves_size_retryable(self, reject_token):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if reject_token and request.headers.get("authorization"):
+                return httpx.Response(401)
+            raise httpx.ReadTimeout("Hub stalled", request=request)
+
+        api = HfApi(token="test-token" if reject_token else False)
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client, patch(
+            "huggingface_hub.hf_api.get_session", return_value=client
+        ), patch.object(hf_downloader_mod, "_HF_API_TIMEOUT", 0.1):
+            for _ in range(2):
+                sizes = await hf_downloader_mod._blob_bytes_for_repos(
+                    api, ["owner/model"]
+                )
+                assert sizes == {"owner/model": 0}
+                assert hf_downloader_mod._cached_blob_size("owner/model") is None
+
+        assert len(requests) == (4 if reject_token else 2)
+        assert all(request.extensions["timeout"]["read"] == 0.1 for request in requests)
+        if reject_token:
+            assert "authorization" not in requests[1].headers
+            assert "authorization" not in requests[3].headers
 
     def test_empty_or_name_only_siblings(self):
         assert _sum_safetensors_blob_bytes(None) is None
