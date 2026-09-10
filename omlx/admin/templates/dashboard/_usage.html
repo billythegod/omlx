@@ -37,14 +37,28 @@
             <div class="border rounded-xl overflow-hidden mb-5">
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm text-right">
-                        <thead class="bg-neutral-50 text-xs text-neutral-500"><tr>
-                            <th class="p-3 text-left">{{ t('usage.model') }}</th><th class="p-3">{{ t('usage.requests') }}</th><th class="p-3">{{ t('usage.prompt') }}</th><th class="p-3">{{ t('usage.output') }}</th><th class="p-3">{{ t('usage.cached') }}</th><th class="p-3">{{ t('usage.total') }}</th><th class="p-3">{{ t('usage.speed') }}</th>
-                        </tr></thead>
-                        <tbody><template x-for="row in data.models" :key="row.model_id"><tr class="border-t">
-                            <th class="p-3 text-left font-medium break-all" x-text="row.model_id"></th>
-                            <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key"><td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td></template>
-                            <td class="p-3" x-text="speed(row.generation_tps)"></td>
-                        </tr></template></tbody>
+                        <thead class="bg-neutral-50 text-xs text-neutral-500">
+                            <tr>
+                                <th class="p-3 text-left">{{ t('usage.model') }}</th>
+                                <th class="p-3">{{ t('usage.requests') }}</th>
+                                <th class="p-3">{{ t('usage.prompt') }}</th>
+                                <th class="p-3">{{ t('usage.output') }}</th>
+                                <th class="p-3">{{ t('usage.cached') }}</th>
+                                <th class="p-3">{{ t('usage.total') }}</th>
+                                <th class="p-3">{{ t('usage.speed') }}</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="row in data.models" :key="row.model_id">
+                                <tr class="border-t">
+                                    <th class="p-3 text-left font-medium break-all" x-text="row.model_id"></th>
+                                    <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
+                                        <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
+                                    </template>
+                                    <td class="p-3" x-text="speed(row.generation_tps)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
                     </table>
                 </div>
             </div>

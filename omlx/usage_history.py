@@ -95,15 +95,18 @@ class UsageHistory:
         self._stop = threading.Event()
         self._closed = False
         self.available = False
+        self._initialized = False
         self.dropped_requests = 0
         self._last_prune = 0.0
         self._bucket_minute: int | None = None
         self._bucket_hour = 0
-        try:
-            self._initialize()
-            self.available = True
-        except (OSError, sqlite3.Error, ValueError):
-            logger.warning("Usage history unavailable; serving continues")
+        if enabled:
+            try:
+                self._initialize()
+                self._initialized = True
+                self.available = True
+            except (OSError, sqlite3.Error, ValueError):
+                logger.warning("Usage history unavailable; serving continues")
         self._thread = threading.Thread(
             target=self._run, name="omlx-usage-history", daemon=True
         )
@@ -226,7 +229,7 @@ class UsageHistory:
         with self._lock:
             changed = self.enabled != enabled
             self.enabled = enabled
-        if changed and not enabled:
+        if changed:
             self.flush()
 
     def _run(self) -> None:
@@ -241,11 +244,16 @@ class UsageHistory:
         with self._flush_lock:
             with self._lock:
                 batch, self._pending = self._pending, {}
-            if not batch and not self.enabled:
-                # Nothing to persist and recording is off: leave the file alone.
+            now = time.time()
+            prune_due = now - self._last_prune >= 86400
+            if not batch and (not self.enabled or (self.available and not prune_due)):
                 return True
             connection = None
             try:
+                # Initialization is deferred when recording starts disabled.
+                if not self._initialized:
+                    self._initialize()
+                    self._initialized = True
                 connection = self._connect()
                 with connection:
                     connection.executemany(
@@ -257,13 +265,12 @@ class UsageHistory:
                             for (hour, model), values in batch.items()
                         ],
                     )
-                    now = time.time()
-                    if now - self._last_prune >= 86400:
+                    if prune_due:
                         connection.execute(
                             "DELETE FROM model_usage_hourly WHERE timestamp_hour < ?",
                             (_hour(now - RETENTION_DAYS * 86400),),
                         )
-                if now - self._last_prune >= 86400:
+                if prune_due:
                     self._last_prune = now
                     # Maintenance failure must not replay a committed batch.
                     with suppress(sqlite3.Error):
@@ -285,7 +292,8 @@ class UsageHistory:
                         elif len(self._pending) < _MAX_PENDING_BUCKETS:
                             self._pending[key] = values
                         else:
-                            self.dropped_requests += values[0]
+                            requests, *_ = values
+                            self.dropped_requests += requests
                 return False
             finally:
                 if connection is not None:
@@ -299,7 +307,12 @@ class UsageHistory:
         self.flush()
 
     def query(
-        self, period: str = "today", model: str = "", *, now: float | None = None
+        self,
+        period: str = "today",
+        model: str = "",
+        *,
+        include_details: bool = False,
+        now: float | None = None,
     ) -> dict:
         now = time.time() if now is None else now
         start, end = _bounds(period, now)
@@ -327,13 +340,13 @@ class UsageHistory:
                 connection.close()
         totals = [0] * len(_FIELDS)
         models: dict[str, list] = {}
-        days = {}
+        # 24 cells per calendar day, repeated DST hours combine; missing hours are zero.
+        heatmap = {}
         day_cursor = start
         while day_cursor < end:
-            days[day_cursor.date().isoformat()] = [0] * len(_FIELDS)
+            heatmap[day_cursor.date().isoformat()] = [0] * 24
             day_cursor += timedelta(days=1)
-        # 24 cells per calendar day, repeated DST hours combine; missing hours are zero.
-        heatmap = {day: [0] * 24 for day in days}
+        days = {day: [0] * len(_FIELDS) for day in heatmap} if include_details else {}
         hourly: dict[int, list] = {}
         for hour, model_id, *values in rows:
             local = datetime.fromtimestamp(hour)
@@ -343,11 +356,15 @@ class UsageHistory:
             models[model_id] = [
                 a + b for a, b in zip(models[model_id], values, strict=True)
             ]
-            days[day] = [a + b for a, b in zip(days[day], values, strict=True)]
-            heatmap[day][local.hour] += values[1] + values[2]
-            hourly.setdefault(hour, [0] * len(_FIELDS))
-            hourly[hour] = [a + b for a, b in zip(hourly[hour], values, strict=True)]
-        return {
+            _requests, prompt_tokens, completion_tokens, *_ = values
+            heatmap[day][local.hour] += prompt_tokens + completion_tokens
+            if include_details:
+                days[day] = [a + b for a, b in zip(days[day], values, strict=True)]
+                hourly.setdefault(hour, [0] * len(_FIELDS))
+                hourly[hour] = [
+                    a + b for a, b in zip(hourly[hour], values, strict=True)
+                ]
+        result = {
             "range": period,
             "start": start.astimezone().isoformat(),
             "end": end.astimezone().isoformat(),
@@ -363,12 +380,16 @@ class UsageHistory:
                 key=lambda item: item["total_tokens"],
                 reverse=True,
             ),
-            "daily": [{"date": key, **_summary(value)} for key, value in days.items()],
-            "hourly": [
-                {"timestamp_hour": key, **_summary(value)}
-                for key, value in sorted(hourly.items())
-            ],
             "heatmap": [
                 {"date": key, "tokens": value} for key, value in heatmap.items()
             ],
         }
+        if include_details:
+            result["daily"] = [
+                {"date": key, **_summary(value)} for key, value in days.items()
+            ]
+            result["hourly"] = [
+                {"timestamp_hour": key, **_summary(value)}
+                for key, value in sorted(hourly.items())
+            ]
+        return result

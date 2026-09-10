@@ -53,8 +53,9 @@ Python's built-in SQLite stores one row per active model/hour with schema versio
 1 (`PRAGMA user_version`). Existing cumulative `stats.json` and its clear controls
 remain independent. No new dependency or configuration is required.
 
-A background thread flushes in-memory aggregates every 5 seconds and on normal
-shutdown. The UI polls every 15 seconds. Sudden termination can lose the unflushed
+A background thread checks for pending aggregates every 5 seconds and flushes
+on normal shutdown. With no pending data, it skips database access unless daily
+retention maintenance is due or a storage failure needs retrying. The UI polls every 15 seconds. Sudden termination can lose the unflushed
 batch. Records are attributed to the local hour when accounting completes, not
 split across the hours of a long request. Epoch bucket keys distinguish repeated
 DST hours; calendar queries use server-local dates, including 23/25-hour days and
@@ -87,8 +88,10 @@ overrides the saved value at startup.
 
 The switch applies immediately, without a restart. Turning it off flushes any
 pending aggregates and then stops recording; `usage.sqlite3` stays in place, so
-turning it back on resumes the same history. While off, nothing is read from or
-written to the database: the Usage History panel reports that history is off
+turning it back on resumes the same history. A server started with recording off does not create, open, or repair the database;
+initialization waits until recording is enabled. After pending aggregates have
+been flushed (including retries after storage failures), nothing is read from or
+written to the database while off: the Usage History panel reports that history is off
 and points to Settings, and `GET /admin/api/usage` returns `"enabled": false`
 with zero totals instead of the unavailable error. Cumulative Session and All
 Time statistics are unaffected.
@@ -102,8 +105,10 @@ Multi-day ranges include today; Yesterday is the preceding calendar day. Omit
 `model` for all models. Filtering uses the exact canonical ID, even after unload
 or removal. OpenAI-compatible responses and endpoints are unchanged.
 
-The JSON includes `totals`, `models`, `daily`, `hourly`, and `heatmap`, plus range,
-retention, refresh, `enabled`, availability, and overflow metadata. Aggregate metrics are
+The default JSON includes `totals`, `models`, and `heatmap`, plus range, retention,
+refresh, `enabled`, availability, and overflow metadata. Add `include_details=true`
+to also compute and return the full `daily` and `hourly` aggregates. The web and
+Mac panels use the compact default response. Aggregate metrics are
 `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`,
 `prefill_seconds`, `generation_seconds`, `request_seconds`, `timed_requests`,
 `cache_efficiency`, `generation_tps`, `prefill_tps`, and `average_request_seconds`.

@@ -259,3 +259,21 @@ def test_usage_history_i18n_keys_present_in_every_locale():
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         missing = {key for key in USAGE_HISTORY_I18N_KEYS if not locale.get(key)}
         assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
+
+
+@pytest.mark.parametrize("model", ["", "canonical-model", "missing"])
+def test_usage_details_are_optional_and_preserve_summary(client, model):
+    client, _ = client
+    params = {"range": "90d", "model": model}
+    compact = client.get("/admin/api/usage", params=params)
+    detailed = client.get(
+        "/admin/api/usage", params={**params, "include_details": "true"}
+    )
+    assert compact.status_code == detailed.status_code == 200
+    compact_data, detailed_data = compact.json(), detailed.json()
+    daily = detailed_data.pop("daily")
+    hourly = detailed_data.pop("hourly")
+    assert compact_data == detailed_data
+    assert sum(row["requests"] for row in daily) == compact_data["totals"]["requests"]
+    assert sum(row["requests"] for row in hourly) == compact_data["totals"]["requests"]
+    assert len(compact.content) < len(detailed.content)

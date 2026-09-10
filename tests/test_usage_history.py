@@ -7,7 +7,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -58,7 +57,7 @@ def test_first_run_schema_and_empty_range(history):
         "request_seconds",
         "timed_requests",
     ]
-    result = history.query("7d")
+    result = history.query("7d", include_details=True)
     assert result["totals"]["requests"] == 0
     assert len(result["daily"]) == len(result["heatmap"]) == 7
     assert result["totals"]["generation_tps"] is None
@@ -69,7 +68,7 @@ def test_aggregation_models_cache_and_weighted_speed(history):
     record(history, generation_duration=8.0)
     record(history, "model-b", cached_tokens=0)
     assert history.flush()
-    result = history.query()
+    result = history.query(include_details=True)
     totals = result["totals"]
     assert totals["requests"] == 3
     assert totals["prompt_tokens"] == 300
@@ -329,7 +328,7 @@ def test_repeated_dst_hour_separate_storage_combined_heatmap(history, timezone_e
     record(history, timestamp=first)
     record(history, timestamp=second)
     history.flush()
-    result = history.query(now=second)
+    result = history.query(now=second, include_details=True)
     assert len(result["hourly"]) == 2
     assert result["heatmap"][0]["tokens"][1] == 240
 
@@ -396,22 +395,78 @@ def test_runtime_toggle_flushes_then_stops_recording_and_resumes(history):
     assert result["totals"]["requests"] == 2
 
 
-def test_disabled_history_never_opens_storage(tmp_path):
-    history = UsageHistory(tmp_path / "usage.sqlite3", enabled=False)
+@pytest.mark.parametrize("storage", ["missing", "valid", "corrupt"])
+def test_disabled_startup_leaves_storage_untouched(tmp_path, storage):
+    path = tmp_path / "usage.sqlite3"
+    if storage == "valid":
+        existing = UsageHistory(path)
+        record(existing)
+        existing.close()
+    elif storage == "corrupt":
+        path.write_bytes(b"not a sqlite database")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    with patch("omlx.usage_history.sqlite3.connect") as connect:
+        history = UsageHistory(path, enabled=False)
+        try:
+            record(history)
+            assert history.flush()
+            assert history.query()["enabled"] is False
+            history.set_enabled(False)
+        finally:
+            history.close()
+        connect.assert_not_called()
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+
+    history = UsageHistory(path, enabled=False)
     try:
+        history.set_enabled(True)
+        assert history.available
         record(history)
-        assert not history._pending
         assert history.flush()
-        for suffix in ("", "-wal", "-shm"):
-            Path(str(history.path) + suffix).unlink(missing_ok=True)
-        result = history.query()
-        assert result["enabled"] is False
-        assert result["totals"]["requests"] == 0
-        history.set_enabled(False)  # no change, no flush
-        assert not history.path.exists()
+        assert history.query()["totals"]["requests"] == (2 if storage == "valid" else 1)
+        if storage == "corrupt":
+            assert (
+                path.with_suffix(".sqlite3.corrupt").read_bytes() == before[path.name]
+            )
     finally:
         history.close()
-    assert not history.path.exists()
+
+
+def test_idle_flush_skips_database_until_retention_due(history):
+    assert history.flush()
+    with patch.object(history, "_connect", wraps=history._connect) as connect:
+        for _ in range(3):
+            assert history.flush()
+        connect.assert_not_called()
+        record(history)
+        assert history.flush()
+        assert connect.call_count == 1
+
+    record(history, timestamp=time.time() - 401 * 86400)
+    assert history.flush()
+    history._last_prune -= 86400
+    assert not history._pending
+    assert history.flush()
+    with sqlite3.connect(history.path) as connection:
+        assert (
+            connection.execute(
+                "SELECT SUM(requests) FROM model_usage_hourly"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_disabled_failed_flush_retries_pending_requests(history):
+    record(history)
+    with patch.object(
+        history, "_connect", side_effect=sqlite3.OperationalError("locked")
+    ):
+        history.set_enabled(False)
+    assert history._pending
+    assert history.flush()
+    assert not history._pending
+    history.set_enabled(True)
+    assert history.query()["totals"]["requests"] == 1
 
 
 def test_server_metrics_respects_disabled_recorder(tmp_path):

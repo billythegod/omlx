@@ -5442,6 +5442,7 @@ def _build_runtime_cache_observability(
 def get_usage_history(
     range: Literal["today", "yesterday", "7d", "30d", "90d", "month"] = "today",
     model: str = "",
+    include_details: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Local hourly serving history. Sync route keeps SQLite off the event loop."""
@@ -5452,7 +5453,7 @@ def get_usage_history(
         raise HTTPException(status_code=503, detail="Usage history unavailable")
     try:
         # Exact canonical IDs allow filtering historical models no longer loaded.
-        return history.query(range, model)
+        return history.query(range, model, include_details=include_details)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Usage history unavailable") from exc
 
