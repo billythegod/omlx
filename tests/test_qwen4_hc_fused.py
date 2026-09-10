@@ -356,8 +356,8 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
 @pytest.mark.parametrize("bits", [4, 5])
 @pytest.mark.parametrize("rows", [17, 2048])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_prefill_path_matches_canonical(bits, rows, use_combine):
-    """Rows above the fused limit take the prefill path: kernel norm, matmul projections, compiled tail."""
+def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
+    """Prefill retains canonical normalization while compiling the stream mean."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     module = _module(bits, use_combine)
@@ -365,7 +365,10 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine):
     mx.eval(x)
     assert not hc_fused.compatible(module, x)
     assert hc_fused.prefill_compatible(module, x)
+    kernel_norm = Mock(side_effect=AssertionError("prefill must use canonical norm"))
+    monkeypatch.setattr(hc_fused, "_kernel_norm", kernel_norm)
     out = hc_fused.prefill_forward(module, x)
+    kernel_norm.assert_not_called()
     assert out is not None
     canon = module._forward(x)
     if use_combine:

@@ -12,6 +12,7 @@ from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Lock
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -1918,8 +1919,6 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 # data path. Remembering pages avoids repeating thread-pool work on warm reads.
 # os.pread releases the GIL and does not change the shared file position.
 _PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
-# One worker: a chunk's rows are gathered while the previous chunk runs on the GPU.
-_PLE_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-prefetch")
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
@@ -2091,6 +2090,11 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.last_uploads = 0
         self.last_prefetch_hit = False
         self._pending: dict[bytes, tuple] = {}
+        self._prefetch_lock = Lock()
+        self._prefetch_closed = False
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ple-prefetch"
+        )
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
         self._tensor_readers: dict[str, _SafeTensorMMap] = {}
@@ -2271,16 +2275,23 @@ class DiskBackedShardedEmbedding(nn.Module):
         host = self._host_indices(indices)
         if host.size == 0:
             return
-        plan = self._plan(host)
-        if plan is None:
-            return
-        key = host.tobytes()
-        if key in self._pending:
-            return
-        # Two slots: the chunk after the one about to run is announced before that one gathers.
-        while len(self._pending) >= 2:
-            del self._pending[next(iter(self._pending))]
-        self._pending[key] = (plan, _PLE_PREFETCH_POOL.submit(self._assemble, host, plan))
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                return
+            plan = self._plan(host)
+            if plan is None:
+                return
+            key = host.tobytes()
+            if key in self._pending:
+                return
+            # Keep two upcoming chunks; obsolete queued reads need not run.
+            while len(self._pending) >= 2:
+                _, future = self._pending.pop(next(iter(self._pending)))
+                future.cancel()
+            self._pending[key] = (
+                plan,
+                self._prefetch_executor.submit(self._assemble, host, plan),
+            )
 
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
@@ -2357,11 +2368,19 @@ class DiskBackedShardedEmbedding(nn.Module):
         return result.reshape(*shape, self.dims)
 
     def close(self):
-        for reader in self._readers.values():
-            reader.close()
-        self._readers.clear()
-        self._tensor_readers.clear()
-        self._shard_specs.clear()
+        with self._prefetch_lock:
+            if self._prefetch_closed:
+                return
+            self._prefetch_closed = True
+            # Shutdown also drains running reads displaced from the two slots.
+            # Their numpy views must be released before closing the mappings.
+            self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._pending.clear()
+            for reader in self._readers.values():
+                reader.close()
+            self._readers.clear()
+            self._tensor_readers.clear()
+            self._shard_specs.clear()
 
     @property
     def _prefix(self):

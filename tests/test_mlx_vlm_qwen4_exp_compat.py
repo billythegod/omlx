@@ -1829,3 +1829,88 @@ def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
 
     PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt([list(range(6))])
     assert order == ["before", ("prefetch", 2), ("forward", 4), ("forward", 2)]
+
+
+def test_disk_ple_cancels_displaced_queued_prefetches(tmp_path, monkeypatch):
+    from threading import Event
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release = Event(), Event()
+    assemble = embedding._assemble
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    futures = []
+    try:
+        for index in range(10):
+            embedding.prefetch(mx.array([[index]], dtype=mx.int32))
+            futures.append(list(embedding._pending.values())[-1][1])
+            if index == 0:
+                assert entered.wait(10)
+        assert len(embedding._pending) == 2
+        assert futures[0].running()
+        assert all(future.cancelled() for future in futures[1:8])
+        assert sum(not future.done() for future in futures) == 3
+    finally:
+        release.set()
+        embedding.close()
+
+
+def test_disk_ple_close_drains_displaced_running_read(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    embedding, _ = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=4)
+    entered, release, closing, closed = Event(), Event(), Event(), Event()
+    assemble = embedding._assemble
+    shutdown = embedding._prefetch_executor.shutdown
+    readers = list(embedding._readers.values())
+    errors = []
+
+    def paused_assemble(host, plan):
+        entered.set()
+        assert release.wait(10)
+        return assemble(host, plan)
+
+    def observed_shutdown(*args, **kwargs):
+        closing.set()
+        return shutdown(*args, **kwargs)
+
+    def close():
+        try:
+            embedding.close()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(embedding, "_assemble", paused_assemble)
+    monkeypatch.setattr(embedding._prefetch_executor, "shutdown", observed_shutdown)
+    thread = Thread(target=close)
+    try:
+        embedding.prefetch(mx.array([[1]], dtype=mx.int32))
+        active = next(iter(embedding._pending.values()))[1]
+        assert entered.wait(10)
+        embedding.prefetch(mx.array([[2]], dtype=mx.int32))
+        embedding.prefetch(mx.array([[3]], dtype=mx.int32))
+        assert all(future is not active for _, future in embedding._pending.values())
+        thread.start()
+        assert closing.wait(10)
+        assert not closed.is_set()
+        assert all(reader._mapping is not None for reader in readers)
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(timeout=10)
+        else:
+            embedding.close()
+    assert closed.is_set() and not errors
+    assert active.result(timeout=10)
+    assert all(reader._mapping is None for reader in readers)
+    assert not embedding._pending
+    embedding.prefetch(mx.array([[4]], dtype=mx.int32))
+    assert not embedding._pending
+    embedding.close()

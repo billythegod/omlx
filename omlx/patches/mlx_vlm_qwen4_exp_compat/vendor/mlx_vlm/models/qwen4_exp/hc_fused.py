@@ -299,7 +299,7 @@ def compatible(module, hyper_input) -> bool:
 
 
 def prefill_compatible(module, hyper_input) -> bool:
-    """Whether rows above MAX_ROWS can take the prefill path (kernel norm, matmul projections)."""
+    """Whether rows above MAX_ROWS can use the compiled prefill mean."""
     rows = _rows_of(hyper_input)
     return (
         enabled()
@@ -396,15 +396,12 @@ def _tail(hc: int, hidden: int):
 
 
 def prefill_forward(module, hyper_input):
-    """Rows above MAX_ROWS: kernel norm, quantized-matmul projections, compiled tail; None on failure."""
+    """Prefill with canonical normalization and a compiled mean; None on failure."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
     try:
         hc, hidden = module.hc_count, module.hidden_size
-        batch, seq, _ = hyper_input.shape
-        rows = batch * seq
         dtype = hyper_input.dtype
-        flat = hyper_input.reshape(rows, hc * hidden)
-        normed = _kernel_norm(module, flat, rows, hc, hidden, dtype).reshape(batch, seq, hc * hidden)
+        normed = module.hc_norm(hyper_input)
         mix = nn.silu(module.input_mix_weight_down(normed) / hc)
         mixed = _tail(hc, hidden)(module.input_mix_weight_up(mix), normed)
         inject = module.block_inject_weight if "block_inject_weight" in module else None
