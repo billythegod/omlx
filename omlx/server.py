@@ -2680,6 +2680,13 @@ async def _with_json_keepalive(
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
             return
+        except HTTPException as e:
+            # Headers are already sent; preserve the API error in the body.
+            logger.warning(
+                "JSON keepalive request failed (%d): %s", e.status_code, e.detail
+            )
+            yield json.dumps(_openai_error_body(e.detail, e.status_code))
+            return
         if result is not None:
             yield result
     finally:
