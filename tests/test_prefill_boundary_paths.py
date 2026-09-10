@@ -17,6 +17,8 @@ from omlx.scheduler import Scheduler, SchedulerConfig, _PrefillState
 def boundary_scheduler():
     model = MagicMock()
     model.layers = []
+    # Use the normal forward instead of an auto-created prefill mock.
+    del model._omlx_prefill
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     scheduler = Scheduler(
