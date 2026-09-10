@@ -67,6 +67,7 @@ class PairRequestBody(BaseModel):
     friendly_name: str = Field(min_length=1, max_length=255)
     caps: dict[str, Any] = Field(default_factory=dict)
     code_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cancel_token_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     code_salt: str = Field(min_length=24, max_length=64)
     http_port: int | None = Field(default=None, ge=1, le=65535)
     addrs: list[str] = Field(default_factory=list, max_length=8)
@@ -113,7 +114,10 @@ async def cluster_pair_join_state(response: Response):
 
 @pair_admin_router.post("/pair/join/cancel")
 async def cluster_pair_join_cancel():
-    return await asyncio.to_thread(_manager().ui_session.cancel)
+    try:
+        return await asyncio.to_thread(_manager().ui_session.cancel)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
 
 
 def _pairing_http_error(exc: PairingError) -> HTTPException:
@@ -152,6 +156,22 @@ async def cluster_pair_request(body: PairRequestBody, request: Request):
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
     return snapshot
+
+
+class PairCancelRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=255)
+    token: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+@pair_router.post("/pair/request/cancel")
+async def cluster_pair_cancel_request(body: PairCancelRequestBody):
+    try:
+        return await asyncio.to_thread(
+            _manager().cancel_join_request, body.node_id, body.token
+        )
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
 
 
 @pair_router.get("/pair/status/{node_id}")

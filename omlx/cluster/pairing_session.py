@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 import threading
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -17,6 +19,7 @@ class PairingSession:
     def __init__(self, manager: PairingManager):
         self.manager = manager
         self.lock = threading.RLock()
+        self.mutation_lock = threading.RLock()
         self.attempt: dict[str, Any] | None = None
         self.polling = False
 
@@ -32,23 +35,37 @@ class PairingSession:
             }
             if self.attempt is None:
                 return empty
-            result = empty | self.attempt
+            result = empty | {
+                key: value
+                for key, value in self.attempt.items()
+                if key != "cancel_token"
+            }
             if result["state"] == "awaiting_approval":
                 remaining = max(0, int(result["expires_at"] - self.manager._clock()))
                 result["seconds_remaining"] = remaining
                 if remaining == 0:
                     self.attempt = {
-                        **result,
+                        **self.attempt,
                         "state": "error",
                         "code": None,
                         "seconds_remaining": 0,
                         "error": "The pairing code expired. Start again.",
                     }
                     self.manager._local_code = None
-                    return dict(self.attempt)
+                    return self.snapshot()
             return result
 
     def begin(self, address: str) -> dict[str, Any]:
+        with self.mutation_lock:
+            with self.lock:
+                cleanup = (
+                    self.attempt is not None and self.snapshot()["state"] == "error"
+                )
+            if cleanup:
+                self.cancel()
+            return self._begin(address)
+
+    def _begin(self, address: str) -> dict[str, Any]:
         raw = address.strip()
         try:
             parsed = urlsplit(raw if "://" in raw else "http://" + raw)
@@ -71,7 +88,7 @@ class PairingSession:
         host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
         normalized = f"{host}:{port}"
         with self.lock:
-            if self.snapshot()["state"] == "awaiting_approval":
+            if self.snapshot()["state"] in {"awaiting_approval", "cancelling"}:
                 raise PairingStateError(
                     "Cancel the existing join before starting another."
                 )
@@ -82,7 +99,10 @@ class PairingSession:
                 self.manager._local_code = None
                 self.attempt = None
                 raise
+            token = secrets.token_hex(32)
+            payload["cancel_token_hash"] = hashlib.sha256(token.encode()).hexdigest()
             attempt = {
+                "cancel_token": token,
                 "state": "awaiting_approval",
                 **shown,
                 "coordinator_addr": normalized,
@@ -98,7 +118,11 @@ class PairingSession:
                 if self.attempt is not attempt:
                     return self.snapshot()
                 self.manager._local_code = None
-                self.attempt = None
+                attempt.update(
+                    state="error",
+                    code=None,
+                    error="The join request failed. Retry or cancel.",
+                )
             raise PairingRequestError(
                 "The coordinator could not accept the join request."
             ) from exc
@@ -148,6 +172,8 @@ class PairingSession:
                 if self.attempt is attempt:
                     self.manager._local_code = None
                     self.attempt = {
+                        **attempt,
+                        "code": None,
                         "state": "error",
                         "error": str(exc),
                         "coordinator_addr": current["coordinator_addr"],
@@ -164,11 +190,39 @@ class PairingSession:
         return self.snapshot()
 
     def cancel(self) -> dict[str, Any]:
+        with self.mutation_lock:
+            return self._cancel()
+
+    def _cancel(self) -> dict[str, Any]:
         with self.lock:
-            if self.attempt is not None:
+            attempt = self.attempt
+            if attempt is None:
+                return self.snapshot()
+            token = attempt.get("cancel_token")
+            attempt["state"] = "cancelling"
+        # Wait for an outbound join POST before withdrawing it. Poll responses
+        # cannot complete this attempt once its state is cancelling.
+        try:
+            if token:
+                self.manager._http_post(
+                    f"http://{attempt['coordinator_addr']}/api/cluster/pair/request/cancel",
+                    {"node_id": self.manager.node_id, "token": token},
+                    10.0,
+                )
+        except Exception as exc:
+            with self.lock:
+                attempt.update(
+                    state="error",
+                    code=None,
+                    error="Could not cancel the join. Retry when the coordinator is reachable.",
+                )
+                self.manager._local_code = None
+            raise PairingRequestError(attempt["error"]) from exc
+        with self.lock:
+            if self.attempt is attempt:
                 self.manager._record_audit(
                     "join_cancelled", node_id=self.manager.node_id
                 )
-            self.attempt = None
-            self.manager._local_code = None
+                self.attempt = None
+                self.manager._local_code = None
             return self.snapshot()

@@ -1609,8 +1609,7 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
     assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
     assert "prompt_cache_ssd_max_bytes" in javascript
-    assert "Writes run in the background" in template
-    assert "512 MiB pending limit" in template
+    assert "Snapshots are written during request processing" in template
 
     result = _run_wizard(
         _WIZARD_TWO_MACS + """

@@ -747,7 +747,7 @@
                     <span class="min-w-0">
                         <span class="block text-xs font-semibold text-neutral-900">Persistent prompt reuse</span>
                         <span class="block text-[10px] text-neutral-500 mt-0.5">
-                            Save aligned prompt snapshots on each Mac so prefixes survive restarts. Writes run in the background; memory reuse stays on either way, and snapshots above the safe 512 MiB pending limit are skipped.
+                            Save aligned prompt snapshots on each Mac so prefixes survive restarts. Snapshots are written during request processing and may add latency. Memory reuse stays on either way.
                         </span>
                     </span>
                     <span class="inline-flex items-center gap-2 flex-shrink-0 pt-0.5">

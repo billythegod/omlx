@@ -322,6 +322,9 @@ function clusterV2Wizard() {
 
         pollTimer: null,
         tickBusy: false,
+        runtimeRevision: 0,
+        choosingModel: false,
+        stagingPurpose: 'plan',
         stagingGeneration: 0,
         stagingPollBusy: false,
         stagingClaimed: false,
@@ -364,6 +367,7 @@ function clusterV2Wizard() {
         destroy() {
             if (this.pollTimer !== null) clearInterval(this.pollTimer);
             this.pollTimer = null;
+            this.runtimeRevision += 1;
             this.dismissStaging();
         },
 
@@ -441,13 +445,16 @@ function clusterV2Wizard() {
         },
 
         async refreshRuntime() {
+            const revision = ++this.runtimeRevision;
             try {
                 const payload = await this.apiFetch(CLUSTER_V2_API.runtime);
+                if (revision !== this.runtimeRevision) return;
                 this.runtimePayload = payload || { jobs: [], launchers: [] };
                 this.runtimeLoaded = true;
                 this.runtimeError = '';
                 this.ensureColdModelSelection();
             } catch (error) {
+                if (revision !== this.runtimeRevision) return;
                 // Fail closed. A previous ready snapshot must never remain green
                 // when the ownership endpoint can no longer prove residency.
                 this.runtimePayload = null;
@@ -1033,6 +1040,7 @@ function clusterV2Wizard() {
             if (this.devicesUnreachable) return 'error';
             // A durable deployment keeps its management panel mounted, but its
             // badge is driven by deploymentRuntimeState(), not by persistence.
+            if (this.choosingModel && this.stage === 'plan') return 'plan';
             if (this.configuredDeployment()) return 'active';
             if (this.stage === 'plan' && this.pairedDevices().length) {
                 return 'plan';
@@ -1480,7 +1488,9 @@ function clusterV2Wizard() {
         coordinatorAddrFor(device) {
             const addr = this.bestDeviceAddr(device);
             if (!addr) return null;
-            return `${addr.ip}:${device.http_port || 8000}`;
+            const host = addr.ip.includes(':') && !addr.ip.startsWith('[')
+                ? `[${addr.ip}]` : addr.ip;
+            return `${host}:${device.http_port || 8000}`;
         },
 
         async beginJoinAsJoiner(device) {
@@ -2733,7 +2743,8 @@ function clusterV2Wizard() {
             await this.postActivation(activation);
         },
 
-        async stageModelToPeers(activation) {
+        async stageModelToPeers(activation, purpose = 'plan') {
+            this.stagingPurpose = purpose;
             this.stopStagingPoll();
             const generation = ++this.stagingGeneration;
             this.stagingClaimed = false;
@@ -2761,13 +2772,13 @@ function clusterV2Wizard() {
                     );
                     this.activateBusy = false;
                     this.stagingActivation = null;
-                    await this.runPlan();
+                    await this.refreshActivationProposal(this.stagingPurpose);
                 } else if (error?.status === 404) {
                     // A server older than /stage: degrade to the pre-staging
                     // behavior instead of bricking activation — the
                     // activation preflight reports whatever is still missing.
                     this.notify('warning', t('cluster.v2.staging.unsupported'));
-                    await this.postActivation(activation);
+                    await this.postActivation(activation, this.stagingPurpose);
                 } else {
                     this.stagingActivation = null;
                     this.failStaging(
@@ -2828,7 +2839,7 @@ function clusterV2Wizard() {
                 this.stopStagingPoll();
                 const activation = this.stagingActivation;
                 this.stagingActivation = null;
-                await this.postActivation(activation); // phase 2, exactly once
+                await this.postActivation(activation, this.stagingPurpose); // phase 2, exactly once
             } else if (snapshot.status === 'failed') {
                 // Other nodes may still have completed; per-node errors stay
                 // visible in stagingJob.nodes next to the banner. Pressing
@@ -2915,7 +2926,16 @@ function clusterV2Wizard() {
         },
 
         // Phase 2 — the pre-staging activation path, unchanged.
-        async postActivation(activation = this.activationRequestBody()) {
+        async refreshActivationProposal(purpose) {
+            if (purpose === 'membership') {
+                this.membershipProposal = null;
+                await this.previewMembershipExpansion();
+            } else {
+                await this.runPlan();
+            }
+        },
+
+        async postActivation(activation = this.activationRequestBody(), purpose = 'plan') {
             const generation = this.stagingGeneration;
             if (!activation) {
                 this.activateBusy = false;
@@ -2933,6 +2953,8 @@ function clusterV2Wizard() {
                     'Cluster activated. The distributed readiness check passed.',
                 );
                 this.stage = null;
+                this.choosingModel = false;
+                this.selectedDeploymentId = activation.deployment_id || '';
                 this.plan = null;
                 this.planProposal = null;
                 this.stagingJob = null;
@@ -2950,7 +2972,7 @@ function clusterV2Wizard() {
                         'The plan changed since you reviewed it — rebuilding it now.',
                     );
                     this.stagingActivation = null;
-                    await this.runPlan();
+                    await this.refreshActivationProposal(purpose);
                 } else {
                     this.notify(
                         'error',
@@ -3264,13 +3286,8 @@ function clusterV2Wizard() {
             ) {
                 return;
             }
-            this.membershipBusy = true;
             this.activateBusy = true;
-            try {
-                await this.stageModelToPeers(activation);
-            } finally {
-                this.membershipBusy = false;
-            }
+            await this.stageModelToPeers(activation, 'membership');
         },
 
         hydratePlannerFromDeployment(deployment) {
@@ -3408,6 +3425,7 @@ function clusterV2Wizard() {
                 });
                 this.confirmChangeModelFor = '';
                 this.resetModelPicker();
+                this.choosingModel = true;
                 await this.refreshDeployments();
                 await this.refreshRuntime();
                 this.enterPlan();
