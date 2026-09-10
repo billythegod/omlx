@@ -4458,3 +4458,77 @@ class TestK2OptionalToolGrammar:
                 ]
         assert text == ("beforeafter" if valid else body)
         assert bool(calls) is valid
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("tool_history", [False, True])
+def test_k2_responses_normalizes_assistant_history(monkeypatch, stream, tool_history):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+    from jinja2 import TemplateError
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.server import _server_state, app
+
+    class StrictK2Tokenizer(MockTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            for message in messages:
+                if message["role"] == "assistant" and not isinstance(
+                    message.get("reasoning_content"), str
+                ):
+                    raise TemplateError("Assistant message is missing a thinking field")
+            return super().apply_chat_template(messages, **kwargs)
+
+    engine = BatchedEngine("test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(args=SimpleNamespace(model_type="k2_horizon"))
+    engine._tokenizer = StrictK2Tokenizer()
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+    monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
+    output = MockGenerationOutput(
+        text="Done",
+        new_text="Done",
+        completion_tokens=1,
+        finished=True,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(engine, "generate", AsyncMock(return_value=output))
+
+    async def generate_stream(*args, **kwargs):
+        yield output
+
+    monkeypatch.setattr(engine, "stream_generate", generate_stream)
+    monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
+    monkeypatch.setattr(_server_state, "default_model", "test-model")
+    history = [{"role": "user", "content": "Read the file"}]
+    if tool_history:
+        history.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "read",
+                    "arguments": '{"path":"test.py"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": "hello",
+                },
+            ]
+        )
+    else:
+        history.append({"role": "assistant", "content": "Hello"})
+    history.append({"role": "user", "content": "Continue"})
+    response = TestClient(app).post(
+        "/v1/responses",
+        json={"model": "test-model", "input": history, "stream": stream},
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+    else:
+        assert response.json()["status"] == "completed"

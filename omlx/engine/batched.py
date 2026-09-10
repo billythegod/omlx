@@ -246,7 +246,7 @@ class BatchedEngine(BaseEngine):
         """
         Preprocess messages for model-specific formats.
 
-        Currently handles Harmony (gpt-oss) models.
+        Handles Harmony formatting and required K2 assistant reasoning fields.
 
         Args:
             messages: List of chat messages
@@ -256,6 +256,10 @@ class BatchedEngine(BaseEngine):
         """
         if self.model_type == "gpt_oss" and HAS_HARMONY_ADAPTER:
             return preprocess_harmony_messages(messages)
+        if self.model_type == "k2_horizon":
+            from ..api.utils import extract_k2_horizon_messages
+
+            return extract_k2_horizon_messages(messages)
         return messages
 
     async def start(self) -> None:

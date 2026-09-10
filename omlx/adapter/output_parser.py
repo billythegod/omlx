@@ -55,7 +55,6 @@ class OutputParserFinalizeResult:
     output_text_prefix: str = ""
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     finish_reason: str | None = None
-    error: str | None = None
 
 
 class OutputParserSession(Protocol):

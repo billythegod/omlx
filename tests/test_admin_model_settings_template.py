@@ -238,9 +238,10 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
-    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.message" in html
+    assert "aneTuningProgressPercent()" in html
     assert "aneTuning.status?.termination_reason" in html
-    assert "aneTuning.status?.results || []" in html
+    assert "!aneTuning.running && aneTuning.status?.recommendation" in html
     assert 'x-model="aneTuningOverrides.allowCpu"' in html
     assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
     assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
@@ -257,8 +258,6 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
     assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
-    assert "if (result?.processing_tps === null" in script
-    assert "result?.latency_ms !== null" in script
 
 
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
