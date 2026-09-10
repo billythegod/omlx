@@ -2,8 +2,9 @@
 """Exact gathered QSA for contiguous batch-one text prompts.
 
 The native path reads selected four-token blocks directly from K/V. The MLX
-fallback gathers the selected rows and causal tail. Batched, padded,
-multimodal, and target-verify requests use mlx-vlm's general implementation.
+fallback gathers the selected rows and causal tail. Eligible text-only Lightning
+MTP verification uses this path too. Batched, padded, and multimodal requests
+use mlx-vlm's general implementation.
 """
 
 from __future__ import annotations

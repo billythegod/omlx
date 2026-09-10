@@ -1426,7 +1426,18 @@ def _mark_text_positions(model: Any, request: Any, uid: int) -> None:
     prefill chunks ran under a temporary uid and only marked the request."""
 
     if not getattr(request, "text_positions_proven", False):
-        return
+        # A complete text cache hit skips the prefill that normally proves this.
+        if not (
+            getattr(request, "cached_tokens", 0) > 0
+            and request.cached_tokens >= request.num_prompt_tokens - 1
+            and request.vlm_inputs_embeds is None
+            and not request.vlm_extra_kwargs
+            and not request.vlm_image_hash
+            and not request.vlm_cache_key_ranges
+            and request.rope_deltas == 0.0
+        ):
+            return
+        request.text_positions_proven = True
     marker = getattr(type(model), "mark_text_positions", None)
     if callable(marker):
         marker(model, uid)
