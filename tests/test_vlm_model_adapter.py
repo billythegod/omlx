@@ -929,3 +929,21 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
+
+
+def test_adapter_forwards_prefetch_ple_to_the_language_model():
+    from unittest.mock import MagicMock
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    vlm = MagicMock()
+    vlm.config.model_type = "qwen4_exp"
+    adapter = VLMModelAdapter(vlm)
+    next_ids, current_ids = object(), object()
+    adapter.prefetch_ple(next_ids, current_ids)
+    vlm.language_model.prefetch_ple.assert_called_once_with(next_ids, current_ids)
+    plain = MagicMock(spec=[])
+    plain.language_model = MagicMock(spec=[])
+    plain.config = MagicMock()
+    plain.config.model_type = "qwen3_5_moe"
+    VLMModelAdapter(plain).prefetch_ple(next_ids, current_ids)  # no hook: no error

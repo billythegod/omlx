@@ -1514,3 +1514,61 @@ class TestPrefillCleanupUsesEngineStream:
 
         assert len(rejected) == 1
         self._assert_engine_stream(streams, sched)
+
+
+def test_step_prefill_chunk_announces_the_next_chunk_to_the_model():
+    """Each chunk step tells a model with prefetch_ple which tokens follow, so it can gather ahead."""
+
+    class LookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_ple(self, next_ids, current_ids):
+            self.seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    model = LookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, chunked_prefill=True, paged_cache_block_size=0),
+    )
+    request = _make_request("lookahead", n_tokens=11)
+    state = _make_prefill_state(scheduler, request, n_remaining=10)
+    state.tokens_remaining = mx.arange(10, 20, dtype=mx.int32)[None]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        while not scheduler._step_prefill_chunk(state):
+            pass
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+def test_external_prefill_announces_the_next_chunk_to_the_model():
+    """The non-chunked prefill loop announces the next chunk too; the last chunk announces nothing."""
+    import types
+
+    class LookaheadModel(_RecordingModel):
+        def __init__(self):
+            super().__init__("vlm")
+            self.seen = []
+
+        def prefetch_ple(self, next_ids, current_ids):
+            self.seen.append((next_ids.tolist()[0], current_ids.tolist()[0]))
+
+    model = LookaheadModel()
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(prefill_step_size=4, paged_cache_block_size=0),
+    )
+    tokens = list(range(10, 21))  # 10 prefill tokens, the last token goes to the batch generator
+    request = _make_request("lookahead-external", n_tokens=11)
+    cache = [types.SimpleNamespace(state=mx.array([0]))]
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._do_external_prefill(request, tokens, cache)
+    assert model.chunk_lengths == [4, 4, 2]
+    assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]

@@ -1215,7 +1215,8 @@ def _prepare_mrope_prompt(self):
 
 def _patched_ppb_prompt(self, tokens):
     _prepare_mrope_prompt(self)
-    return _original_ppb_prompt(self, tokens)
+    # Late-bound so model patches can swap the loop under this wrapper.
+    return PromptProcessingBatch._omlx_base_prompt(self, tokens)
 
 
 PromptProcessingBatch._omlx_base_prompt = _original_ppb_prompt
@@ -1581,6 +1582,16 @@ class SchedulingPolicy(Enum):
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Priority-based
 
+
+
+def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_enabled: bool, block_size: int) -> int:
+    """Size the prefill loops give the next chunk: the step, clamped to the next block boundary."""
+    next_n = min(step_size, remaining)
+    if boundary_enabled and block_size > 0:
+        delta = ((kv_total // block_size) + 1) * block_size - kv_total
+        if delta > 0:
+            next_n = min(next_n, delta)
+    return max(1, next_n)
 
 @dataclass
 class SchedulerConfig:
@@ -3644,6 +3655,7 @@ class Scheduler:
             prompt_cache, _cache_base_sizes(prompt_cache) + n_tokens
         )
 
+        Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array)
         while input_arr.shape[1] > 0:
             _trace_chunk_start = time.perf_counter()
             _trace_processed_before = processed_tokens
@@ -3732,6 +3744,18 @@ class Scheduler:
                         )
                 if self._supports_skip_lm_head():
                     model_kwargs["skip_lm_head"] = True
+                # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+                prefetch = getattr(self.model, "prefetch_ple", None)
+                if prefetch is not None and embeds_array is None and remaining > n_to_process:
+                    after = processed_tokens + n_to_process
+                    next_n = _expected_chunk_len(
+                        self._prefill_step_size_for_progress(after, remaining - n_to_process),
+                        remaining - n_to_process,
+                        base_size + after,
+                        boundary_enabled,
+                        block_size,
+                    )
+                    prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
                 prefill_model(
                     input_arr[:, :n_to_process],
@@ -5400,6 +5424,28 @@ class Scheduler:
             total_length=len(tokens),
         )
 
+    def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array) -> None:
+        """Let a gather-ahead model start on the first chunk before the loop reaches it (empty current chunk)."""
+        prefetch = getattr(self.model, "prefetch_ple", None)
+        if prefetch is None or embeds_array is not None or tokens.shape[1] == 0:
+            return
+        remaining = tokens.shape[1]
+        first_n = _expected_chunk_len(
+            self._prefill_step_size_for_progress(0, remaining), remaining, base_size, boundary_enabled, block_size
+        )
+        prefetch(tokens[:, :first_n], tokens[:, :0])
+
+    def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
+        remaining = state.tokens_remaining.shape[1]
+        processed = state.tokens_processed + n
+        return _expected_chunk_len(
+            self._prefill_step_size_for_progress(processed, remaining),
+            remaining,
+            state.base_size + processed,
+            state.boundary_enabled,
+            state.block_size,
+        )
+
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
         """Process one prefill chunk from *state*.
 
@@ -5426,6 +5472,7 @@ class Scheduler:
 
         if state.tokens_processed == 0:
             Scheduler._clear_cache(self)
+            Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
             self._reserve_qsa_index_capacity(
@@ -5485,6 +5532,10 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
+            # Tell a gather-ahead model (SSD-backed PLE rows) which tokens come next.
+            prefetch = getattr(self.model, "prefetch_ple", None)
+            if prefetch is not None and state.tokens_remaining.shape[1] > 0:
+                prefetch(state.tokens_remaining[:, : Scheduler._next_prefill_chunk_len(self, state, n)], chunk)
             # A chunked text prefill can yield to active decode between
             # forwards. Completion cleanup or the intervening decode batch may
             # replace the VLM adapter's process-local mRoPE state. Rebind this

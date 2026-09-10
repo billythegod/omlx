@@ -422,6 +422,12 @@ class VLMModelAdapter(nn.Module):
         """Check if there are pending embeddings for prefill."""
         return self._pending_embeds is not None
 
+    def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
+        """Forward the prompt loop's next-chunk notice to a language model that gathers ahead."""
+        hook = getattr(self._language_model, "prefetch_ple", None)
+        if hook is not None:
+            hook(next_ids, current_ids)
+
     def __call__(
         self,
         input_ids: mx.array,
