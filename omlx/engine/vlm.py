@@ -857,7 +857,8 @@ def _derive_gemma4_global_kv_on_load(model_dir: Path):
         text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
         if isinstance(text_config, dict):
             for key, value in derived.items():
-                text_config.setdefault(key, value)
+                if text_config.get(key) is None:
+                    text_config[key] = value
         return loaded
 
     logger.info(

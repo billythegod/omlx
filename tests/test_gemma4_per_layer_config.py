@@ -142,6 +142,36 @@ def test_on_load_keeps_explicit_legacy_fields(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "legacy_fields, expected",
+    [
+        (
+            {"global_head_dim": None, "num_global_key_value_heads": None},
+            (512, 2),
+        ),
+        (
+            {"global_head_dim": 256, "num_global_key_value_heads": None},
+            (256, 2),
+        ),
+        (
+            {"global_head_dim": None, "num_global_key_value_heads": 4},
+            (512, 4),
+        ),
+    ],
+)
+def test_on_load_replaces_null_legacy_fields(tmp_path, legacy_fields, expected):
+    model_dir = _write_model_dir(tmp_path, "model", _config(**legacy_fields))
+    original_config = (model_dir / "config.json").read_bytes()
+    original_loader = mlx_vlm_utils.load_config
+
+    with _derive_gemma4_global_kv_on_load(model_dir):
+        loaded = mlx_vlm_utils.load_config(model_dir)["text_config"]
+
+    assert (loaded["global_head_dim"], loaded["num_global_key_value_heads"]) == expected
+    assert mlx_vlm_utils.load_config is original_loader
+    assert (model_dir / "config.json").read_bytes() == original_config
+
+
+@pytest.mark.parametrize(
     "config",
     [
         _config(global_head_dim=512, num_global_key_value_heads=2),
