@@ -46,6 +46,7 @@ from omlx.api.utils import (
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
     _merge_consecutive_roles,
+    cache_reasoning_output,
     chat_template_preserves_mid_system,
     clean_output_text,
     detect_and_strip_partial,
@@ -57,6 +58,7 @@ from omlx.api.utils import (
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
+from omlx.model_settings import ModelSettings
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -3600,6 +3602,19 @@ class TestToolResultWithToolAwareTokenizer:
 
 class TestCacheReasoningOutput:
     """Whether a reasoning request's output tokens are cacheable for the next turn."""
+
+    @pytest.mark.parametrize(
+        "forced, expected", [(None, False), (True, True), (False, False)]
+    )
+    def test_explicit_retention_off_with_native_reasoning(self, forced, expected):
+        assert (
+            cache_reasoning_output(
+                ModelSettings(cache_reasoning_output=forced),
+                native_reasoning=True,
+                chat_template_kwargs={"preserve_thinking": False},
+            )
+            is expected
+        )
 
     def test_follows_history_retention_by_default(self):
         from omlx.api.utils import cache_reasoning_output

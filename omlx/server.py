@@ -6995,6 +6995,19 @@ async def create_response(
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms,
+            native_reasoning=uses_native_reasoning_content(
+                resolved_model,
+                config_model_type=getattr(_entry, "config_model_type", None),
+                engine_model_type=getattr(engine, "model_type", None),
+                preserve_thinking_default=getattr(
+                    _entry, "preserve_thinking_default", None
+                ),
+            ),
+            chat_template_kwargs=merged_ct_kwargs,
+        )
+
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)

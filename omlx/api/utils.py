@@ -57,7 +57,10 @@ def cache_reasoning_output(
     forced = getattr(settings, "cache_reasoning_output", None)
     if forced is not None:
         return bool(forced)
-    return bool(native_reasoning) or (chat_template_kwargs or {}).get("preserve_thinking") is True
+    preserve_thinking = (chat_template_kwargs or {}).get("preserve_thinking")
+    if preserve_thinking is False:
+        return False
+    return bool(native_reasoning) or preserve_thinking is True
 
 
 def merge_reasoning_effort_chat_template_kwargs(
