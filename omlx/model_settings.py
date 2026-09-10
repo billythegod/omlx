@@ -272,6 +272,9 @@ class ModelSettings:
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
+    cache_reasoning_output: Optional[bool] = (
+        None  # Cache <think> output for the next turn (None = auto: when history keeps it)
+    )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = (

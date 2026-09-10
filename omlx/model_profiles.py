@@ -30,6 +30,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "force_sampling",
     "enable_thinking",
     "preserve_thinking",
+    "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
     "reasoning_parser",

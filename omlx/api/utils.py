@@ -47,6 +47,19 @@ def uses_native_reasoning_content(
     return "minimax" in lowered and "m3" in lowered
 
 
+def cache_reasoning_output(
+    settings: Any,
+    *,
+    native_reasoning: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool:
+    """Whether a reasoning request's output tokens can prefix-match the next turn."""
+    forced = getattr(settings, "cache_reasoning_output", None)
+    if forced is not None:
+        return bool(forced)
+    return bool(native_reasoning) or (chat_template_kwargs or {}).get("preserve_thinking") is True
+
+
 def merge_reasoning_effort_chat_template_kwargs(
     chat_template_kwargs: dict[str, Any] | None,
     reasoning_effort: Any | None,

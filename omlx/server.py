@@ -175,6 +175,7 @@ from .api.utils import (
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    cache_reasoning_output,
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
@@ -4161,6 +4162,9 @@ async def create_chat_completion(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+        )
 
         # SpecPrefill: per-request overrides (fall back to model_settings)
         if request.specprefill is not None:
@@ -6432,6 +6436,9 @@ async def create_anthropic_message(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+        )
 
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
