@@ -539,6 +539,18 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
+    context_window = model_info.get("max_context_window")
+    if tool_name == "claude":
+        # Claude's context overrides are process-wide, including tier switches
+        # and subagents. Do not advertise more than any configured model allows.
+        context_windows = [
+            info["max_context_window"]
+            for model_id in (model, opus_model, sonnet_model, haiku_model)
+            if (info := models_status_map.get(model_id, {}))
+            and isinstance(info.get("max_context_window"), int)
+            and info["max_context_window"] > 0
+        ]
+        context_window = min(context_windows) if context_windows else None
     ctx = IntegrationContext(
         host=connect_host,
         port=port,
@@ -547,7 +559,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
-        context_window=model_info.get("max_context_window"),
+        context_window=context_window,
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),

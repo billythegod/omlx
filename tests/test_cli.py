@@ -1464,3 +1464,67 @@ class TestLaunchClaudeTierPrecedence:
         )
         assert ctx.model == "picked-model"
         assert (ctx.opus_model, ctx.sonnet_model, ctx.haiku_model) == (None, None, None)
+
+    @pytest.mark.parametrize(
+        "windows, expected_window",
+        [
+            ((131072, 49152, 65536, 65536), "49152"),
+            ((131072, 65536, 49152, 65536), "49152"),
+            ((131072, 65536, 65536, 49152), "49152"),
+            ((49152, 131072, 131072, 131072), "49152"),
+            ((131072, 131072, 131072, 131072), "131072"),
+            ((131072, None, None, None), "131072"),
+            ((None, 49152, 65536, 65536), "49152"),
+            ((None, None, None, None), None),
+        ],
+    )
+    def test_launch_passes_initial_model_and_shared_context_limit(
+        self, windows, expected_window
+    ):
+        from omlx.cli import launch_command
+        from omlx.integrations.claude import ClaudeCodeIntegration
+
+        integration = ClaudeCodeIntegration()
+        model_ids = ("picked-model", "opus-cfg", "sonnet-cfg", "haiku-cfg")
+        models = [
+            {"id": model_id, "max_context_window": window, "model_type": "llm"}
+            for model_id, window in zip(model_ids, windows)
+        ]
+        responses = [MagicMock(), MagicMock(), MagicMock()]
+        responses[1].json.return_value = {"models": models}
+        responses[2].json.return_value = {"data": models}
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model="opus-cfg",
+                sonnet_model="sonnet-cfg",
+                haiku_model="haiku-cfg",
+            ),
+        )
+        args = argparse.Namespace(
+            tool="claude", host=None, port=None, api_key=None, model=None
+        )
+        with (
+            patch("requests.get", side_effect=responses),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch.object(integration, "is_installed", return_value=True),
+            patch.object(integration, "select_model", return_value="picked-model"),
+            patch.object(integration, "_find_claude_binary", return_value="claude"),
+            patch.dict("os.environ", {"ANTHROPIC_MODEL": "old-model"}, clear=True),
+            patch("omlx.integrations.claude.os.execvpe") as execute,
+        ):
+            launch_command(args, extra_args=["--resume", "session-id"])
+
+        execute.assert_called_once()
+        binary, argv, env = execute.call_args.args
+        assert binary == "claude"
+        assert argv == ["claude", "--disallowedTools", "LSP", "--resume", "session-id"]
+        assert env["ANTHROPIC_MODEL"] == "picked-model"
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-cfg"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-cfg"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-cfg"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
+        assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
+        assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window
