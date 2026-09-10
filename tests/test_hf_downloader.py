@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import threading
-import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -23,6 +23,40 @@ from omlx.admin.hf_downloader import (
     _is_xet_transport_error,
     _make_cancellable_tqdm,
 )
+
+
+@pytest.fixture
+async def blocked_worker():
+    """Hold worker-thread work until teardown, even if its awaiter is cancelled."""
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+
+    def call(*args, **kwargs):
+        if kwargs.get("dry_run"):
+            return []
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5), "Test did not release the worker"
+            return []
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    try:
+        yield SimpleNamespace(call=call, started=started)
+    finally:
+        release.set()
+        if started.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5)
+
+
+async def _wait_for_downloads(downloader):
+    """Wait for the scheduled downloads instead of guessing their duration."""
+    await asyncio.wait_for(
+        asyncio.gather(*downloader._active_tasks.values()), timeout=5
+    )
+
 
 # =============================================================================
 # DownloadTask Tests
@@ -197,7 +231,7 @@ class TestHFDownloader:
             task = await downloader.start_download("owner/model")
 
             # Wait for task to complete
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.COMPLETED
             assert task.progress == 100.0
@@ -225,7 +259,7 @@ class TestHFDownloader:
             task = await downloader.start_download("owner/model")
 
             # Wait for task to fail
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "Network error" in task.error
@@ -261,7 +295,7 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/nonexistent")
 
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "not found" in task.error.lower()
@@ -297,7 +331,7 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/gated-model")
 
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
             assert "gated" in task.error.lower()
@@ -307,7 +341,7 @@ class TestHFDownloader:
     # --- Cancel Download ---
 
     @pytest.mark.asyncio
-    async def test_cancel_download(self, downloader, model_dir):
+    async def test_cancel_download(self, downloader, model_dir, blocked_worker):
         # In-progress shards live under ._____temp and must be removed,
         # while finalized shards outside it stay for resume on retry.
         target = model_dir / "owner" / "model"
@@ -321,7 +355,7 @@ class TestHFDownloader:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -331,8 +365,8 @@ class TestHFDownloader:
 
             task = await downloader.start_download("owner/model")
 
-            # Give it a moment to start
-            await asyncio.sleep(0.2)
+            # Wait until the download thread is running
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             active_task = downloader._active_tasks[task.task_id]
             success = await downloader.cancel_download(task.task_id)
@@ -534,13 +568,15 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
 
     @pytest.mark.asyncio
-    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(self, downloader):
+    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(
+        self, downloader, blocked_worker
+    ):
         """shutdown() flags active tasks so in-flight threads abort via tqdm."""
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -549,7 +585,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             await downloader.shutdown()
             assert task.task_id in downloader._cancelled
@@ -576,7 +612,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
             assert task.status == DownloadStatus.COMPLETED
 
             result = await downloader.cancel_download(task.task_id)
@@ -630,7 +666,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
             assert task.status == DownloadStatus.COMPLETED
 
             result = downloader.remove_task(task.task_id)
@@ -640,12 +676,12 @@ class TestHFDownloader:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_remove_active_task_fails(self, downloader):
+    async def test_remove_active_task_fails(self, downloader, blocked_worker):
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -654,7 +690,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             result = downloader.remove_task(task.task_id)
             assert result is False
@@ -675,12 +711,12 @@ class TestHFDownloader:
     # --- Shutdown ---
 
     @pytest.mark.asyncio
-    async def test_shutdown_cancels_active_tasks(self, downloader):
+    async def test_shutdown_cancels_active_tasks(self, downloader, blocked_worker):
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -689,7 +725,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             await downloader.shutdown()
             assert task.status == DownloadStatus.CANCELLED
@@ -776,7 +812,7 @@ class TestHFDownloader:
             mock_api_cls.return_value = mock_api
 
             await downloader.start_download("Jundot/Qwen3.6-27B-oQ8-mtp")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             # The actual download call (last call; the first is dry_run).
             call_kwargs = mock_download.call_args[1]
@@ -2170,15 +2206,14 @@ class TestHFAPITimeouts:
     """Test that HF API calls respect timeouts when HuggingFace is unreachable."""
 
     @pytest.mark.asyncio
-    async def test_get_recommended_models_timeout(self):
+    async def test_get_recommended_models_timeout(self, blocked_worker):
         """get_recommended_models should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_list_models(**kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
             return []
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = slow_list_models
@@ -2189,16 +2224,17 @@ class TestHFAPITimeouts:
                     max_memory_bytes=16 * 1024**3
                 )
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_search_models_timeout(self):
+    async def test_search_models_timeout(self, blocked_worker):
         """search_models should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_list_models(**kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
             return []
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = slow_list_models
@@ -2207,15 +2243,16 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.search_models(query="test")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_get_model_info_timeout(self):
+    async def test_get_model_info_timeout(self, blocked_worker):
         """get_model_info should raise TimeoutError when HF is unreachable."""
-        import time as time_mod
 
         def slow_model_info(*args, **kwargs):
-            time_mod.sleep(5)
+            blocked_worker.call()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.model_info.side_effect = slow_model_info
@@ -2224,20 +2261,22 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.get_model_info("org/model")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_search_models_timeout_on_lazy_iteration(self):
+    async def test_search_models_timeout_on_lazy_iteration(self, blocked_worker):
         """list_models returns a lazy generator; a hang during iteration
         (not the call itself) must still hit the timeout instead of
         blocking the event loop (issue #2325)."""
 
         def lazy_hanging_list_models(**kwargs):
             def gen():
-                time.sleep(5)
+                blocked_worker.call()
                 yield None
 
             return gen()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = lazy_hanging_list_models
@@ -2246,18 +2285,22 @@ class TestHFAPITimeouts:
             with pytest.raises(asyncio.TimeoutError):
                 await HFDownloader.search_models(query="test")
 
+            assert blocked_worker.started.is_set()
+
     @pytest.mark.asyncio
-    async def test_get_recommended_models_timeout_on_lazy_iteration(self):
+    async def test_get_recommended_models_timeout_on_lazy_iteration(
+        self, blocked_worker
+    ):
         """Same lazy-iteration hang, via get_recommended_models."""
 
         def lazy_hanging_list_models(**kwargs):
             def gen():
-                time.sleep(5)
+                blocked_worker.call()
                 yield None
 
             return gen()
 
-        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.5), \
+        with patch("omlx.admin.hf_downloader._HF_API_TIMEOUT", 0.1), \
              patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
             mock_api = MagicMock()
             mock_api.list_models.side_effect = lazy_hanging_list_models
@@ -2267,6 +2310,8 @@ class TestHFAPITimeouts:
                 await HFDownloader.get_recommended_models(
                     max_memory_bytes=16 * 1024**3
                 )
+
+            assert blocked_worker.started.is_set()
 
     @pytest.mark.asyncio
     async def test_search_models_drains_generator_off_event_loop(self):
@@ -2325,7 +2370,7 @@ class TestHFEndpointPassthrough:
         ), patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
             downloader = HFDownloader(model_dir=str(model_dir))
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             # Called twice: dry_run + actual download
             assert mock_download.call_count == 2
@@ -2353,7 +2398,7 @@ class TestHFEndpointPassthrough:
 
             downloader = HFDownloader(model_dir=str(model_dir))
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert mock_download.call_count == 2
             call_kwargs = mock_download.call_args[1]
@@ -2498,13 +2543,13 @@ class TestRetryDownload:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_retry_active_download_raises(self, downloader):
+    async def test_retry_active_download_raises(self, downloader, blocked_worker):
         """Retrying an active download should raise ValueError."""
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -2513,7 +2558,7 @@ class TestRetryDownload:
             mock_api_cls.return_value = mock_api
 
             task = await downloader.start_download("owner/model")
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             with pytest.raises(ValueError, match="not retryable"):
                 await downloader.retry_download(task.task_id)
@@ -2808,7 +2853,7 @@ class TestSequentialDownloadQueue:
         return d
 
     @pytest.mark.asyncio
-    async def test_second_download_stays_pending(self, model_dir):
+    async def test_second_download_stays_pending(self, model_dir, blocked_worker):
         """When two downloads are started, only the first should be DOWNLOADING."""
         downloader = HFDownloader(model_dir=str(model_dir))
 
@@ -2816,7 +2861,7 @@ class TestSequentialDownloadQueue:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
+            side_effect=blocked_worker.call,
         ):
             mock_api = MagicMock()
             mock_info = MagicMock()
@@ -2827,8 +2872,8 @@ class TestSequentialDownloadQueue:
             task1 = await downloader.start_download("owner/model-a")
             task2 = await downloader.start_download("owner/model-b")
 
-            # Give first task time to acquire semaphore
-            await asyncio.sleep(1)
+            # The running download holds the semaphore.
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
 
             assert task1.status == DownloadStatus.DOWNLOADING
             assert task2.status == DownloadStatus.PENDING
@@ -2854,8 +2899,8 @@ class TestSequentialDownloadQueue:
             task1 = await downloader.start_download("owner/model-a")
             task2 = await downloader.start_download("owner/model-b")
 
-            # Let both tasks finish (snapshot_download returns immediately)
-            await asyncio.sleep(2)
+            # Wait for both scheduled downloads to finish.
+            await _wait_for_downloads(downloader)
 
             assert task1.status == DownloadStatus.COMPLETED
             assert task2.status == DownloadStatus.COMPLETED
@@ -2951,7 +2996,7 @@ class TestEtagTimeout:
 
             downloader = HFDownloader(model_dir=str(model_dir))
             await downloader.start_download("owner/model")
-            await asyncio.sleep(0.5)
+            await _wait_for_downloads(downloader)
 
             assert mock_download.call_count == 2
             # Last call is the actual download
