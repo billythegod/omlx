@@ -1164,7 +1164,7 @@ private struct ExperimentalSection: View {
                         }
                     }
                 }
-                if vm.isQwen35AnePrefillModel {
+                if vm.isQwenOqA8Model {
                     Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
                                       defaultValue: "Qwen INT8 Activation Prefill",
                                       comment: "Row label for the oQ INT8-activation prefill kernels"),
@@ -1758,7 +1758,7 @@ private struct ExperimentalSection: View {
     private var qwenOqA8Sublabel: String {
         if let reason = vm.qwen35OqA8ConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Run eligible Qwen 3.5/3.6/3.8 prompt-processing matmuls with INT8 activations. Requires a chip with native INT8 tensor operations (M5-series or newer) — on anything older there is no speed-up and the setting is refused. Speeds up prompt processing only; token generation is unchanged. Roughly 1.4x faster, and it changes numerics slightly. Cannot be combined with ANE prompt processing. Takes effect after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 

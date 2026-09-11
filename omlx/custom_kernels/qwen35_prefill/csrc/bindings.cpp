@@ -464,19 +464,7 @@ NB_MODULE(_ext, m) {
       "biases"_a,
       "bits"_a,
       "act_mode"_a = 0,
-      "variant"_a = 0,
-      "stream"_a = nb::none());
-  m.def(
-      "qwen35_oq_a8_i4_qmm_t",
-      &omlx::qwen35_prefill_kernels::qwen35_oq_a8_i4_qmm_t,
-      "qa"_a,
-      "sa"_a,
-      "ra"_a,
-      "weight"_a,
-      "scales"_a,
-      "biases"_a,
-      "act_mode"_a = 0,
-      "variant"_a = 0,
+      "variant"_a = 800,
       "stream"_a = nb::none());
   m.def(
       "qwen35_oq_a8_decode_weights",

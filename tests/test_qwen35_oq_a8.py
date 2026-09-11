@@ -265,8 +265,17 @@ def test_qmm_matches_affine_reference(bits, act_mode):
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
     qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
+    qa8, sa8, ra8 = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
     got = fast.qwen35_oq_a8_qmm_t(
-        qa, sa, ra, packed, scales, biases, bits, act_mode, 0
+        qa8,
+        sa8,
+        ra8,
+        packed,
+        mx.contiguous(scales.T),
+        mx.contiguous(biases.T),
+        bits,
+        act_mode,
+        800,
     )
     mx.eval(qa, sa, ra, got)
 
@@ -301,7 +310,7 @@ def test_qmm_tracks_the_unquantized_projection(bits):
     rng = np.random.default_rng(31)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
-    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, bits, 0, 0)
+    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, bits, 0, 800)
     reference = mx.quantized_matmul(
         x,
         packed,
@@ -321,29 +330,6 @@ def test_qmm_tracks_the_unquantized_projection(bits):
 
 
 @requires_kernels
-@pytest.mark.parametrize("variant", [0, 2, 5, 6])
-def test_qmm_variants_agree(variant):
-    """Every tile must compute the same thing; only speed may differ."""
-    fast = _kernels()
-    M, K, N = 200, 256, 128
-    packed, scales, biases = make_quantized(N, K, 4, seed=5)
-    rng = np.random.default_rng(41)
-    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
-
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, 0)
-    base = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, scales, biases, 4, 0, 0)
-    other = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, scales, biases, 4, 0, variant)
-    mx.eval(base, other)
-
-    np.testing.assert_allclose(
-        np.array(base.astype(mx.float32)),
-        np.array(other.astype(mx.float32)),
-        rtol=1e-3,
-        atol=1e-3,
-    )
-
-
-@requires_kernels
 def test_qmm_handles_a_partial_row_tile():
     """M is the token count and need not tile; N is checked host-side."""
     fast = _kernels()
@@ -352,7 +338,7 @@ def test_qmm_handles_a_partial_row_tile():
     rng = np.random.default_rng(53)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
-    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, 0, 0)
+    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
     mx.eval(got)
     assert got.shape == (M, N)
     assert not np.isnan(np.array(got.astype(mx.float32))).any()
@@ -366,139 +352,7 @@ def test_qmm_rejects_untiled_output_width():
     x = mx.zeros((64, K), dtype=mx.float16)
     qa, sa, ra = fast.qwen35_oq_a8_quantize(x, 0)
     with pytest.raises(ValueError):
-        fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, scales, biases, 4, 0, 0)
-
-
-# --------------------------------------------------------------------------
-# Q4 decode-free path
-# --------------------------------------------------------------------------
-
-
-def test_nibble_flip_maps_unsigned_codes_to_signed():
-    """(q ^ 8) read as two's-complement 4-bit is exactly q - 8.
-
-    This identity is the whole basis of the decode-free path: it lets the
-    hardware's signed int4b_format consume oQ's unsigned affine codes, with the
-    offset absorbed into the bias.
-    """
-    for q in range(16):
-        flipped = q ^ 8
-        signed = flipped - 16 if flipped >= 8 else flipped
-        assert signed == q - 8, f"q={q}: {signed} != {q - 8}"
-
-
-@requires_kernels
-@pytest.mark.parametrize("act_mode", [0, 1])
-def test_i4_matches_the_decoding_kernel(act_mode):
-    """The decode-free Q4 path must agree with the decoder path exactly.
-
-    Same inputs, same math, different route to the tensor units -- so this is
-    the tightest available check on the bit flip and the folded bias.
-    """
-    fast = _kernels()
-    M, K, N = 128, 512, 128
-    packed, scales, biases = make_quantized(N, K, 4, seed=77)
-
-    rng = np.random.default_rng(97)
-    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
-
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
-    decoded = fast.qwen35_oq_a8_qmm_t(
-        qa, sa, ra, packed, scales, biases, 4, act_mode, 0
-    )
-
-    w4, s4, b4 = fast.qwen35_oq_a8_prepare_q4(packed, scales, biases)
-    direct = fast.qwen35_oq_a8_i4_qmm_t(qa, sa, ra, w4, s4, b4, act_mode, 0)
-    mx.eval(decoded, direct)
-
-    a = np.array(decoded.astype(mx.float32))
-    b = np.array(direct.astype(mx.float32))
-    rel = np.abs(a - b).max() / max(np.abs(a).max(), 1e-6)
-    assert rel < 2e-3, f"decode-free Q4 diverged from the decoder path by {rel:.5f}"
-
-
-@requires_kernels
-def test_i4_prepare_is_a_pure_relabelling():
-    """The flip and bias fold must not change what the weights mean."""
-    fast = _kernels()
-    K, N = 256, 64
-    packed, scales, biases = make_quantized(N, K, 4, seed=5)
-    w4, s4, b4 = fast.qwen35_oq_a8_prepare_q4(packed, scales, biases)
-    mx.eval(w4, s4, b4)
-
-    codes = unpack_codes(np.array(packed), 4, K)
-    flipped = unpack_codes(np.array(w4), 4, K)
-    signed = np.where(flipped >= 8, flipped - 16, flipped)
-    np.testing.assert_array_equal(signed, codes - 8)
-
-    # Sw*q + Bw must equal Sw*(q - 8) + Bw'
-    s = np.repeat(np.array(scales.astype(mx.float32)), GROUP_SIZE, axis=1)
-    b = np.repeat(np.array(biases.astype(mx.float32)), GROUP_SIZE, axis=1)
-    b_folded = np.repeat(np.array(b4.astype(mx.float32)), GROUP_SIZE, axis=1)
-    np.testing.assert_allclose(
-        s * codes + b, s * (codes - 8) + b_folded, rtol=1e-2, atol=1e-2
-    )
-
-
-@requires_kernels
-@pytest.mark.parametrize("variant", [0, 1, 3])
-def test_i4_variants_agree(variant):
-    fast = _kernels()
-    M, K, N = 192, 256, 128
-    packed, scales, biases = make_quantized(N, K, 4, seed=8)
-    w4, s4, b4 = fast.qwen35_oq_a8_prepare_q4(packed, scales, biases)
-    rng = np.random.default_rng(19)
-    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
-
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, 0)
-    base = fast.qwen35_oq_a8_i4_qmm_t(qa, sa, ra, w4, s4, b4, 0, 0)
-    other = fast.qwen35_oq_a8_i4_qmm_t(qa, sa, ra, w4, s4, b4, 0, variant)
-    mx.eval(base, other)
-
-    np.testing.assert_allclose(
-        np.array(base.astype(mx.float32)),
-        np.array(other.astype(mx.float32)),
-        rtol=1e-3,
-        atol=1e-3,
-    )
-
-
-@requires_kernels
-def test_i4_tracks_the_unquantized_projection():
-    fast = _kernels()
-    M, K, N = 128, 512, 128
-    packed, scales, biases = make_quantized(N, K, 4, seed=23)
-    w4, s4, b4 = fast.qwen35_oq_a8_prepare_q4(packed, scales, biases)
-
-    rng = np.random.default_rng(29)
-    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
-
-    got = fast.qwen35_oq_a8_i4_linear(x, w4, s4, b4, 0, 0)
-    reference = mx.quantized_matmul(
-        x, packed, scales, biases, transpose=True,
-        group_size=GROUP_SIZE, bits=4, mode="affine",
-    )
-    mx.eval(got, reference)
-
-    g = np.array(got.astype(mx.float32))
-    r = np.array(reference.astype(mx.float32))
-    rel = np.abs(g - r).max() / max(np.abs(r).max(), 1e-6)
-    assert rel < 0.05, f"decode-free Q4 drifted {rel:.4f} from the W4A16 result"
-
-
-@requires_kernels
-def test_i4_handles_a_partial_row_tile():
-    fast = _kernels()
-    M, K, N = 130, 128, 64
-    packed, scales, biases = make_quantized(N, K, 4, seed=31)
-    w4, s4, b4 = fast.qwen35_oq_a8_prepare_q4(packed, scales, biases)
-    rng = np.random.default_rng(37)
-    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
-
-    got = fast.qwen35_oq_a8_i4_linear(x, w4, s4, b4, 0, 0)
-    mx.eval(got)
-    assert got.shape == (M, N)
-    assert not np.isnan(np.array(got.astype(mx.float32))).any()
+        fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
 
 
 # --------------------------------------------------------------------------
@@ -687,12 +541,16 @@ def test_v8_matches_w4a16_within_quantization_error(bits, act_mode, M):
     qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
     mx.eval(sc_t, bi_t, qa, sa, ra)
 
-    got = fast.qwen35_oq_a8_qmm_t(
-        qa, sa, ra, packed, sc_t, bi_t, bits, act_mode, 800
-    )
+    got = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, act_mode, 800)
     ref = mx.quantized_matmul(
-        x, packed, scales, biases, transpose=True,
-        group_size=GROUP_SIZE, bits=bits, mode="affine",
+        x,
+        packed,
+        scales,
+        biases,
+        transpose=True,
+        group_size=GROUP_SIZE,
+        bits=bits,
+        mode="affine",
     )
     mx.eval(got, ref)
     g = np.array(got.astype(mx.float32))
@@ -725,8 +583,10 @@ def test_v8_tiles_agree_with_each_other(variant, bits):
     got = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, 0, variant)
     mx.eval(base, got)
     np.testing.assert_allclose(
-        np.array(got.astype(mx.float32)), np.array(base.astype(mx.float32)),
-        rtol=0, atol=0,
+        np.array(got.astype(mx.float32)),
+        np.array(base.astype(mx.float32)),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -740,8 +600,9 @@ def test_stage_a_keeps_the_batch_rank(act_mode):
     """
     fast = _kernels()
     rng = np.random.default_rng(31)
-    x = mx.array((rng.standard_normal((3, 128, 256)) * 0.5).astype(np.float32),
-                 mx.float16)
+    x = mx.array(
+        (rng.standard_normal((3, 128, 256)) * 0.5).astype(np.float32), mx.float16
+    )
     mx.eval(x)
     qa, _, _ = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
     mx.eval(qa)
@@ -801,8 +662,16 @@ def test_batched_prefill_keeps_sequences_independent(B):
 
     got = run(x)
     assert got.shape == (B, S, N)
-    ref = mx.quantized_matmul(x, packed, scales, biases, transpose=True,
-                              group_size=GROUP_SIZE, bits=4, mode="affine")
+    ref = mx.quantized_matmul(
+        x,
+        packed,
+        scales,
+        biases,
+        transpose=True,
+        group_size=GROUP_SIZE,
+        bits=4,
+        mode="affine",
+    )
     mx.eval(ref)
     g = np.array(got.astype(mx.float32))
     r = np.array(ref.astype(mx.float32))
@@ -896,9 +765,7 @@ def test_patched_mlp_routes_and_falls_back(monkeypatch):
             self.down_proj = _quantized_linear(512, 256, 4)
 
         def __call__(self, x, *args, **kwargs):
-            return self.down_proj(
-                nn.silu(self.gate_proj(x)) * self.up_proj(x)
-            )
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
     monkeypatch.setattr(dispatch, "_SWIGLU", lambda g, u: nn.silu(g) * u)
 
@@ -1045,3 +912,48 @@ def test_two_resident_models_keep_their_own_settings(monkeypatch):
 
     assert dispatch._min_tokens(dispatch._config_for(short.proj)) == 64
     assert dispatch._min_tokens(dispatch._config_for(long.proj)) == 4096
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_single_token_mlp_stays_on_decode_when_floor_is_one(monkeypatch, batch):
+    from unittest.mock import Mock
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "1")
+    route = Mock(side_effect=AssertionError("decode entered A8"))
+    monkeypatch.setattr(dispatch, "oq_a8_mlp", route)
+    original = Mock(return_value="decode")
+    wrapped = dispatch._make_patched_mlp(original)
+    x = mx.zeros((batch, 1, 64), dtype=mx.float16)
+    assert wrapped(object(), x) == "decode"
+    route.assert_not_called()
+    assert not dispatch._shape_eligible(x, dispatch.OqA8Config(min_tokens=1))
+    assert dispatch._shape_eligible(
+        mx.zeros((1, 128, 64), mx.float16), dispatch.OqA8Config(min_tokens=1)
+    )
+
+
+@requires_kernels
+@pytest.mark.parametrize("variant", [-1, 0, 6, 200, 206, 799, 807])
+def test_native_qmm_rejects_removed_variants(variant):
+    fast = _kernels()
+    packed, scales, biases = make_quantized(128, 128, 4, seed=20)
+    x = mx.ones((128, 128), dtype=mx.float16)
+    with pytest.raises(ValueError, match="variant"):
+        fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, variant=variant)
+
+
+def test_mlp_routing_errors_are_not_silently_ignored(monkeypatch):
+    from unittest.mock import Mock
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    route = Mock(side_effect=RuntimeError("kernel failure"))
+    original = Mock()
+    monkeypatch.setattr(dispatch, "oq_a8_mlp", route)
+    monkeypatch.setattr(dispatch, "_SWIGLU", lambda g, u: g * u)
+    wrapped = dispatch._make_patched_mlp(original)
+    with pytest.raises(RuntimeError, match="kernel failure"):
+        wrapped(object(), mx.ones((1, 128, 64), dtype=mx.float16))
+    original.assert_not_called()

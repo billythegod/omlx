@@ -1,23 +1,10 @@
 # ruff: noqa: N806
-"""Dispatch layer for the oQ mixed-bit QxA8 prefill kernels.
+"""Model-local routing for Qwen INT8-activation prefill.
 
-Every ``QuantizedLinear`` is classified exactly once, at the point it is first
-seen, into a frozen plan (bits, activation-scale policy, tile). The forward
-path then reads that plan off the module instead of re-parsing quantization
-metadata on every call.
-
-Importing this module patches nothing. The kernel changes inference numerics
-by quantizing activations to INT8, so turning it on is an accuracy decision
-and stays behind an explicit opt-in. Installing the model-side routing is an
-explicit call to :func:`apply_qwen35_oq_a8_patch`, which the engine makes only
-when ``qwen35_oq_a8_enabled`` is set for the model, and which opts that model
-in by tagging its modules; ``OMLX_OQ_A8=1`` is the equivalent opt-in for
-callers that route through :func:`oq_a8_linear`, :func:`oq_a8_mlp` or
-:func:`oq_a8_gdn_projections` directly.
-
-The class wrapper it installs is process-wide and stays installed, but the
-tag is per model, so the setting is reversible: a model loaded with it off is
-not tagged and the wrapper falls through.
+Eligible Q4/Q5 projections cache a dispatch plan and share activation
+quantization where possible. Class wrappers are installed once, but only
+modules tagged by an enabled model are routed. Environment overrides also
+support direct callers. Importing this module installs no patches.
 """
 
 from __future__ import annotations
@@ -44,18 +31,8 @@ _WARNED_VARIANTS: set[str] = set()
 _PLAN_ATTR = "_omlx_oq_a8_plan"
 _PREPARED_ATTR = "_omlx_oq_a8_prepared"
 
-# The kernel reads the checkpoint's own packed weight stream, unmodified, and
-# gets a lane's codes into one contiguous read by choosing which K each
-# fragment slot stands for rather than by moving any bytes. The only prepared
-# arrays are the transposed scale/bias tables, four orders of magnitude smaller
-# than the weights, so a routed projection costs no extra weight memory and the
-# decode path is untouched.
-
-# Rowwise A8 is the throughput path. GS64 activation scales cost
-# more preprocessing but align the activation and weight group boundaries
-# exactly, which is most attractive for the Q5-protected sensitive layers
-#. The policy does not have to be uniform, so Q4 and Q5 read
-# separate knobs.
+# Packed weights are reused; only scale/bias metadata and activations are copied.
+# Rowwise and GS64 activation scaling are supported independently for Q4/Q5.
 _ACT_MODE_ROW = 0
 _ACT_MODE_G64 = 1
 
@@ -104,20 +81,7 @@ def enabled() -> bool:
 
 
 def _config_for(module: Any) -> OqA8Config | None:
-    """The oQ A8 configuration governing ``module``, or None to stay on MLX.
-
-    Gating is per module rather than process-wide because the patch replaces
-    ``Qwen3_5MLP.__call__``, which every resident model shares. A model whose
-    settings have the feature off never gets tagged, so the shared wrapper
-    falls straight through for it. That is what makes the setting reversible:
-    a process-wide flag stays stuck on once any model has turned it on, so
-    switching it off and reloading would keep routing. It also keeps two
-    resident models with different settings independent, including their
-    token floors, rather than last-writer-wins.
-
-    Mirrors ``_omlx_ane_prefill_config`` in the ANE prefill patch, which gates
-    the same class the same way.
-    """
+    """Resolve model-local configuration, with an optional environment override."""
     if os.environ.get("OMLX_OQ_A8") == "0":
         return None
     config = getattr(module, _CONFIG_ATTR, None)
@@ -135,25 +99,16 @@ def _tag_modules(model: Any, config: OqA8Config) -> int:
     the linear backend gets first refusal on (``linear_attn.out_proj``) are
     reached as themselves, not through a parent.
     """
-    tagged = 0
-    try:
-        modules = [module for _, module in model.named_modules()]
-    except Exception:
-        logger.debug("oq_a8: could not walk the model tree", exc_info=True)
-        return 0
+    modules = [module for _, module in model.named_modules()]
     for module in modules:
-        try:
-            setattr(module, _CONFIG_ATTR, config)
-        except Exception:
-            continue
-        tagged += 1
-    return tagged
+        setattr(module, _CONFIG_ATTR, config)
+    return len(modules)
 
 
 def _kernels_available() -> bool:
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
-    except Exception:
+    except ImportError:
         return False
     return fast.oq_a8_available()
 
@@ -197,8 +152,7 @@ _VARIANT_MAX = 806
 
 def _variant_for_bits(bits: int) -> int:
     # Q4 and Q5 are autotuned independently: Q5 reads a second plane per
-    # weight row and costs more registers, so the best tile need not match
-    #.
+    # weight row and costs more registers, so the best tile need not match.
     default = _DEFAULT_VARIANT_Q5 if bits == 5 else _DEFAULT_VARIANT_Q4
     shared = _env_int("OMLX_OQ_A8_VARIANT", default)
     if bits == 5:
@@ -232,12 +186,7 @@ def classify_linear(linear: Any) -> OqA8Plan | None:
         return cached
 
     plan = _classify_uncached(linear)
-    try:
-        object.__setattr__(linear, _PLAN_ATTR, plan)
-    except Exception:
-        # nn.Module subclasses that reject attribute writes just pay the
-        # classification cost again; correctness is unaffected.
-        pass
+    object.__setattr__(linear, _PLAN_ATTR, plan)
     return plan
 
 
@@ -308,9 +257,7 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
     return plan
 
 
-# Mirror of oq_a8_v2_variant() in qwen35_oq_a8.cpp, which both the shipped
-# families index into: (BM, BN, WM, WN), keyed by the offset from the family's
-# base.
+# Must match oq_a8_nax_variant() in C++: (BM, BN, WM, WN), indexed from 800.
 _VARIANT_TILES = {
     0: (64, 64, 2, 2),
     1: (128, 64, 4, 2),
@@ -334,14 +281,7 @@ def _variant_bn(variant: int) -> int:
 
 
 def _prepared_weights(linear: Any):
-    """Load-time operand transform for ``linear``, computed once and cached.
-
-    The weight stream is handed through untouched -- the kernel reads the
-    checkpoint's own bytes -- so this only transposes the scale and bias
-    tables to group-major, which is four orders of magnitude less memory than
-    a repacked weight copy would be and leaves the module's arrays, and MLX's
-    decode path over them, exactly as loaded.
-    """
+    """Cache transposed metadata while reusing the packed weight array."""
     cached = getattr(linear, _PREPARED_ATTR, None)
     if cached is not None:
         return cached
@@ -352,10 +292,7 @@ def _prepared_weights(linear: Any):
         mx.contiguous(linear.biases.T),
     )
     mx.eval(*prepared)
-    try:
-        object.__setattr__(linear, _PREPARED_ATTR, prepared)
-    except Exception:
-        pass
+    object.__setattr__(linear, _PREPARED_ATTR, prepared)
     return prepared
 
 
@@ -380,7 +317,7 @@ def stage_a(x: mx.array, act_mode: int = _ACT_MODE_ROW) -> StageA:
     Qa carries the schedule's within-group K order, and Ra (and Sa in
     per-group mode) come back group-major to match the weight metadata. This
     is the only operand that is reordered, and it is rebuilt on every prefill,
-    so the order costs no memory and nothing on disk changes.
+    which uses temporary activation memory without changing the checkpoint.
     """
     from omlx.custom_kernels.qwen35_prefill import fast
 
@@ -439,7 +376,7 @@ def _shape_eligible(x: mx.array, config: OqA8Config) -> bool:
     # prefill and the tiles start at 32 rows.
     if x.ndim < 2 or x.dtype not in (mx.float16, mx.bfloat16):
         return False
-    if x.shape[-2] < _min_tokens(config):
+    if x.shape[-2] <= 1 or x.shape[-2] < _min_tokens(config):
         return False
     return x.shape[-1] % _GROUP_SIZE == 0
 
@@ -447,8 +384,7 @@ def _shape_eligible(x: mx.array, config: OqA8Config) -> bool:
 def oq_a8_mlp(mlp: Any, x: mx.array, activation) -> mx.array | None:
     """SwiGLU MLP with Stage A shared between gate and up.
 
-    Both are Q4 everywhere in this checkpoint, so the shared quantization is a
-    guaranteed win and no mixed-bit gate/up template is needed.
+    Gate and up share Stage A when their activation scaling policies match.
     Returns None when any of the three projections is not eligible, leaving
     the caller on its existing path.
     """
@@ -525,7 +461,7 @@ def oq_a8_gdn_projections(
 # The GDN projections go through the first-refusal hook that the q4 prefill
 # patch already exposes, rather than a second wrapper around
 # ``GatedDeltaNet.__call__`` -- that keeps the recurrent implementation and
-# the Native-MTP call signature in one place.
+# the Lightning MTP call signature in one place.
 
 _MLP_PATCHED = False
 _GDN_REGISTERED = False
@@ -557,22 +493,16 @@ _SWIGLU = None
 
 def _make_patched_mlp(orig_call):
     def patched(self, x, *args, **kwargs):
-        # This runs on every MLP call of every layer of every decode step, so
-        # the common case has to exit on an attribute read and a shape check
-        # alone (#2132) -- no kernel probing, no import.
+        # Skip single-token decoding before probing kernels or importing SwiGLU.
         config = getattr(self, _CONFIG_ATTR, None) or _ENV_CONFIG
-        if x.ndim < 3 or x.shape[-2] < _min_tokens(config):
+        if x.ndim < 3 or x.shape[-2] <= 1 or x.shape[-2] < _min_tokens(config):
             return orig_call(self, x, *args, **kwargs)
         target_verify = bool(kwargs.get("target_verify", False))
         if args and isinstance(args[0], bool):
             target_verify = target_verify or bool(args[0])
         if target_verify:
             return orig_call(self, x, *args, **kwargs)
-        try:
-            out = oq_a8_mlp(self, x, _swiglu())
-        except Exception:
-            logger.debug("oq_a8: MLP routing failed; falling back", exc_info=True)
-            return orig_call(self, x, *args, **kwargs)
+        out = oq_a8_mlp(self, x, _swiglu())
         if out is None:
             return orig_call(self, x, *args, **kwargs)
         return out
@@ -588,11 +518,7 @@ def _gdn_prefill_backend(gdn: Any, inputs: mx.array, target_verify: bool):
     """
     if target_verify:
         return None
-    try:
-        projections = oq_a8_gdn_projections(gdn, inputs)
-    except Exception:
-        logger.debug("oq_a8: GDN routing failed; falling back", exc_info=True)
-        return None
+    projections = oq_a8_gdn_projections(gdn, inputs)
     if projections is None:
         return None
     return (
@@ -629,7 +555,7 @@ def _patch_mlp_class(module_name: str, class_name: str) -> bool:
 
     try:
         module = importlib.import_module(module_name)
-    except Exception:
+    except ImportError:
         return False
     cls = getattr(module, class_name, None)
     if cls is None:
@@ -647,24 +573,10 @@ def apply_qwen35_oq_a8_patch(
     model: Any = None,
     min_tokens: int | None = None,
 ) -> bool:
-    """Route ``model``'s eligible Qwen3.5 prefill projections through oQ A8.
+    """Install shared wrappers and tag only this model with its configuration.
 
-    ``model`` is the loaded model whose settings asked for this; its modules
-    are tagged, and that tag is the opt-in. Only the tagged model is routed,
-    so a second resident model with the feature off is untouched, and turning
-    the setting off means the next load simply is not tagged -- the class
-    wrapper stays installed and falls through. Called without a model, it
-    installs the wrapper and leaves ``OMLX_OQ_A8`` as the only opt-in.
-
-    ``min_tokens`` comes from the model's settings. Passing it here rather than
-    through the environment keeps the engine's configuration explicit and
-    testable; ``OMLX_OQ_A8_MIN_TOKENS`` still overrides, for callers driving
-    the dispatcher directly. There is no kernel to choose -- the tile is picked
-    per bit width from a measured default, and ``OMLX_OQ_A8_VARIANT`` overrides
-    it for benchmarking.
-
-    Idempotent, and safe to call when the kernels are unavailable -- it simply
-    reports False and changes nothing.
+    Reloading with the setting off creates untagged modules, so existing
+    wrappers fall through. Returns False when native kernels are unavailable.
     """
     global _MLP_PATCHED, _GDN_REGISTERED
 

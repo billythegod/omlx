@@ -2438,6 +2438,11 @@
                 }
             },
 
+            isQwenOqA8Model(model) {
+                const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
+                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+            },
+
             validateQwenOqA8Settings() {
                 if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently

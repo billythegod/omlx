@@ -1054,6 +1054,11 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
+    var isQwenOqA8Model: Bool {
+        let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
+    }
+
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// Native Lightning MTP can't co-exist with the other speculative

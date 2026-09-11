@@ -118,22 +118,7 @@ mx::array qwen35_oq_a8_qmm_t(
     const mx::array& biases,
     int bits,
     int act_mode = 0,
-    int variant = 0,
-    mx::StreamOrDevice s = {});
-
-// Q4 decode-free GEMM: hands the packed nibbles straight to the tensor units
-// as int4b_format. `weight` must already be bit-flipped (^ 0x88888888) and
-// `biases` must already carry 8*scales + biases; both are one-time load-time
-// transforms. Q5 has no native 5-bit format and uses qwen35_oq_a8_qmm_t.
-mx::array qwen35_oq_a8_i4_qmm_t(
-    const mx::array& qa,
-    const mx::array& sa,
-    const mx::array& ra,
-    const mx::array& weight,
-    const mx::array& scales,
-    const mx::array& biases,
-    int act_mode = 0,
-    int variant = 0,
+    int variant = 800,
     mx::StreamOrDevice s = {});
 
 // Test helper: unpack Q4/Q5 codes to INT8 [N, group_count * 64]. Production
