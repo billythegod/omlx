@@ -34,6 +34,24 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 
+def validate_moe_expert_offload(settings: dict) -> None:
+    fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
+    if settings.get("moe_expert_offload_enabled") and any(
+        settings.get(key)
+        for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled")
+    ):
+        raise ValueError(
+            "MoE expert offload cannot be combined with Lightning MTP, "
+            "VLM MTP, or DFlash; disable speculative decoding first."
+        )
+
+
 def ane_prefill_backend(model_type: str | None) -> str | None:
     """Select the ANE implementation from model metadata."""
     model_type = (model_type or "").lower().replace("-", "_")
@@ -145,8 +163,6 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     resolved = dict(data)
     resolved["qwen35_oq_a8_enabled"] = False
     return resolved, ["qwen35_ane_prefill_enabled"]
-
-
 
 
 PROFILES_VERSION = 1
@@ -500,14 +516,7 @@ class ModelSettings:
                     "require per-request logits processors, which the "
                     "vlm_mtp decode path does not apply"
                 )
-        # Expert offload streams from the checkpoint at a chosen residency;
-        # values outside (0, 1] have no meaning and would otherwise fail
-        # deep inside the load path instead of at the API boundary.
-        if not (0.0 < self.moe_expert_offload_resident_fraction <= 1.0):
-            raise ValueError(
-                "moe_expert_offload_resident_fraction must be in (0, 1], "
-                f"got {self.moe_expert_offload_resident_fraction}"
-            )
+        validate_moe_expert_offload(self.to_dict())
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

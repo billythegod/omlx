@@ -2090,6 +2090,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2105,6 +2110,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = qwen4_exp_residency_estimate(
                     model_info.get("model_path", "")
                 )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._qwen4_ple_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
                 qwen4_ple_ssd_offload_supported = estimate.supported
                 qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
@@ -2133,6 +2146,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = deepseek_v41_residency_estimate(
                     model_info.get("model_path", "")
                 )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
                 deepseek_v41_engram_ssd_offload_supported = estimate.supported
                 deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
@@ -2197,6 +2218,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "moe_expert_offload_supported": moe_offload_supported,
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
@@ -2774,7 +2796,9 @@ async def update_model_settings(
         )
     if "moe_expert_offload_resident_fraction" in sent:
         current_settings.moe_expert_offload_resident_fraction = (
-            request.moe_expert_offload_resident_fraction or 0.25
+            0.25
+            if request.moe_expert_offload_resident_fraction is None
+            else request.moe_expert_offload_resident_fraction
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -3282,6 +3306,19 @@ def _raise_if_alias_conflicts_exposed_profiles(
 
 
 def _validate_model_settings(entry, settings):
+    from ..model_settings import validate_moe_expert_offload
+
+    try:
+        validate_moe_expert_offload(settings)
+        if settings.get("moe_expert_offload_enabled"):
+            from ..patches.moe_offload_compat import moe_offload_compatibility
+
+            supported, reason = moe_offload_compatibility(entry.model_path)
+            if not supported:
+                raise ValueError(reason)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
     if "qwen35_oq_a8_min_tokens" in settings:
         value = settings["qwen35_oq_a8_min_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:

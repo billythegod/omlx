@@ -55,7 +55,13 @@ def set_module(model, path, module):
         setattr(parent, parts[-1], module)
 
 
-def load(path, *, engram_ssd_offload=False, preserve_mtp=None):
+def load(
+    path,
+    *,
+    engram_ssd_offload=False,
+    preserve_mtp=None,
+    moe_expert_offload_resident_fraction=None,
+):
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
         raise ValueError("DeepSeek V4.1 checkpoint conversion is still in progress")
@@ -80,6 +86,11 @@ def load(path, *, engram_ssd_offload=False, preserve_mtp=None):
         if not source_checkpoint and preserve_mtp != config.preserve_mtp:
             raise ValueError("Converted checkpoint MTP layout cannot be overridden")
         config.preserve_mtp = bool(preserve_mtp)
+    if moe_expert_offload_resident_fraction is not None:
+        if preserve_mtp is True:
+            raise ValueError("MoE expert offload cannot enable DSpark MTP")
+        # Retained draft weights need not consume RAM when speculation is forbidden.
+        config.preserve_mtp = False
     model = Model(config)
     if config.engram_layer_ids:
         logger.info(
@@ -87,6 +98,7 @@ def load(path, *, engram_ssd_offload=False, preserve_mtp=None):
             "SSD offload" if engram_ssd_offload else "host RAM",
         )
     memory_scope = ExitStack()
+    offload = None
     try:
         if not engram_ssd_offload and config.engram_layer_ids:
             # Include packed Engram storage in the normal MLX residency budget
@@ -130,18 +142,45 @@ def load(path, *, engram_ssd_offload=False, preserve_mtp=None):
             name: value.shape for name, value in tree_flatten(model.parameters())
         }
 
+        if moe_expert_offload_resident_fraction is not None:
+            from .moe_offload import ExpertOffloadPlan, OffloadedExpert
+
+            offload = ExpertOffloadPlan(
+                path, raw, mapping, config, moe_expert_offload_resident_fraction
+            )
+            model._moe_offload_plan = offload
+            for layer_id, layer in enumerate(model.language_model.layers):
+                prefix = f"language_model.layers.{layer_id}.ffn.experts"
+                layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
+            logger.info(
+                "DeepSeek V4.1 MoE offload: %d/%d experts resident per layer "
+                "(%.2f GiB -> %.2f GiB expert weights)",
+                offload.capacity,
+                offload.count,
+                offload.full_bytes / 1024**3,
+                offload.resident_bytes / 1024**3,
+            )
+        offload_keys = set(offload.excluded_keys) if offload is not None else set()
+        if offload is not None and not source_checkpoint:
+            offload_keys.update(
+                k for k in mapping if k.startswith("language_model.mtp.")
+            )
+
         def batches():
             if source_checkpoint:
                 yield from iter_source_weights(
-                    path, raw, mapping, preserve_mtp=config.preserve_mtp
+                    path,
+                    raw,
+                    {k: v for k, v in mapping.items() if k not in offload_keys},
+                    preserve_mtp=config.preserve_mtp,
                 )
             else:
                 for filename in dict.fromkeys(mapping.values()):
                     keys = {key for key, file in mapping.items() if file == filename}
-                    normal_keys = keys - engram_keys
+                    normal_keys = keys - engram_keys - offload_keys
                     if not normal_keys:
                         continue
-                    if keys.intersection(engram_keys):
+                    if keys.intersection(engram_keys | offload_keys):
                         # Shared shards must not pull SSD-offloaded tables onto
                         # the GPU when loading their ordinary projections.
                         reader = TensorFile(path / filename)
@@ -235,8 +274,13 @@ def load(path, *, engram_ssd_offload=False, preserve_mtp=None):
             or (
                 not source_checkpoint
                 and (
-                    seen != set(mapping) - engram_keys
-                    or replaced != set(format_spec.get("quantized_modules", {}))
+                    seen != set(mapping) - engram_keys - offload_keys
+                    or replaced
+                    != {
+                        name
+                        for name in format_spec.get("quantized_modules", {})
+                        if name + ".weight" not in offload_keys
+                    }
                 )
             )
         ):

@@ -84,6 +84,9 @@ class Model(nn.Module):
         )
 
     def close(self):
+        offload = getattr(self, "_moe_offload_plan", None)
+        if offload is not None:
+            offload.close()
         prefetch = getattr(self.language_model, "_engram_prefetch", None)
         try:
             if prefetch is not None:

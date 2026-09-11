@@ -41,3 +41,21 @@ DeepSeek V4.1 Metal arithmetic and sparse-addressing checks: `python -m pytest t
 Packed attention rounding: `python -m pytest tests/test_deepseek_v41_attention_rounding.py -q`. An independent MLX oracle checks 64-key online maxima, FP32 denominators, BF16 PV probabilities, masking, sink placement, and growing or strided KV across the threadgroup capacity boundary. This does not execute the official CUDA kernels.
 
 Engram storage and prefetch lifecycle: `python -m pytest tests/test_deepseek_v41_offload.py -q`. Modal state, forced-toggle behavior, and save payload: `node --test tests/deepseek_v41_offload_ui.test.cjs`. Both use synthetic fixtures and require no checkpoint download.
+
+
+### MoE expert residency
+
+`tests/test_deepseek_v41_moe_offload.py` exercises original and converted
+V4.1 expert reads, MXFP4/MXFP8 and mixed-bit affine arithmetic, repeated
+evictions, sorted routes, load/inference thread separation, Engram coexistence,
+draft-weight exclusion, and memory estimates. The load probe rejects whole
+expert reads from shared shards. Run alongside `test_deepseek_v41_offload.py`,
+`test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
+`node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
+save/reopen payload and speculative-decoding toggle exclusion.
+
+`tests/test_moe_expert_offload.py` also exercises Qwen4-Exp MoE routing with
+512 experts, top-k 10, 64 resident slots, shared experts, and repeated
+evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
+checkpoint completeness, dense-model exclusion, API/runtime rejection, and
+PLE/Engram metadata after expert savings.

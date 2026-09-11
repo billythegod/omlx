@@ -4336,3 +4336,56 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "dynamic memory ceiling" in message
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
+
+
+@pytest.mark.parametrize(
+    "ple_enabled,ceiling,expected,forced",
+    [
+        (False, 700, 580, False),
+        (True, 700, 180, False),
+        (False, 300, 180, True),
+    ],
+)
+def test_qwen4_moe_savings_precede_ple_force_decision(
+    tmp_path, ple_enabled, ceiling, expected, forced
+):
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    settings = ModelSettings(
+        moe_expert_offload_enabled=True,
+        moe_expert_offload_resident_fraction=0.125,
+        qwen4_ple_ssd_offload=ple_enabled,
+    )
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1000,
+    )
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=950,
+        ple_bytes=400,
+        resident_bytes=1000,
+        mmap_bytes=600,
+    )
+    pool = _make_pool(ceiling=ceiling)
+    with (
+        patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ),
+        patch(
+            "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+            side_effect=lambda path, size, fraction: size - 400,
+        ),
+    ):
+        _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
+        assert is_forced is forced
+        assert pool._entry_runtime_resident_size(entry, settings) == expected

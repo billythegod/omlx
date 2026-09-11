@@ -560,3 +560,78 @@ class TestRealGeometry:
         ref, got = glu(x, i), wrapped(x, i)
         mx.eval(ref, got)
         assert bool(mx.array_equal(ref, got))
+
+
+def test_capacity_uses_checkpoint_routing_top_k(tmp_path):
+    import json
+
+    glu = _make_glu()
+    _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+    (tmp_path / "config.json").write_text(json.dumps({"num_experts_per_tok": 10}))
+    model = _MiniMoE([glu])
+    apply_moe_expert_offload(model, tmp_path, .125)
+    wrapped = model.layers[0].experts.switch_glu
+    assert wrapped.cache.capacity == 10
+    x = mx.random.normal((1, 1, D))
+    indices = mx.arange(10).reshape(1, 1, 10)
+    np_result = wrapped(x, indices)
+    reference = glu(x, indices)
+    mx.eval(np_result, reference)
+    assert bool(mx.array_equal(np_result, reference))
+
+
+@pytest.mark.parametrize("length,batch", [(1, 1), (32, 1), (8, 2)])
+def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
+    """Exercise Qwen4-Exp's actual MoE block, including its shared expert."""
+    import copy
+    import json
+    from types import SimpleNamespace
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import Qwen3_5MoeSparseMoeBlock
+
+    mx.random.seed(42)
+    config = SimpleNamespace(
+        hidden_size=64,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        num_experts=512,
+        num_experts_per_tok=10,
+    )
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = Qwen3_5MoeSparseMoeBlock(config)
+    model.language_model.model.layers = [layer]
+    nn.quantize(layer.mlp.switch_mlp, group_size=32, bits=4)
+    reference = copy.deepcopy(layer.mlp)
+    _save_checkpoint(
+        tmp_path,
+        _glu_tensors(
+            layer.mlp.switch_mlp, "language_model.model.layers.0.mlp.switch_mlp"
+        ),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": vars(config),
+            }
+        )
+    )
+    assert apply_moe_expert_offload(model, tmp_path, 0.125) == 1
+    cache = layer.mlp.switch_mlp.cache
+    assert cache.capacity == 64
+    for _ in range(5):
+        x = mx.random.normal((batch, length, 64))
+        expected, actual = reference(x), layer.mlp(x)
+        mx.eval(expected, actual)
+        assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-5).item()
+        assert len(cache.slot_of) <= 64
+    if length > 1:
+        assert cache.misses > cache.capacity

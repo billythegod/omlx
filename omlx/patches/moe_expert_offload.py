@@ -70,6 +70,25 @@ _DTYPES = {
 }
 
 
+def _minimum_experts(model_dir):
+    path = Path(model_dir) / "config.json"
+    if not path.exists():
+        return 8
+    config = json.loads(path.read_text())
+    text = config.get("text_config", config)
+    return max(
+        8,
+        *(
+            int(text.get(k) or 0)
+            for k in (
+                "num_experts_per_tok",
+                "num_experts_per_token",
+                "n_activated_experts",
+            )
+        ),
+    )
+
+
 class CheckpointExpertStore:
     """Per-expert slab reads from a model directory's safetensors shards.
 
@@ -314,6 +333,8 @@ class OffloadSwitchGLU(nn.Module):
         c = self.cache
         flat_i = indices.reshape(-1, indices.shape[-1])
         n_tok, k = flat_i.shape
+        if k > c.capacity:
+            raise ValueError("Expert cache capacity is smaller than routing top-k")
         if n_tok * k <= c.capacity or n_tok == 1:
             return self._forward(x, indices)
         distinct = len(set(int(e) for e in flat_i.reshape(-1).tolist()))
@@ -436,6 +457,11 @@ def _resolve_store_view(
     so the failure mode stays "runs resident" instead of a fetch-time
     KeyError mid-generation.
     """
+    if type(glu).__module__.startswith("omlx.patches.deepseek_v4"):
+        return (
+            None,
+            "custom weighted expert kernels require a dedicated offload adapter",
+        )
     n = None
     fields_of: dict[str, list[str]] = {}
     for proj in _PROJS:
@@ -493,6 +519,7 @@ def apply_moe_expert_offload(
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
+    minimum = _minimum_experts(model_dir)
     store = CheckpointExpertStore(model_dir)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
@@ -506,7 +533,7 @@ def apply_moe_expert_offload(
             logger.info("moe expert offload: skipping %s (%s)", path, reason)
             continue
         n_experts = glu.gate_proj["weight"].shape[0]
-        capacity = max(8, min(n_experts, round(n_experts * resident_fraction)))
+        capacity = min(n_experts, max(minimum, round(n_experts * resident_fraction)))
         layer_bytes = sum(
             int(np.prod(lin[f].shape)) * lin[f].dtype.size
             for p in _PROJS
@@ -531,7 +558,7 @@ def apply_moe_expert_offload(
 
     if wrapped:
         logger.info(
-            "moe expert offload: wrapped %d layers at %.0f%% residency "
+            "moe expert offload: wrapped %d layers at %.1f%% residency "
             "(expert tables: %.2f GB total, %.2f GB resident)",
             wrapped,
             100 * resident_fraction,
@@ -553,15 +580,23 @@ def estimate_offload_admission_bytes(
     checkpoints wrap nothing) in a supported layout — stacked 3-D tensors
     or per-expert ``.experts.<n>.<proj>.<field>`` names. Renamed layouts
     (Mixtral-style ``w1/w2/w3``) match neither and discount nothing. Each
-    layer's savings honor the runtime's minimum-eight capacity floor:
-    ``capacity = max(8, min(E, round(E * fraction)))``, so tiny fractions
+    layer's savings honor the runtime's routing-aware capacity floor:
+    ``capacity = min(E, max(8, top_k, round(E * fraction)))``, so tiny fractions
     do not under-report the resident share. Falls back to ``full_size`` on
     any failure — admission must never get more permissive by accident.
     """
+    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
+        return full_size
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
             return full_size
+        minimum = _minimum_experts(model_dir)
+        config_path = Path(model_dir) / "config.json"
+        if config_path.exists():
+            kind = json.loads(config_path.read_text()).get("model_type", "")
+            if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
+                return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the
@@ -613,14 +648,14 @@ def estimate_offload_admission_bytes(
             n = next(iter(b["e"]))
             if n <= 0:
                 continue
-            capacity = max(8, min(n, round(n * resident_fraction)))
+            capacity = min(n, max(minimum, round(n * resident_fraction)))
             saved += b["bytes"] * (1.0 - capacity / n)
         for b in per_expert.values():
             per_e = b["per_e"]
             if not per_e or any(not required <= s for s in per_e.values()):
                 continue  # any incomplete expert: the wrapper rejects the layer
             n = len(per_e)
-            capacity = max(8, min(n, round(n * resident_fraction)))
+            capacity = min(n, max(minimum, round(n * resident_fraction)))
             saved += b["bytes"] * (1.0 - capacity / n)
         if saved <= 0:
             return full_size

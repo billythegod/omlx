@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -431,6 +432,36 @@ def maybe_apply_pre_load_patches(
 
     Safe to call repeatedly; the patches are idempotent.
     """
+    from ..model_settings import validate_moe_expert_offload
+
+    if model_settings is not None:
+        validate_moe_expert_offload(
+            {
+                "moe_expert_offload_resident_fraction": getattr(
+                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                ),
+                **{
+                    key: getattr(model_settings, key, False)
+                    for key in (
+                        "moe_expert_offload_enabled",
+                        "mtp_enabled",
+                        "vlm_mtp_enabled",
+                        "dflash_enabled",
+                    )
+                },
+            }
+        )
+
+    if (
+        getattr(model_settings, "moe_expert_offload_enabled", False)
+        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+    ):
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        supported, reason = moe_offload_compatibility(model_name)
+        if not supported:
+            raise ValueError(reason)
+
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.

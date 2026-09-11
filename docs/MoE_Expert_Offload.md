@@ -59,22 +59,18 @@ residency.
 
 ## Supported models
 
-Targets any model whose MoE layers use upstream mlx-lm `SwitchGLU` with
-quantized expert projections (~40 model files: Qwen MoE families, Gemma
-MoE, Mixtral, Llama-4, Kimi, OLMoE, gpt-oss, and more), in both checkpoint
-layouts found in the wild — stacked `[num_experts, ...]` tensors, and the
-older one-tensor-per-expert layout that mlx-lm's `sanitize()` stacks at
-load. End-to-end verified on `gemma-4-26b-a4b-it-4bit` (stacked) and
-`OLMoE-1B-7B-0125-Instruct-4bit` (per-expert; 3.89 GB → 1.17 GB at 25%
-residency, generations bit-identical). Every layer is verified against the
-checkpoint (tensor names — all experts individually in the per-expert
-layout — shapes, storage dtypes, quantized projections) before wrapping;
-anything unmatched — non-quantized projections, fused `gate_up_proj`,
-per-expert `bias`, renamed projections such as Mixtral's `w1/w2/w3`,
-unknown quantization formats — is skipped with a logged reason and runs
-resident as before, so the failure mode for an unverified family is "no
-offload", never "wrong outputs". DeepSeek-V4 and GLM-5.2 use oMLX's native
-switch kernels and are a planned follow-up on the same store.
+The experimental toggle is available for `deepseek_v41`, `qwen4_exp`,
+`gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes
+validation. Dense Gemma models and other model types do not show the toggle.
+The settings API and model loader use the same eligibility check.
+
+The common adapter supports stacked `[num_experts, ...]` quantized
+`SwitchGLU` projections and the per-expert layout used by OLMoE conversions.
+All backbone layers must have the expected tensor names, shapes, storage
+dtypes, and quantization metadata. Fused or renamed projections, missing
+experts, unquantized weights, and per-expert linear bias are rejected.
+DeepSeek V4.1 has a separate adapter described below. DeepSeek V4 and
+GLM-5.3 are outside the current support list.
 
 When offload wraps layers, the Qwen gate/up fusion is skipped automatically:
 fusion rewrites stock expert weights in RAM, which cannot apply to experts
@@ -106,3 +102,51 @@ paraphrase-level forks, paired-entropy verdict clean, and labeled gsm8k
 (n=200) statistically indistinguishable (McNemar p = 0.61). The test suite
 (`tests/test_moe_expert_offload*.py`) encodes exactly this policy: bit-exact
 where the kernel path is identical, rounding-bounded where it is not.
+
+
+## DeepSeek V4.1
+
+DeepSeek V4.1 uses its own expert adapter and loader. Both the original
+checkpoint and oMLX converted MXFP/oQ checkpoints are supported. Expert
+weights stay in the existing safetensors files. The resident fraction applies
+to the routed experts in each backbone layer, with capacity floored at the
+number selected by one token. Shared experts, attention, and other backbone
+weights remain resident.
+
+For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
+preserves V4.1's activation quantization, clamped SwiGLU, and application of
+routing weights before the down projection. Large routed batches are split
+into bounded chunks; kernel rounding may differ from a fully resident run.
+
+Enable `moe_expert_offload_enabled` and set
+`moe_expert_offload_resident_fraction` to `0.125` in model settings. Engram
+storage is independent: `deepseek_v41_engram_ssd_offload` can be enabled at
+the same time. Memory admission, loaded-model accounting, and unload targets
+include the expert savings and the selected Engram storage mode.
+
+MoE offload cannot be combined with Lightning MTP (including DSpark), VLM
+MTP, or DFlash. Disable these before enabling offload. Settings and runtime
+validation reject conflicting combinations. V4.1 offload skips retained
+DSpark tensors even when the checkpoint includes them; the checkpoint is
+not modified. Disable offload and reload to use MTP again.
+
+GLM-5.3-Flash and the custom DeepSeek V4 expert kernels are not supported by
+this adapter. Unmatched modules remain resident, and unsupported custom
+model families receive no offload admission discount.
+
+## Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next checkpoints with `model_type: qwen4_exp` and stacked
+quantized `switch_mlp` projections use the common expert adapter. At 12.5%
+residency, a 512-expert checkpoint keeps 64 experts per layer; routing still
+selects the checkpoint's original top 10 experts per token. Shared experts
+remain resident, and large routed batches are processed in bounded chunks.
+
+Set `moe_expert_offload_enabled: true` and
+`moe_expert_offload_resident_fraction: 0.125` in the model's experimental
+settings. PLE SSD offload (`qwen4_ple_ssd_offload`) is independent and can be
+enabled alongside expert offload. The PLE automatic fallback decision and
+loaded-model memory accounting include expert savings without counting them
+twice. Lightning MTP, VLM MTP, and DFlash must be disabled. Checkpoints that
+include MTP weights can still be used; inactive MTP weights are omitted by
+the existing Qwen loader.
