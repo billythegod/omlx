@@ -58,6 +58,8 @@ _NEXTN_PREFIXES = (
 # ``block.`` (the decoder layer itself).
 _MTP_FUSION_KEYS = {
     "eh_proj.weight": "eh_proj.weight",
+    "eh_proj.scales": "eh_proj.scales",
+    "eh_proj.biases": "eh_proj.biases",
     "enorm.weight": "enorm.weight",
     "hnorm.weight": "hnorm.weight",
     "shared_head.norm.weight": "norm.weight",
@@ -331,16 +333,28 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
     original_call = cls.__call__
 
     def __call__(self, x, mask=None, cache=None, gdn_sink=None):
-        if gdn_sink is None or not self.is_linear:
+        if gdn_sink is None:
             return original_call(self, x, mask, cache)
-        # Mirror the stock body, passing the sink into the KDA attention. The
-        # FFN half is untouched (stateless, no recurrent state to roll back).
+        # Capture recurrent state only in KDA layers. Both attention families
+        # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
         xc, post, comb = self.attn_hc(x)
-        r = self.self_attn(
-            self.input_layernorm(xc), mask, cache, gdn_sink=gdn_sink
-        )
+        normed = self.input_layernorm(xc)
+        if self.is_linear:
+            r = self.self_attn(normed, mask, cache, gdn_sink=gdn_sink)
+        else:
+            r = self.self_attn(normed, mask, cache)
         x = g5_lang.hc_expand(r, residual, post, comb)
+        # Reuse the stock decode compiler. Larger prefill/batch shapes stay
+        # eager to avoid compiling the full MoE at unbounded token counts.
+        if (
+            self.compile_ffn
+            and x.shape[0] == 1
+            and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
+        ):
+            if self._ffn_c is None:
+                self._ffn_c = mx.compile(self._ffn_block)
+            return self._ffn_c(x)
         return self._ffn_block(x)
 
     cls.__call__ = __call__
@@ -392,7 +406,7 @@ def _patch_model_call(g5_lang: Any) -> None:
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            if gdn_sink is not None and layer.is_linear:
+            if gdn_sink is not None:
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
             else:
                 h = layer(h, mask=mask, cache=c)

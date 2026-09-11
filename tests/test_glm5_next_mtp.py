@@ -11,6 +11,7 @@ is shrunk so the routed MoE never allocates.
 from __future__ import annotations
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 pytest.importorskip("mlx_vlm.models.deepseek_v4")
@@ -151,9 +152,7 @@ def _raw_nextn_weights(config):
         PFX + "self_attn.indexer.index_kpool_compress_ape": _zeros(
             config.index_kpool, ihd
         ),
-        PFX + "self_attn.indexer.index_kpool_compress_gate": _zeros(
-            config.index_kpool, ihd
-        ),
+        PFX + "self_attn.indexer.index_kpool_compress_gate": _zeros(ihd, h),
         PFX + "mlp.gate.weight": _zeros(experts, h),
         PFX + "mlp.gate.e_score_correction_bias": _zeros(experts),
         "model.language_model.layers.0.input_layernorm.weight": _zeros(h),
@@ -238,6 +237,39 @@ def test_sanitize_binds_the_nextn_layer_exactly(applied, config):
     assert not [k for k in produced if ".mlp.experts." in k]
     assert not [k for k in out if "shared_head.head" in k]
     assert "model.language_model.layers.0.input_layernorm.weight" in out
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("prefix", glm5_next_vlm_runtime._NEXTN_PREFIXES)
+def test_sanitize_loads_quantized_nextn_fusion(applied, config, bits, prefix):
+    """Quantized nextn fusion loads and survives a converted-head reload."""
+    source = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+    source = nn.QuantizedLinear.from_linear(source, group_size=64, bits=bits)
+    weights = _raw_nextn_weights(config)
+    weights.pop(PFX + "eh_proj.weight")
+    for name, value in source.parameters().items():
+        weights[PFX + "eh_proj." + name] = value
+    source_prefix = prefix.format(i=N_MAIN)
+    weights = {
+        source_prefix + key[len(PFX):] if key.startswith(PFX) else key: value
+        for key, value in weights.items()
+    }
+    sanitized = applied.LanguageModel.sanitize(_Host(config), weights)
+    block = applied.Glm5NextMTPBlock(config)
+    block.eh_proj = nn.QuantizedLinear.from_linear(
+        block.eh_proj, group_size=64, bits=bits
+    )
+    inputs = mx.ones((1, 2, 2 * config.hidden_size))
+    for checkpoint in (
+        sanitized,
+        applied.LanguageModel.sanitize(_Host(config), sanitized),
+    ):
+        block.load_weights(
+            [(key[len("mtp.0."):], value)
+             for key, value in checkpoint.items() if key.startswith("mtp.0.")],
+            strict=True,
+        )
+        assert mx.array_equal(block.eh_proj(inputs), source(inputs)).item()
 
 
 def test_sanitize_preserves_an_already_converted_head(applied, config):
@@ -559,3 +591,35 @@ def test_rollback_refuses_when_the_capture_is_short(applied, config, monkeypatch
         )
 
     assert sparse.trimmed == [], "no layer may be trimmed once the capture is short"
+
+
+@pytest.mark.parametrize("layer_idx", [0, 3])
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_verify_compiled_ffn_matches_eager(applied, config, layer_idx, width):
+    layer = applied.Glm5NextDecoderLayer(config, layer_idx)
+    layer.eval()
+    x = mx.random.normal((1, width, config.hc_mult, config.hidden_size))
+    layer.compile_ffn = False
+    eager_sink = []
+    expected = layer(x, gdn_sink=eager_sink)
+    mx.eval(expected)
+
+    layer.compile_ffn = True
+    compiled_sink = []
+    actual = layer(x, gdn_sink=compiled_sink)
+    mx.eval(actual)
+
+    assert layer._ffn_c is not None
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    assert len(compiled_sink) == len(eager_sink) == int(layer.is_linear)
+
+
+@pytest.mark.parametrize(
+    "batch,width,verify", [(2, 4, True), (1, 9, True), (1, 4, False)]
+)
+def test_verify_ffn_compilation_stays_bounded(applied, config, batch, width, verify):
+    layer = applied.Glm5NextDecoderLayer(config, 0)
+    layer.eval()
+    x = mx.zeros((batch, width, config.hc_mult, config.hidden_size))
+    mx.eval(layer(x, gdn_sink=[] if verify else None))
+    assert layer._ffn_c is None
