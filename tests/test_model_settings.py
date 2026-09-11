@@ -668,6 +668,21 @@ class TestModelSettingsManager:
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
+    @pytest.mark.parametrize("budget", [None, 0, 1])
+    @pytest.mark.parametrize("enabled", [None, True, False])
+    def test_budget_respects_explicit_thinking_mode(self, budget, enabled):
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        kwargs = {} if enabled is None else {"enable_thinking": enabled}
+        expected = {"enable_thinking": True} if not kwargs and budget == 1 else kwargs
+        assert merge_chat_template_kwargs(None, kwargs, thinking_budget=budget) == expected
+
+    def test_zero_thinking_budget_does_not_enable_thinking(self):
+        """Zero means no thinking budget activation at template-render time."""
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        assert merge_chat_template_kwargs(None, thinking_budget=0) == {}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading

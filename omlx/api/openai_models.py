@@ -355,6 +355,8 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Top-level alias used by OpenAI-compatible clients.
+    enable_thinking: Optional[bool] = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
     # Numbers stay numbers: models like Inkling take a numeric effort
     # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat
@@ -378,6 +380,22 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def normalize_top_level_enable_thinking(self) -> "ChatCompletionRequest":
+        """Preserve the alias and reject contradictory request controls."""
+        if self.enable_thinking is None:
+            return self
+        template_kwargs = dict(self.chat_template_kwargs or {})
+        if "enable_thinking" in template_kwargs and (
+            template_kwargs["enable_thinking"] is not self.enable_thinking
+        ):
+            raise ValueError(
+                "enable_thinking conflicts with chat_template_kwargs.enable_thinking"
+            )
+        template_kwargs["enable_thinking"] = self.enable_thinking
+        self.chat_template_kwargs = template_kwargs
+        return self
 
 
 class AssistantMessage(BaseModel):
