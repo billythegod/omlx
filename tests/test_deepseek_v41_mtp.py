@@ -179,3 +179,58 @@ def test_acceptance_depth_is_independent_of_timing():
         assert not a.should_exit() and not b.should_exit()
         depths.append(a.cur)
     assert depths == [1, 2, 3, 3, 2, 1, 2, 3, 3]
+
+
+@pytest.mark.parametrize("cached_tokens", [0, 8])
+@pytest.mark.parametrize("has_active_prompt", [False, True])
+def test_second_request_prefix_preparation_preserves_dspark_owner(
+    cached_tokens, has_active_prompt
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = LanguageModel(mtp_config())
+    load_reference_weights(model)
+    model.configure_mtp(True, 3)
+    adapter = VLMModelAdapter(
+        SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), language_model=model
+        )
+    )
+    first_cache = model.make_cache()
+    if has_active_prompt:
+        model(mx.array([[3, 4, 5]]), cache=first_cache)
+    before = getattr(model, "_omlx_mtp_prime_ctx", None)
+    sidecar = Mock(block_size=8)
+    assert not prompt_priming.prepare_prefix_context(
+        adapter,
+        request_id="second",
+        prompt_tokens=list(range(3, 16)),
+        cached_tokens=cached_tokens,
+        prefix_cache=sidecar,
+    )
+    assert getattr(model, "_omlx_mtp_prime_ctx", None) is before
+    assert getattr(model, "_omlx_mtp_prime_plan", None) is None
+    sidecar.restore_mtp_prefix_snapshot.assert_not_called()
+    if has_active_prompt:
+        model(mx.array([[6]]), cache=first_cache, return_hidden=True)
+        primed = prompt_priming.take_primed(adapter, first_cache, mx.array([6]))
+        assert primed is not None
+        assert primed[1] == 3
+
+    # The second request captures its own uncached suffix at the restored offset.
+    second_cache = model.make_cache()
+    if cached_tokens:
+        model(
+            mx.array([list(range(3, 3 + cached_tokens))]),
+            cache=second_cache,
+            return_hidden=True,
+        )
+    model(mx.array([[20, 21]]), cache=second_cache)
+    model(mx.array([[22]]), cache=second_cache, return_hidden=True)
+    primed = prompt_priming.take_primed(adapter, second_cache, mx.array([22]))
+    assert primed is not None
+    assert primed[1] == cached_tokens + 2

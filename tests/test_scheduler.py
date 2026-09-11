@@ -28,6 +28,7 @@ from mlx_lm.models.cache import CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
+from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
@@ -7135,6 +7136,24 @@ class TestSupportsSkipLmHead:
         assert scheduler._supports_skip_lm_head() is True
         # Result is cached on the instance.
         assert scheduler._skip_lm_head_supported is True
+
+    @pytest.mark.parametrize(
+        "model_type, expected", [("deepseek_v41", False), ("qwen4_exp", True)]
+    )
+    def test_vlm_capability_controls_prefill_skip_and_log(
+        self, model_type, expected, caplog
+    ):
+        adapter = VLMModelAdapter(
+            SimpleNamespace(
+                config=SimpleNamespace(model_type=model_type),
+                language_model=SimpleNamespace(),
+            )
+        )
+        scheduler = self._scheduler_with_model(adapter)
+        with caplog.at_level("INFO", logger="omlx.scheduler"):
+            assert scheduler._supports_skip_lm_head() is expected
+            assert scheduler._supports_skip_lm_head() is expected
+        assert caplog.text.count("Prefill lm_head skip enabled") == int(expected)
 
     def test_rejects_stock_model(self):
         class StockModel:
