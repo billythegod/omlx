@@ -955,9 +955,9 @@ def test_ced_preserves_encoder_and_global_kv_bitwise():
     ids = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
     co, cn = off.make_cache(), on.make_cache()
     off(ids, cache=co)
-    ln = np.asarray(on(ids, cache=cn)[:, -1])
+    ln = np.asarray(on._omlx_prefill(ids, cache=cn)[:, -1])
     # Determinism: two CED runs are bit-identical.
-    ln2 = np.asarray(on(ids, cache=on.make_cache())[:, -1])
+    ln2 = np.asarray(on._omlx_prefill(ids, cache=on.make_cache())[:, -1])
     np.testing.assert_array_equal(ln, ln2)
     # Encoder caches are untouched by CED.
     for i in range(3):
@@ -977,19 +977,17 @@ def test_ced_preserves_encoder_and_global_kv_bitwise():
 def test_ced_inactive_within_window_is_bitwise_full_compute():
     off, on = ced_pair()
     ids = mx.array([[5, 9, 3, 12, 20, 7]])
-    ln = np.asarray(on(ids, cache=on.make_cache()))
-    # Length 6 > window 4: CED is active. Skipped positions carry zero
-    # logits; the tail is finite and differs from full compute (bounded
-    # replay truncates early tail queries' windows by design).
-    np.testing.assert_array_equal(ln[:, :2], np.zeros((1, 2, ln.shape[-1])))
-    assert np.isfinite(ln[:, 2:]).all()
+    ln = np.asarray(on._omlx_prefill(ids, cache=on.make_cache()))
+    # Cache-only prefill returns computed tail logits, not fabricated zeros.
+    assert ln.shape == (1, 4, 64)
+    assert np.isfinite(ln).all()
     lo = np.asarray(off(ids, cache=off.make_cache()))
     assert not np.allclose(lo[:, -1], ln[:, -1])
     # A sequence within the window stays on the full-compute path bitwise.
     short = mx.array([[5, 9, 3, 12]])
     np.testing.assert_array_equal(
         np.asarray(off(short, cache=off.make_cache())),
-        np.asarray(on(short, cache=on.make_cache())),
+        np.asarray(on._omlx_prefill(short, cache=on.make_cache())),
     )
 
 
@@ -997,16 +995,17 @@ def test_ced_chunked_continuity_and_decode_seam():
     _, on = ced_pair()
     full = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
     ca = on.make_cache()
-    first = np.asarray(on(full[:, :6], cache=ca))
-    second = np.asarray(on(full[:, 6:], cache=ca))
-    assert first.shape[1] == 6 and second.shape[1] == 4
+    first = np.asarray(on._omlx_prefill(full[:, :6], cache=ca))
+    second = np.asarray(on._omlx_prefill(full[:, 6:], cache=ca))
+    assert first.shape[1] == second.shape[1] == 4
     decoded = np.asarray(on(mx.array([[11]]), cache=ca))[:, -1]
     assert np.isfinite(decoded).all()
     for i in (3, 4, 5):
         assert ca[i].size() == 11
         assert ca[i][1].shape[1] == 4
-    # Chunked CED ends with the same trailing window as one CED pass.
+    # A short suffix extends the contiguous replay window normally.
     cb = on.make_cache()
-    on(full, cache=cb)
+    on._omlx_prefill(full[:, :6], cache=cb)
+    on(full[:, 6:], cache=cb)
     solo = np.asarray(on(mx.array([[11]]), cache=cb))[:, -1]
     np.testing.assert_array_equal(decoded, solo)

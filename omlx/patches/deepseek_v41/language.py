@@ -947,17 +947,15 @@ class LanguageModel(DSparkMixin, nn.Module):
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
             shared = {}
-            # CED prefill: the decoder half replays only the trailing
-            # window of the sequence. The gate is absolute (cache offset +
-            # chunk length) so chunk boundaries never leak stale decoder
-            # windows; decode steps and DSpark verify blocks stay on the
-            # normal path.
+            # Only cache-only scheduler calls may omit decoder logits. A short
+            # contiguous suffix retains its existing window rather than
+            # pretending that a full replay window was present in this chunk.
             ced_tail = (
                 c.window_size
                 if c.ced_prefill
+                and kwargs.get("_ced_prefill", False)
                 and verify_states is None
-                and end - begin > 1
-                and start + end - begin > c.window_size
+                and end - begin > c.window_size
                 else None
             )
             ced_mid = c.n_layers // 2
@@ -1012,14 +1010,14 @@ class LanguageModel(DSparkMixin, nn.Module):
                             )
                     rows[i].append(rc[i])
             logits = project_logits(self.norm(hc_pre(h, pre)), self.head.weight)
-            # CED skipped decoder positions keep zero logits; they are never
-            # sampled (only the final position of the final chunk is used).
+            # The scheduler discards this tail-only result. Ordinary forward
+            # calls still return real logits for every input token.
             results.append(
                 mx.pad(
                     logits,
                     [
                         (0, 0),
-                        (end - logits.shape[1], input_ids.shape[1] - end),
+                        (begin, input_ids.shape[1] - end),
                         (0, 0),
                     ],
                 )
@@ -1035,6 +1033,7 @@ class LanguageModel(DSparkMixin, nn.Module):
             ):
                 raise ValueError("Incomplete DSpark target hidden capture")
             return logits, mx.concatenate(
-                [captured[i] for i in c.dspark_target_layer_ids], axis=-1
+                [captured[i][:, -logits.shape[1] :] for i in c.dspark_target_layer_ids],
+                axis=-1,
             )
         return logits
