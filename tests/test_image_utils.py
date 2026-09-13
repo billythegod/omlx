@@ -3,6 +3,9 @@
 
 import base64
 import io
+import struct
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -606,3 +609,140 @@ class TestLoadImageDecodeCache:
         warm = load_image(uri)
         assert cold.mode == warm.mode == "RGB"
         assert cold.tobytes() == warm.tobytes()
+
+
+class TestDecodeCacheFollowup:
+    @pytest.fixture(autouse=True)
+    def isolate_cache(self):
+        from omlx.utils.image import clear_image_decode_cache
+
+        clear_image_decode_cache()
+        yield
+        clear_image_decode_cache()
+
+    def test_rgb_storage_budget_evicts_at_four_bytes_per_pixel(self, monkeypatch):
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(
+            module,
+            "_IMAGE_DECODE_CACHE_MAX_BYTES",
+            (4 * 24 * 24 + 24 * struct.calcsize("P")),
+        )
+        sources = [
+            "data:image/png;base64," + _image_to_base64(_unique_image(seed))
+            for seed in (91, 92)
+        ]
+        load_image(sources[0])
+        assert module._image_decode_cache_bytes == (
+            4 * 24 * 24 + 24 * struct.calcsize("P")
+        )
+        load_image(sources[1])
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            load_image(sources[0])
+        assert opened.call_count == 1
+
+    def test_over_capacity_history_preserves_hits_and_image_order(self, monkeypatch):
+        from omlx.utils import image as module
+
+        # Three screenshots with room for only two decoded images.
+        monkeypatch.setattr(
+            module,
+            "_IMAGE_DECODE_CACHE_MAX_BYTES",
+            2 * (4 * 24 * 24 + 24 * struct.calcsize("P")),
+        )
+        originals = [_unique_image(seed) for seed in (101, 102, 103)]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64," + _image_to_base64(img)
+                        },
+                    },
+                ],
+            }
+            for img in originals
+        ]
+        extract_images_from_messages(messages)
+        for _ in range(3):
+            with patch.object(Image, "open", wraps=Image.open) as opened:
+                text, images, audio = extract_images_from_messages(messages)
+            assert opened.call_count == 1
+            assert [img.tobytes() for img in images] == [
+                img.tobytes() for img in originals
+            ]
+            assert text == [{"role": "user", "content": "Describe"}] * 3
+            assert audio == []
+            assert module._image_decode_cache_bytes <= 2 * (
+                4 * 24 * 24 + 24 * struct.calcsize("P")
+            )
+
+    def test_clear_during_decode_does_not_repopulate_cache(self):
+        from omlx.utils import image as module
+
+        entered, resume = Event(), Event()
+        original = _unique_image(201)
+        source = "data:image/png;base64," + _image_to_base64(original)
+        real_open = Image.open
+
+        def blocked_open(*args, **kwargs):
+            entered.set()
+            assert resume.wait(5)
+            return real_open(*args, **kwargs)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                with patch.object(Image, "open", side_effect=blocked_open):
+                    future = pool.submit(load_image, source)
+                    assert entered.wait(5)
+                    module.clear_image_decode_cache()
+                    resume.set()
+                    image = future.result(timeout=5)
+            finally:
+                resume.set()
+        assert image.tobytes() == original.tobytes()
+        assert not module._image_decode_cache
+        assert module._image_decode_cache_bytes == 0
+        load_image(source)
+        assert module._image_decode_cache
+
+    def test_concurrent_duplicate_inserts_keep_exact_budget(self):
+        from omlx.utils import image as module
+
+        barrier = Barrier(4)
+        real_open = Image.open
+        original = _unique_image(301)
+        source = "data:image/png;base64," + _image_to_base64(original)
+
+        def concurrent_open(*args, **kwargs):
+            barrier.wait(timeout=5)
+            return real_open(*args, **kwargs)
+
+        with (
+            patch.object(Image, "open", side_effect=concurrent_open),
+            ThreadPoolExecutor(max_workers=4) as pool,
+        ):
+            images = list(pool.map(load_image, [source] * 4))
+        assert all(image.tobytes() == original.tobytes() for image in images)
+        assert len(module._image_decode_cache) == 1
+        assert module._image_decode_cache_bytes == (
+            4 * 24 * 24 + 24 * struct.calcsize("P")
+        )
+
+    def test_oversized_image_is_returned_without_evicting_existing_hit(
+        self, monkeypatch
+    ):
+        from omlx.utils import image as module
+
+        monkeypatch.setattr(module, "_IMAGE_DECODE_CACHE_MAX_BYTES", 2500)
+        small = "data:image/png;base64," + _image_to_base64(_unique_image(401))
+        large = "data:image/png;base64," + _image_to_base64(_unique_image(402, 48, 48))
+        load_image(small)
+        assert load_image(large).size == (48, 48)
+        with patch.object(Image, "open", wraps=Image.open) as opened:
+            load_image(small)
+        assert opened.call_count == 0
+        assert len(module._image_decode_cache) == 1
