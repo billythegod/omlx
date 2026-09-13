@@ -148,6 +148,7 @@ class HumanEvalBenchmark(BaseBenchmark):
     name = "humaneval"
     quick_size = 100
     auto_detect_thinking = False
+    blocking_scoring = True
     expected_label = "(unit tests)"
     predicted_max_chars = 200
 

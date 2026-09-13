@@ -3,6 +3,9 @@
 
 import asyncio
 import contextlib
+import importlib
+import os
+import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -96,8 +99,12 @@ def _code_benchmark(cls, monkeypatch) -> BaseBenchmark:
     monkeypatch.setattr(
         bench, "format_prompt", lambda item: [{"role": "user", "content": item["id"]}]
     )
-    monkeypatch.setattr(bench, "extract_answer", lambda response, item: response.strip())
-    monkeypatch.setattr(bench, "check_answer", lambda predicted, item: predicted.startswith("A"))
+    monkeypatch.setattr(
+        bench, "extract_answer", lambda response, item: response.strip()
+    )
+    monkeypatch.setattr(
+        bench, "check_answer", lambda predicted, item: predicted.startswith("A")
+    )
     return bench
 
 
@@ -285,3 +292,181 @@ async def test_code_benchmarks_do_not_auto_switch_thinking(cls, monkeypatch):
     assert result.thinking_used is False
     assert [c["thinking"] for c in engine.calls] == [False]
 
+
+@pytest.mark.parametrize("cls", CODE_BENCHMARKS)
+async def test_slow_scoring_keeps_generation_running(cls, monkeypatch):
+    bench = _code_benchmark(cls, monkeypatch)
+    engine = _GatedEngine()
+    loop = asyncio.get_running_loop()
+    scoring_started = asyncio.Event()
+    release_score = threading.Event()
+    scored = []
+
+    def check(predicted, item):
+        scored.append(item["id"])
+        if item["id"] == "q0":
+            loop.call_soon_threadsafe(scoring_started.set)
+            assert release_score.wait(2)
+        return True
+
+    monkeypatch.setattr(bench, "check_answer", check)
+    async with _running(bench.run(engine, _items(5), batch_size=2)) as run:
+        try:
+            await engine.wait_started("q0", "q1")
+            engine.release("q0")
+            await asyncio.wait_for(scoring_started.wait(), WAIT)
+            engine.release("q1", "q2")
+            await engine.wait_started("q3", "q4")
+            assert scored == ["q0"]
+            assert not run.done()
+        finally:
+            release_score.set()
+        engine.release("q3", "q4")
+        result = await asyncio.wait_for(run, WAIT)
+    assert result.correct_count == 5
+    assert sorted(scored) == [f"q{i}" for i in range(5)]
+    assert engine.max_in_flight == 2
+
+
+@pytest.mark.parametrize("cls", CODE_BENCHMARKS)
+@pytest.mark.parametrize("score_raises", [False, True])
+async def test_cancel_during_scoring_drains_only_current_score(
+    cls, score_raises, monkeypatch
+):
+    bench = _code_benchmark(cls, monkeypatch)
+    engine = _GatedEngine()
+    loop = asyncio.get_running_loop()
+    scoring_started = asyncio.Event()
+    release_score = threading.Event()
+    score_finished = threading.Event()
+    generation_cancelled = asyncio.Event()
+    release_generation = asyncio.Event()
+    scored = []
+    progress = []
+    original_chat = engine.chat
+
+    async def chat(*args, **kwargs):
+        try:
+            return await original_chat(*args, **kwargs)
+        except asyncio.CancelledError:
+            generation_cancelled.set()
+            await release_generation.wait()
+            raise
+
+    async def on_progress(current, total):
+        progress.append(current)
+
+    def check(predicted, item):
+        scored.append(item["id"])
+        loop.call_soon_threadsafe(scoring_started.set)
+        try:
+            assert release_score.wait(2)
+            if score_raises:
+                raise RuntimeError("Scoring failed during cancellation")
+            return True
+        finally:
+            score_finished.set()
+
+    monkeypatch.setattr(engine, "chat", chat)
+    monkeypatch.setattr(bench, "check_answer", check)
+    async with _running(bench.run(engine, _items(4), on_progress, batch_size=2)) as run:
+        try:
+            await engine.wait_started("q0", "q1")
+            engine.release("q0")
+            await asyncio.wait_for(scoring_started.wait(), WAIT)
+            run.cancel()
+            await asyncio.wait_for(generation_cancelled.wait(), WAIT)
+            assert not run.done()
+            assert not score_finished.is_set()
+            # A repeated UI cancel must not detach the scoring subprocess.
+            run.cancel()
+            await asyncio.sleep(0)
+            assert not run.done()
+        finally:
+            release_generation.set()
+            release_score.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, WAIT)
+    assert score_finished.is_set()
+    assert scored == ["q0"]
+    assert progress == []
+    assert engine.in_flight == set()
+
+
+@pytest.mark.parametrize("cls", CODE_BENCHMARKS)
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_real_code_scoring_subprocess_cleanup(cls, cancel, monkeypatch, tmp_path):
+    bench = cls()
+    module = importlib.import_module(cls.__module__)
+    marker = tmp_path / "started"
+    release = tmp_path / "release"
+    body = (
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+        f"while not pathlib.Path({str(release)!r}).exists():\n"
+        "    time.sleep(0.005)\n"
+    )
+    if cls is LiveCodeBenchBenchmark:
+        code = body + "print(1)\n"
+        item = dict(description="q0", inputs=[""], outputs=["1"])
+    else:
+        code = (
+            "def solve():\n"
+            + "".join("    " + line + "\n" for line in body.splitlines())
+            + "    return 1\n"
+        )
+        if cls is HumanEvalBenchmark:
+            item = dict(
+                prompt="def solve():\n",
+                test="def check(candidate):\n    assert candidate() == 1",
+                entry_point="solve",
+            )
+        else:
+            item = dict(text="q0", test_list=["assert solve() == 1"])
+    item["id"] = "q0"
+    engine = _GatedEngine(lambda qid, thinking: code)
+    monkeypatch.setattr(
+        bench, "format_prompt", lambda item: [{"role": "user", "content": item["id"]}]
+    )
+    temp_files = []
+    original_temp = module.tempfile.NamedTemporaryFile
+
+    def tracked_temp(*args, **kwargs):
+        result = original_temp(*args, **kwargs)
+        temp_files.append(result.name)
+        return result
+
+    monkeypatch.setattr(module.tempfile, "NamedTemporaryFile", tracked_temp)
+
+    async def wait_for_file():
+        while not marker.exists() or not marker.read_text():
+            await asyncio.sleep(0.005)
+
+    async with _running(
+        bench.run(engine, [item, dict(item, id="q1")], batch_size=2)
+    ) as run:
+        try:
+            await engine.wait_started("q0", "q1")
+            engine.release("q0")
+            await asyncio.wait_for(wait_for_file(), 2)
+            pid = int(marker.read_text())
+            os.kill(pid, 0)
+            if cancel:
+                run.cancel()
+                await asyncio.sleep(0.01)
+                assert not run.done()
+                assert engine.in_flight == set()
+            else:
+                engine.release("q1")
+        finally:
+            release.touch()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, 2)
+        else:
+            result = await asyncio.wait_for(run, 2)
+            assert result.correct_count == 2
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert temp_files
+    assert all(not os.path.exists(path) for path in temp_files)

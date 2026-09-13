@@ -110,6 +110,7 @@ class MBPPBenchmark(BaseBenchmark):
     name = "mbpp"
     quick_size = 200
     auto_detect_thinking = False
+    blocking_scoring = True
     expected_label = "(test cases)"
     predicted_max_chars = 200
 

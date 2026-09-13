@@ -66,6 +66,8 @@ class BaseBenchmark(ABC):
     # Result rendering: fixed "expected" label and a cap on the predicted text.
     expected_label: Optional[str] = None
     predicted_max_chars: Optional[int] = None
+    # Code execution blocks; keep it off the engine event loop.
+    blocking_scoring: bool = False
 
     @abstractmethod
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:
@@ -370,6 +372,7 @@ class BaseBenchmark(ABC):
         workers = [
             asyncio.create_task(worker()) for _ in range(min(batch_size, total))
         ]
+        scoring_task: asyncio.Task[QuestionResult] | None = None
         try:
             while len(results) < total:
                 message = await done.get()
@@ -392,15 +395,38 @@ class BaseBenchmark(ABC):
                         todo.put_nowait(stale)
                     results.clear()
                     continue
-                results[idx] = self._question_result(
-                    idx, item, response_text, prompt_text, diagnostics, elapsed
-                )
+                args = (idx, item, response_text, prompt_text, diagnostics, elapsed)
+                if self.blocking_scoring:
+                    scoring_task = asyncio.create_task(
+                        asyncio.to_thread(self._question_result, *args)
+                    )
+                    results[idx] = await asyncio.shield(scoring_task)
+                    scoring_task = None
+                else:
+                    results[idx] = self._question_result(*args)
                 if on_progress:
                     await on_progress(len(results), total)
         finally:
             for task in workers:
                 task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+
+            async def drain() -> None:
+                await asyncio.gather(*workers, return_exceptions=True)
+                # Cancelling to_thread does not stop its subprocess. Drain the
+                # current score before leaving; never start another score here.
+                if scoring_task is not None:
+                    await asyncio.gather(scoring_task, return_exceptions=True)
+
+            cleanup = asyncio.create_task(drain())
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # Repeated cancellation must not detach cleanup work.
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError()
 
         ordered = [results[idx] for idx in range(total)]
         correct = sum(1 for r in ordered if r.correct)
