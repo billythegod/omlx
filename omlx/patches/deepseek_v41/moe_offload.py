@@ -346,7 +346,7 @@ class _ExpertSlots:
         at most ``INFLIGHT_BYTES`` of payload ahead of the installs; the
         second installs them serially in the order the misses were seen, so
         eviction victims, counters and resident bytes match a serial fetch
-        exactly. A failed read or decode leaves the cache as it was, and
+        exactly. A failed read or decode leaves completed installs intact, and
         every read this call started is drained before it raises.
         """
         needed = list(dict.fromkeys(ids))
@@ -362,7 +362,6 @@ class _ExpertSlots:
                 misses.append(expert)
         protected = set(needed)
         pending = {}
-        started = []
         window = max(1, INFLIGHT_BYTES // max(1, self.plan.expert_bytes))
         submitted = 0
 
@@ -374,9 +373,10 @@ class _ExpertSlots:
                 pending[expert] = []
                 for proj in _PROJECTIONS:
                     slabs = self.plan.slabs(self.prefix, proj, expert)
-                    futures = [_EXPERT_IO_POOL.submit(self.plan.read, s) for s in slabs]
-                    started.extend(futures)
+                    futures = []
                     pending[expert].append((proj, slabs, futures))
+                    for slab in slabs:
+                        futures.append(_EXPERT_IO_POOL.submit(self.plan.read, slab))
 
         try:
             submit(window)
@@ -385,10 +385,11 @@ class _ExpertSlots:
                 # experts' bytes exist at once, counting the one written here.
                 submit(done + window)
                 arrays, nbytes = {}, 0
-                for proj, slabs, futures in pending.pop(expert):
+                for proj, slabs, futures in pending[expert]:
                     raws = [future.result() for future in futures]
                     arrays[proj] = self.plan.decode(slabs, raws)
                     nbytes += sum(slab.nbytes for slab in slabs)
+                    del raws, futures
                 slot = (
                     self.free.pop()
                     if self.free
@@ -407,10 +408,14 @@ class _ExpertSlots:
                 self.slot_of[expert] = slot
                 self.misses += 1
                 self.fetched_bytes += nbytes
+                # Completed futures own their payloads; release them before refill.
+                del pending[expert]
         finally:
-            for future in started:
-                if not future.cancel():
-                    future.exception()
+            for projections in pending.values():
+                for _, _, futures in projections:
+                    for future in futures:
+                        if not future.cancel():
+                            future.exception()
         return [self.slot_of[e] for e in ids]
 
 

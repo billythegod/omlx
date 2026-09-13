@@ -1,6 +1,7 @@
 """V4.1 expert residency preserves routing, projection arithmetic and loading."""
 
 import json
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
@@ -537,3 +538,38 @@ def test_admission_and_fit_match_the_engine_pool(tmp_path, engram):
         assert fit_resident_fraction(
             target, expected - 1, engram_ssd_offload=engram
         ) == ((capacity - 1) / 8 if capacity > 2 else None)
+
+
+@pytest.mark.parametrize("window_experts", [1, 2])
+def test_consumed_read_buffers_are_released_within_window(
+    tmp_path, monkeypatch, window_experts
+):
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 1.0)
+    budget = window_experts * plan.expert_bytes
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", budget)
+    refs, samples = [], []
+    original_decode = plan.decode
+
+    class TrackedBuffer(bytearray):
+        pass
+
+    def allocate(size):
+        buffer = TrackedBuffer(size)
+        refs.append((weakref.ref(buffer), size))
+        return buffer
+
+    def decode(slabs, raws):
+        samples.append(sum(size for ref, size in refs if ref() is not None))
+        return original_decode(slabs, raws)
+
+    monkeypatch.setattr(moe_offload, "bytearray", allocate, raising=False)
+    monkeypatch.setattr(plan, "decode", decode)
+    try:
+        disk.slots.ensure_ids(list(range(plan.count)))
+        assert disk.slots.misses == plan.count
+        assert max(samples) <= budget
+        assert all(ref() is None for ref, _ in refs)
+    finally:
+        plan.close()
