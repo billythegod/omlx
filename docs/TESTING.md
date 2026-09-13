@@ -53,7 +53,10 @@ Engram storage and prefetch lifecycle: `python -m pytest tests/test_deepseek_v41
 V4.1 expert reads, MXFP4/MXFP8 and mixed-bit affine arithmetic, repeated
 evictions, sorted routes, load/inference thread separation, Engram coexistence,
 draft-weight exclusion, and memory estimates. The load probe rejects whole
-expert reads from shared shards. Run alongside `test_deepseek_v41_offload.py`,
+expert reads from shared shards and any expert slab read through the Engram
+mapping. Further cases pin the serial LRU order under concurrent reads,
+expert-boundary chunking of sorted routes, and the fit-to-budget residency
+helper against the admission arithmetic. Run alongside `test_deepseek_v41_offload.py`,
 `test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
 `node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
 save/reopen payload and speculative-decoding toggle exclusion.

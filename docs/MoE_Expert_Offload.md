@@ -113,6 +113,81 @@ to the routed experts in each backbone layer, with capacity floored at the
 number selected by one token. Shared experts, attention, and other backbone
 weights remain resident.
 
+Non-resident experts are read with positional `pread` calls on a small
+reader pool of their own, not through the Engram row-gather mapping: an
+expert is megabytes of contiguous bytes, and a faulting `MADV_RANDOM` gather
+reads it one page at a time. A residency update starts the misses' reads
+ahead of the installs, at most 512 MiB of payload in flight, and installs
+them serially in the order the misses were seen, so eviction victims, hit
+and miss counts, and resident bytes are identical to a serial fetch. Sorted
+prefill routes are chunked on expert boundaries (every route of up to
+`capacity` distinct experts per chunk), so a prefill reads each expert once
+per layer and runs one kernel per chunk.
+
+Measured on a synthetic checkpoint with the oQ3e expert geometry (384
+experts, 3-bit affine, 14.8 MiB per expert, 4 layers, random weights),
+cold reads from the internal SSD of an M5 Max, 12.5% residency:
+
+| | mmap gather (before) | positional reads |
+|---|---:|---:|
+| decode, one token, per MoE layer | 362 ms | 9.1 ms |
+| expert fetch throughput | 0.23 GB/s | 9.3 GB/s |
+| sorted prefill, 256 tokens | 33 token-layers/s | 568 token-layers/s |
+
+These are single runs of adapter-level calls on synthetic weights; they
+exclude attention, Engram, and the rest of the forward.
+
+### Measured on a 128 GB Mac
+
+`Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp` on an M5 Max with 128 GB and the
+internal SSD (`iogpu.wired_limit_mb` unset), Engram on SSD, native kernels
+built, run with `benchmarks/deepseek_v41_offload_bench.py` on a 433-token
+prose prompt in one prefill chunk followed by 64 greedy tokens. Single runs:
+
+| residency | experts per layer | load | Metal active | peak footprint | prefill | decode | decode hit rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12.5% | 48 | 3.9 s | 38.0 GiB | 49.6 GiB | 28 tok/s | 5.6 tok/s | 0.69 |
+| 25% | 96 | 4.5 s | 65.7 GiB | 77.4 GiB | 25 tok/s | 4.2 tok/s | 0.78 |
+
+Both settings produce coherent, on-topic continuations. Served through
+`omlx serve` with the same settings (discovered from the HF cache, Engram
+forced to SSD by admission, 12.5% residency, engine load 4.4 s), two
+64-token chat completions ran at 2.7 tok/s on cold expert slots and
+4.1 tok/s after. Prefill reads every
+expert the prompt routes to once per layer (about 226 of 384 per layer for
+this prompt, 130 GiB in total) at 8 to 9 GB/s. Decode is bound by miss
+latency at one to two misses per layer per token. The lower residency
+decodes faster: the RAM the resident slots do not take is used by the page
+cache, which serves repeated misses far faster than the SSD (6.5 GB/s
+effective at 12.5% against 3.4 GB/s at 25%). On a 128 GB machine 12.5% is
+the better default. Expect the page cache to take all remaining RAM during
+a run; it is reclaimable and is not part of the Metal working-set limit.
+Higher residencies fit the limit on paper (`fit_resident_fraction` reports
+41% at 107.5 GiB) but leave no headroom for the KV cache and prefill
+transients, and were not measured.
+
+### Sizing on a 128 GB Mac
+
+For `Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp`, the shard headers give 221.5 GiB
+of routed experts, 91.9 GiB of Engram tables, 7.5 GiB of DSpark draft
+weights (not loaded under offload), and 10.1 GiB of everything else. With
+Engram on SSD the resident set is:
+
+| resident fraction | experts per layer | resident weights |
+|---:|---:|---:|
+| 12.5% | 48 | 38 GiB |
+| 25% | 96 | 65 GiB |
+| 33.3% | 128 | 84 GiB |
+| 37.5% | 144 | 93 GiB |
+
+The Metal working-set limit on a 128 GB machine with `iogpu.wired_limit_mb`
+unset is about 107 GiB, and KV cache, prefill transients, and the Engram
+page cache share it. `admission_bytes(path, fraction)` and
+`fit_resident_fraction(path, budget_bytes)` in
+`omlx.patches.deepseek_v41.moe_offload` give the engine pool's admission
+estimate for a fraction and the largest fraction whose estimate fits a byte
+budget.
+
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of
 routing weights before the down projection. Large routed batches are split
