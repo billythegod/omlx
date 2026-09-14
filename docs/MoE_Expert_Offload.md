@@ -55,12 +55,14 @@ chunk that touched it, evicting on the way. Over-capacity prefill is now
 chunked on expert boundaries instead — the routes are sorted by expert and
 each chunk holds every route of up to `capacity` distinct experts, the same
 shape as the DeepSeek V4.1 adapter's sorted prefill — so each expert is read
-at most once per layer per prefill. Measured with
+at most once per layer per model call. Measured with
 `benchmarks/moe_offload_prefill_bench.py` on the same model (585-token
 prompt, 32 decode tokens, single runs; warm = second identical request, cold
-= first request after load, which also pays the page-cache fill):
+= first request after load; filesystem page-cache state is not controlled).
+Fetch counts are sampled at the first yielded token and include the decode
+step mlx-lm runs ahead of that yield, rather than measuring pure prefill:
 
-| residency | prefill expert fetches, before → after | TTFT warm, before → after | TTFT cold, after | decode tok/s |
+| residency | expert fetches through first token, before → after | TTFT warm, before → after | TTFT cold, after | decode tok/s |
 |---|---|---|---|---|
 | 50% | 6,073 → 1,719 | 2.38 s → 0.69 s | 1.64 s | 60.6 |
 | 25% | 30,302 → 2,675 | 8.87 s → 0.85 s | 1.51 s | 43.5 |

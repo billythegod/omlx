@@ -5,7 +5,7 @@ Loads a checkpoint lazily through the oMLX loader, wraps its experts with
 ``apply_moe_expert_offload`` at each requested resident fraction, then runs
 one prompt twice directly on the model (no scheduler, no chat template):
 cold (first request after load, pays the initial fill) and warm (same prompt
-again). Reports time to first token, the expert fetches the prefill caused,
+again). Reports time to first token, expert fetches through the first yielded token,
 decode speed, and process memory. Meant for before/after comparison of the
 over-capacity prefill path; the git revision is recorded in the output::
 
@@ -83,16 +83,18 @@ def _one_request(model, tok, prompt: list[int], decode_tokens: int) -> dict:
     for resp in stream_generate(model, tok, prompt=prompt, max_tokens=decode_tokens):
         if ttft is None:
             ttft = time.perf_counter() - t0
-            after_prefill = moe_offload_stats(model)
+            # The generator can run a decode step before its first yield.
+            # These counters describe that yield boundary, not pure prefill.
+            at_first_token = moe_offload_stats(model)
         n += 1
         gen_tps = resp.generation_tps
     total = time.perf_counter() - t0
     after = moe_offload_stats(model)
     return {
         "ttft_s": ttft,
-        "prefill_fetches": after_prefill["misses"] - before["misses"],
-        "prefill_hits": after_prefill["hits"] - before["hits"],
-        "decode_fetches": after["misses"] - after_prefill["misses"],
+        "first_token_fetches": at_first_token["misses"] - before["misses"],
+        "first_token_hits": at_first_token["hits"] - before["hits"],
+        "after_first_token_fetches": after["misses"] - at_first_token["misses"],
         "decode_tokens": n,
         "decode_tps": gen_tps,
         "total_s": total,
@@ -147,7 +149,7 @@ def main() -> None:
     out = {"model": args.model, "git": _git_rev(), "mlx": mx.__version__, "runs": []}
     print(f"model {args.model}  rev {out['git']}  mlx {out['mlx']}")
     print(
-        "| residency | capacity | TTFT cold | TTFT warm | prefill fetches cold / warm "
+        "| residency | capacity | TTFT cold | TTFT warm | first-token fetches cold / warm "
         "| decode tok/s | process GiB |"
     )
     print("|---|---|---|---|---|---|---|")
@@ -157,7 +159,7 @@ def main() -> None:
         c, w = r["cold"], r["warm"]
         print(
             f"| {100 * fraction:g}% | {r['capacity']} | {c['ttft_s']:.2f} s | "
-            f"{w['ttft_s']:.2f} s | {c['prefill_fetches']} / {w['prefill_fetches']} | "
+            f"{w['ttft_s']:.2f} s | {c['first_token_fetches']} / {w['first_token_fetches']} | "
             f"{w['decode_tps']:.1f} | {r['footprint_gib']} |",
             flush=True,
         )
