@@ -12,7 +12,6 @@ import binascii
 import hashlib
 import io
 import math
-import os
 import struct
 import threading
 from collections import OrderedDict
@@ -21,46 +20,28 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
+from ..settings import get_settings
 
 DEFAULT_MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MiB
 DEFAULT_MAX_IMAGE_SIDE_LENGTH = 2048  # 2048 px
 
 
 def get_max_image_bytes() -> int:
-    """Return max allowed image payload in bytes (0 means no limit)."""
-    env_val = os.getenv("OMLX_MAX_IMAGE_UPLOAD_SIZE") or os.getenv("OMLX_MAX_IMAGE_BYTES")
-    if env_val:
-        try:
-            from ..config import parse_size
-
-            return parse_size(env_val)
-        except Exception:
-            try:
-                return int(env_val)
-            except ValueError:
-                pass
+    """Return the resolved image payload limit in bytes."""
     try:
-        from ..settings import get_settings
-
-        return get_settings().server.max_image_upload_bytes()
-    except Exception:
+        settings = get_settings()
+    except RuntimeError:
         return DEFAULT_MAX_IMAGE_BYTES
+    return settings.server.max_image_upload_bytes()
 
 
 def get_max_image_side_length() -> int:
-    """Return max allowed image side length in pixels (0 means no limit)."""
-    env_val = os.getenv("OMLX_MAX_IMAGE_SIDE_LENGTH")
-    if env_val is not None:
-        try:
-            return int(env_val)
-        except ValueError:
-            pass
+    """Return the resolved image side limit (0 disables resizing)."""
     try:
-        from ..settings import get_settings
-
-        return get_settings().server.max_image_side_length
-    except Exception:
+        settings = get_settings()
+    except RuntimeError:
         return DEFAULT_MAX_IMAGE_SIDE_LENGTH
+    return settings.server.max_image_side_length
 
 
 _IMAGE_INPUT_ERROR = (

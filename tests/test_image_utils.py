@@ -913,13 +913,34 @@ class TestImageSizeAndDownscaling:
         assert opened.call_count == 0
         assert cached.size == (100, 50)
 
-    def test_env_var_overrides(self, monkeypatch):
-        """Environment variables OMLX_MAX_IMAGE_BYTES and OMLX_MAX_IMAGE_SIDE_LENGTH are respected."""
+    @pytest.mark.parametrize("cli_override", [False, True])
+    def test_resolved_settings_control_image_processing(
+        self, monkeypatch, tmp_path, cli_override
+    ):
+        from argparse import Namespace
+
+        from omlx import settings as settings_module
         from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
 
-        monkeypatch.setenv("OMLX_MAX_IMAGE_BYTES", "20MB")
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        monkeypatch.setenv("OMLX_MAX_IMAGE_UPLOAD_SIZE", "20MB")
         monkeypatch.setenv("OMLX_MAX_IMAGE_SIDE_LENGTH", "1500")
+        args = Namespace(max_image_upload_size="30MB", max_image_side_length=512)
+        settings_module.init_settings(
+            base_path=tmp_path, cli_args=args if cli_override else None
+        )
+        side = 512 if cli_override else 1500
+        assert get_max_image_bytes() == (30 if cli_override else 20) * 1024 * 1024
+        assert get_max_image_side_length() == side
+        uri = "data:image/png;base64," + _image_to_base64(
+            _make_test_image(3000, 1500, "blue")
+        )
+        assert load_image(uri).size == (side, side // 2)
 
-        assert get_max_image_bytes() == 20 * 1024 * 1024
-        assert get_max_image_side_length() == 1500
+    def test_uninitialized_settings_use_defaults(self, monkeypatch):
+        from omlx import settings as settings_module
+        from omlx.utils.image import get_max_image_bytes, get_max_image_side_length
 
+        monkeypatch.setattr(settings_module, "_global_settings", None)
+        assert get_max_image_bytes() == 50 * 1024 * 1024
+        assert get_max_image_side_length() == 2048
