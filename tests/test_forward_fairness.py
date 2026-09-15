@@ -1,19 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Tests for ForwardFairnessGate (non-scheduler decode fairness).
-
-Embedding forwards bypass the Scheduler; the gate makes them honor the
-same shared hold protocol scheduler prefills use: wait out the
-process-global hold deadline before a forward, accrue chunk_time * share
-after it, cap contended chunk sizes in time, and skip the process-global
-cache flush while another engine decodes -- resuming the flush once
-memory crosses the enforcer's propagated soft watermark (or while no
-watermark is known at all).
-"""
+"""Embedding fairness holds, chunk sizing, and memory-pressure cleanup."""
 
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -33,7 +24,8 @@ from omlx.scheduler import (
 @pytest.fixture(autouse=True)
 def _quiet_decode_activity():
     get_decode_activity().clear()
-    yield
+    with patch("omlx.engine.forward_fairness.get_phys_footprint", return_value=0):
+        yield
     get_decode_activity().clear()
 
 
@@ -155,6 +147,34 @@ class TestChunkCap:
 
 
 class TestClearCacheDecision:
+    @pytest.mark.parametrize(
+        "active,footprint,hot_cache,expected",
+        [
+            (6, 11, 0, True),
+            (6, 9, 0, False),
+            (10, 9, 0, True),
+            (6, 12, 3, False),
+            (6, 13, 3, True),
+            (10, 12, 3, True),
+        ],
+    )
+    def test_process_memory_and_hot_cache(self, active, footprint, hot_cache, expected):
+        _publish_other_decode()
+        config = SchedulerConfig()
+        config.hot_cache_budget = SimpleNamespace(total_bytes=hot_cache * 1024**3)
+        gate = ForwardFairnessGate("embed:test", config)
+        gate.set_memory_soft_limit(10 * 1024**3)
+        with (
+            patch("omlx.engine.forward_fairness.mx") as fake_mx,
+            patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=footprint * 1024**3,
+            ),
+        ):
+            fake_mx.get_active_memory.return_value = active * 1024**3
+            fake_mx.get_cache_memory.return_value = 3 * 1024**3
+            assert gate.should_clear_cache() is expected
+
     def test_clears_when_uncontended(self):
         gate = ForwardFairnessGate("embed:test")
         assert gate.should_clear_cache() is True
@@ -176,24 +196,23 @@ class TestClearCacheDecision:
         assert gate.should_clear_cache() is True
 
     def test_clears_under_contention_at_watermark(self):
-        # active + cache counts: cached-but-free buffers are exactly what
-        # the skip lets accumulate.
         _publish_other_decode()
         gate = ForwardFairnessGate("embed:test")
         gate.set_memory_soft_limit(2 * 1024**3)
         with patch("omlx.engine.forward_fairness.mx") as fake_mx:
             fake_mx.get_active_memory.return_value = 1 * 1024**3
-            fake_mx.get_cache_memory.return_value = 1 * 1024**3
-            assert gate.should_clear_cache() is True
+            with patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=2 * 1024**3,
+            ):
+                assert gate.should_clear_cache() is True
 
-    def test_watermark_setter_sanitizes_bad_values(self):
+    def test_zero_or_negative_watermark_restores_clearing(self):
         gate = ForwardFairnessGate("embed:test")
-        gate.set_memory_soft_limit(-5)
-        assert gate._memory_soft_limit_bytes == 0
-        gate.set_memory_soft_limit("garbage")
-        assert gate._memory_soft_limit_bytes == 0
-        gate.set_memory_soft_limit(123)
-        assert gate._memory_soft_limit_bytes == 123
+        _publish_other_decode()
+        for limit in (0, -5):
+            gate.set_memory_soft_limit(limit)
+            assert gate.should_clear_cache()
 
     def test_clears_again_when_fairness_disabled(self):
         config = SchedulerConfig(decode_fairness=False)
@@ -243,9 +262,10 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
         _publish_other_decode()
         engine = self._engine()
         engine.set_memory_soft_limit(10 * 1024**3)
-        with patch("omlx.engine.embedding.mx") as engine_mx, patch(
-            "omlx.engine.forward_fairness.mx"
-        ) as fair_mx:
+        with (
+            patch("omlx.engine.embedding.mx") as engine_mx,
+            patch("omlx.engine.forward_fairness.mx") as fair_mx,
+        ):
             fair_mx.get_active_memory.return_value = 1024
             fair_mx.get_cache_memory.return_value = 1024
             self._run_embed(engine)
@@ -256,12 +276,16 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
         _publish_other_decode()
         engine = self._engine()
         engine.set_memory_soft_limit(2 * 1024**3)
-        with patch("omlx.engine.embedding.mx") as engine_mx, patch(
-            "omlx.engine.forward_fairness.mx"
-        ) as fair_mx:
+        with (
+            patch("omlx.engine.embedding.mx") as engine_mx,
+            patch("omlx.engine.forward_fairness.mx") as fair_mx,
+        ):
             fair_mx.get_active_memory.return_value = 1 * 1024**3
-            fair_mx.get_cache_memory.return_value = 2 * 1024**3
-            self._run_embed(engine)
+            with patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=3 * 1024**3,
+            ):
+                self._run_embed(engine)
             engine_mx.clear_cache.assert_called()
 
     def test_contended_forward_clears_without_watermark(self):

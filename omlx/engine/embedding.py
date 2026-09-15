@@ -73,12 +73,12 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             )
         self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None
-        # Embedding forwards bypass the Scheduler, so they must take part
-        # in decode fairness themselves (see forward_fairness.py). The key
-        # only has to differ from every Scheduler's registry key.
         self._fairness = ForwardFairnessGate(
             f"embed:{model_name}:{id(self):x}", scheduler_config
         )
+
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        self._fairness.set_memory_soft_limit(soft_limit_bytes)
 
     @property
     def model_name(self) -> str:
@@ -177,10 +177,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             fairness = self._fairness
             index = 0
             while index < len(ordered_items):
-                # While another engine decodes, forwards are capped in
-                # time (via the measured per-item duration) so the
-                # victim's stall stays bounded; uncontended forwards use
-                # the full configured batch size.
+                # Limit each forward while another engine is decoding.
                 cap = fairness.chunk_cap()
                 size = batch_size if cap is None else max(1, min(batch_size, cap))
                 batch = ordered_items[index:index + size]
