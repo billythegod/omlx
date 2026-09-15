@@ -56,6 +56,39 @@ def test_mlx_phase_does_not_inherit_ssd_progress():
     assert "no recent SSD" in guard.check(160)
 
 
+def test_watchdog_logs_every_ten_seconds_with_current_phase(caplog):
+    guard = budget()
+    guard.set_phase("primary_ssd", lambda: 159.0)
+    now = 100.0
+    waits = []
+
+    def wait(seconds):
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+        if now == 180:
+            guard.set_phase("mlx_reclaim")
+        return now >= 190
+
+    with (
+        patch.object(guard._done, "wait", side_effect=wait),
+        patch("omlx.engine_core.time.monotonic", side_effect=lambda: now),
+        caplog.at_level("INFO", logger="omlx.engine_core"),
+    ):
+        guard._watch()
+
+    assert waits == [60, 10, 10, 10]
+    assert [record.levelname for record in caplog.records] == [
+        "WARNING",
+        "INFO",
+        "INFO",
+    ]
+    assert "elapsed 70s/120s, phase=primary_ssd" in caplog.records[1].message
+    assert "last completed write 11.0s ago" in caplog.records[1].message
+    assert "elapsed 80s/120s, phase=mlx_reclaim" in caplog.records[2].message
+    assert "write" not in caplog.records[2].message
+
+
 def test_progress_requires_the_same_waiting_thread(tmp_path):
     manager = PagedSSDCacheManager(tmp_path, max_size_bytes=1024**2)
     try:

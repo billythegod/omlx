@@ -119,9 +119,34 @@ class _EngineTeardown:
             reason = f"Engine {self.engine_id}: teardown progress check failed"
         if reason is not None:
             fatal_exit(reason)
-        if not self._done.wait(self.remaining()):
-            fatal_exit(
-                f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s"
+        while not self._done.wait(min(10.0, self.remaining())):
+            now = time.monotonic()
+            if now >= self.deadline:
+                fatal_exit(
+                    f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s"
+                )
+                return
+            with self._lock:
+                phase, progress = self._phase, self._progress
+                try:
+                    last_success = progress() if progress is not None else None
+                except Exception:
+                    logger.exception("Failed to inspect engine teardown progress")
+                    last_success = None
+            detail = ""
+            if progress is not None:
+                detail = (
+                    f", last completed write {max(0.0, now - last_success):.1f}s ago"
+                    if last_success is not None
+                    else ", no recent successful SSD write confirmed"
+                )
+            logger.info(
+                "Engine %s: waiting for teardown (elapsed %.0fs/%gs, phase=%s%s)",
+                self.engine_id,
+                now - self.started,
+                2 * self.timeout,
+                phase,
+                detail,
             )
 
     def __enter__(self):
