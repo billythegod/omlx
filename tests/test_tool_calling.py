@@ -4815,3 +4815,126 @@ class TestParseToolCallsNativeParserPreservesTypes:
         args = json.loads(tool_calls[0].function.arguments)
         assert args["count"] == 42
         assert isinstance(args["count"], int)
+
+
+class TestNakedQwenFollowup:
+    @staticmethod
+    def tokenizer():
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parse_tool_call
+        return tok
+
+    @staticmethod
+    def tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                            "items": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def block(value):
+        return f"<function=write><parameter=content>{value}</parameter></function>"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "123",
+            "true",
+            '{"a": 1}',
+            'print("</function>")',
+            'print("</parameter>")',
+            "see <parameter=x> here",
+            "literal </function></tool_call> tail",
+            "한글 日本語 😀",
+        ],
+    )
+    @pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+    def test_arguments_and_stream_boundaries(self, value, chunk_size):
+        raw = "Before " + self.block(value) + "\n</tool_call> After"
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "Before  After"
+        assert len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"content": value}
+        filt = ToolCallStreamFilter(self.tokenizer(), capture_ordered_segments=True)
+        emitted = (
+            "".join(
+                filt.feed(raw[i : i + chunk_size])
+                for i in range(0, len(raw), chunk_size)
+            )
+            + filt.finish()
+        )
+        assert emitted == "Before  After"
+        envelopes = filt.take_completed_envelopes()
+        assert envelopes == [self.block(value)]
+
+    def test_schema_types_and_mixed_repeated_calls(self):
+        first = (
+            "<function=write><parameter=count>20</parameter>"
+            "<parameter=enabled>true</parameter>"
+            "<parameter=items>[1,2]</parameter></function>"
+        )
+        second = self.block("123")
+        raw = first + "<tool_call>" + second + "</tool_call>" + second
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == ""
+        assert [json.loads(c.function.arguments) for c in calls] == [
+            {"count": 20, "enabled": True, "items": [1, 2]},
+            {"content": "123"},
+            {"content": "123"},
+        ]
+        assert len({c.id for c in calls}) == 3
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "<function=ping></function>",
+            "<function=ping>\n</function>\n</tool_call>",
+            "<function=ping>" + " " * 1000 + "</function>",
+        ],
+    )
+    def test_zero_argument_calls(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer())
+        assert cleaned == ""
+        assert json.loads(calls[0].function.arguments) == {}
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '<function=write><parameter=content>print("</function>")',
+            "<function=write><parameter=content>unfinished",
+        ],
+    )
+    def test_incomplete_call_is_recoverable_without_execution(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert calls is None
+        assert cleaned == raw
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+        assert filt.take_recovery_candidate() == raw
+
+    def test_unrelated_close_tag_in_prose_is_preserved(self):
+        raw = self.block("ok") + " After mentioning </tool_call> in prose."
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "After mentioning </tool_call> in prose."
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == " " + cleaned
