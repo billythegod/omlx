@@ -6,10 +6,10 @@ flags, and metadata.
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
-import shutil
 import tempfile
 import threading
 from dataclasses import dataclass, field, fields
@@ -647,13 +647,21 @@ class ModelSettingsManager:
         if not changed:
             return
 
+        digest = hashlib.sha256()
+        for path, content in originals.items():
+            digest.update(path.name.encode("utf-8") + b"\0")
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        backup = self.base_path / f"profile-reference-backup-{digest.hexdigest()}"
         written = []
         try:
-            backup = Path(
-                tempfile.mkdtemp(prefix="profile-reference-backup-", dir=self.base_path)
-            )
-            for path in originals:
-                shutil.copy2(path, backup / path.name)
+            backup.mkdir(exist_ok=True)
+            for path, content in originals.items():
+                target = backup / path.name
+                if not target.exists():
+                    self._write_profile_repair(target, content)
+                if target.read_bytes() != content:
+                    raise OSError(f"Profile backup does not match original: {target}")
             for path in changed:
                 content = json.dumps(
                     documents[path], indent=2, ensure_ascii=False
@@ -661,8 +669,15 @@ class ModelSettingsManager:
                 self._write_profile_repair(path, content)
                 written.append(path)
         except OSError:
-            for path in written:
-                self._write_profile_repair(path, originals[path])
+            try:
+                for path in written:
+                    self._write_profile_repair(path, originals[path])
+            except OSError:
+                logger.exception(
+                    "Profile reference repair rollback failed; recover originals from %s",
+                    backup,
+                )
+                raise
             logger.exception("Profile reference repair failed; original files retained")
             return
         logger.info(

@@ -944,30 +944,79 @@ def test_unreadable_storage_does_not_trigger_reference_repair(
         assert (tmp_path / name).read_bytes() == content
 
 
-@pytest.mark.parametrize("failure", ["backup", "second_write"])
+@pytest.mark.parametrize("failure", ["backup", "second_write", "corrupt_backup"])
 def test_reference_repair_failure_retains_original_documents(
     tmp_path, monkeypatch, failure, caplog
 ):
     documents = _write_legacy_profile_storage(tmp_path)
     originals = {name: (tmp_path / name).read_bytes() for name in documents}
-    if failure == "backup":
+    write = ModelSettingsManager._write_profile_repair
 
-        def fail_copy(*args):
+    def fail_write(path, content):
+        in_backup = path.parent != tmp_path
+        if path.name == "model_profiles.json" and in_backup and failure == "backup":
             raise OSError("Backup unavailable")
+        if (
+            path.name == "model_settings.json"
+            and not in_backup
+            and failure == "second_write"
+        ):
+            raise OSError("Settings write unavailable")
+        if in_backup and failure == "corrupt_backup":
+            content = b"corrupt backup"
+        write(path, content)
 
-        monkeypatch.setattr("omlx.model_settings.shutil.copy2", fail_copy)
-    else:
-        write = ModelSettingsManager._write_profile_repair
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ModelSettingsManager, "_write_profile_repair", staticmethod(fail_write)
+        )
+        ModelSettingsManager(tmp_path)
+        backup = next(tmp_path.glob("profile-reference-backup-*"))
+        first_backup = backup / "model_settings.json"
+        modified_at = first_backup.stat().st_mtime_ns
+        ModelSettingsManager(tmp_path)
+        assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+        assert first_backup.stat().st_mtime_ns == modified_at
+        assert "Profile reference repair failed" in caplog.text
+        for name, content in originals.items():
+            assert (tmp_path / name).read_bytes() == content
 
-        def fail_settings(path, content):
+    if failure == "corrupt_backup":
+        ModelSettingsManager(tmp_path)
+        assert first_backup.read_bytes() == b"corrupt backup"
+        assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+        for name, content in originals.items():
+            assert (tmp_path / name).read_bytes() == content
+        return
+
+    ModelSettingsManager(tmp_path)
+    assert list(tmp_path.glob("profile-reference-backup-*")) == [backup]
+    assert first_backup.stat().st_mtime_ns == modified_at
+    for name, content in originals.items():
+        assert (backup / name).read_bytes() == content
+    repaired = json.loads((tmp_path / "model_settings.json").read_bytes())
+    assert repaired["models"]["m"]["active_profile_name"] is None
+
+
+def test_reference_repair_rollback_failure_reports_backup(tmp_path, monkeypatch, caplog):
+    documents = _write_legacy_profile_storage(tmp_path)
+    originals = {name: (tmp_path / name).read_bytes() for name in documents}
+    write = ModelSettingsManager._write_profile_repair
+
+    def fail_write(path, content):
+        if path.parent == tmp_path:
             if path.name == "model_settings.json":
                 raise OSError("Settings write unavailable")
-            write(path, content)
+            if content == originals[path.name]:
+                raise OSError("Rollback unavailable")
+        write(path, content)
 
-        monkeypatch.setattr(
-            ModelSettingsManager, "_write_profile_repair", staticmethod(fail_settings)
-        )
-    ModelSettingsManager(tmp_path)
-    assert "Profile reference repair failed" in caplog.text
+    monkeypatch.setattr(
+        ModelSettingsManager, "_write_profile_repair", staticmethod(fail_write)
+    )
+    with pytest.raises(OSError, match="Rollback unavailable"):
+        ModelSettingsManager(tmp_path)
+    backup = next(tmp_path.glob("profile-reference-backup-*"))
+    assert str(backup) in caplog.text
     for name, content in originals.items():
-        assert (tmp_path / name).read_bytes() == content
+        assert (backup / name).read_bytes() == content
