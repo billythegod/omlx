@@ -46,9 +46,9 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
@@ -59,6 +59,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -1192,6 +1193,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         return
 
     import safetensors
+
     from ..patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import ple_load_resources
 
     original_safe_open = safetensors.safe_open
@@ -2431,6 +2433,8 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from ..utils.model_loading import (
                         lm_load_compat as mlx_lm_load,
+                    )
+                    from ..utils.model_loading import (
                         maybe_load_custom_quantization,
                     )
                     from ..utils.tokenizer import get_tokenizer_config
@@ -2525,6 +2529,7 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        cancelled = False
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -2562,13 +2567,15 @@ class VLMBatchedEngine(BaseEngine):
         if engine:
             if hasattr(engine, "engine") and engine.engine is not None:
                 try:
-                    engine.engine.close()
+                    cancelled = await _close_engine_core(engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _inject_tool_calling(self, tokenizer) -> None:
         """Inject tool calling attributes into VLM tokenizer.
