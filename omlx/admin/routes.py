@@ -3649,6 +3649,29 @@ async def apply_model_profile(
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
+@router.post("/api/models/{model_id}/profile-templates/{name}/apply")
+async def apply_model_template(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    entry = _require_model(model_id)
+
+    def sanitizer(settings):
+        if _entry_is_diffusion_model(entry):
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
+    try:
+        applied = mgr.apply_template(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
 @router.get("/api/profile-fields")
 async def get_profile_fields(is_admin: bool = Depends(require_admin)):
     from ..model_profiles import (

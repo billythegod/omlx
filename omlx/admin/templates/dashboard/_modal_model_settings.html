@@ -104,7 +104,8 @@
                             <template x-for="tmpl in templates" :key="tmpl.name">
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyTemplateToForm(tmpl)"
-                                            class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
+                                            :class="activeTemplateName === tmpl.name ? 'bg-blue-500 text-white border-blue-500' : 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'"
+                                            class="px-2.5 py-1 text-xs rounded-full border transition-all"
                                             x-text="tmpl.display_name || tmpl.name"></button>
                                     <button type="button" @click="editingTemplate = tmpl.name"
                                             class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors"
@@ -169,7 +170,7 @@
                          style="max-height: 72px; overflow-y: auto;"
                          class="pills-scrollbar">
                         <div class="flex flex-wrap items-center gap-2">
-                            <template x-for="p in profiles" :key="p.name">
+                            <template x-for="p in visibleModelProfiles" :key="p.name">
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyProfileToForm(p)"
                                             @mouseenter="showTip($event.currentTarget, profileTooltip(p))"
@@ -286,7 +287,7 @@
                                         {{ t('modal.model_settings.profiles.update_from_form') }}
                                     </button>
                                     <button type="button" x-show="p.source_template"
-                                            @click="(() => { const tmpl = templates.find(t => t.name === p.source_template); if (tmpl) { applyTemplateToForm(tmpl); updateProfile(p.name, {settings: formValuesForProfile()}); } })()"
+                                            @click="(() => { const tmpl = templates.find(t => t.name === p.source_template); if (tmpl) { applyTemplateToForm(tmpl); } })()"
                                             class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
                                         {{ t('modal.model_settings.profiles.resync_template') }}
                                     </button>
