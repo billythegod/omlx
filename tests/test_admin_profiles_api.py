@@ -1332,3 +1332,41 @@ def test_profile_conflicting_flags_rejected_before_storage(client, operation, va
         response = c.put(url + "/existing", json={"settings": values})
     assert response.status_code == 400, response.text
     assert mgr.profiles_file.read_bytes() == before
+
+
+def test_template_apply_reads_latest_and_preserves_independent_profile(client):
+    c, mgr = client
+    mgr.save_profile("model-a", "coding", "Coding", None, {"temperature": 0.1})
+    mgr.save_template("coding", "Coding", None, {"temperature": 0.2})
+    path = "/admin/api/models/model-a/profile-templates/coding/apply"
+    first = c.post(path)
+    assert first.status_code == 200
+    copy_name = first.json()["settings"]["active_profile_name"]
+    assert copy_name != "coding"
+    assert (
+        c.put(
+            "/admin/api/profile-templates/coding",
+            json={"settings": {"temperature": 0.9}},
+        ).status_code
+        == 200
+    )
+    second = c.post(path)
+    assert second.status_code == 200
+    assert second.json()["settings"]["temperature"] == 0.9
+    assert second.json()["settings"]["active_profile_name"] == copy_name
+    assert mgr.get_profile("model-a", "coding")["settings"]["temperature"] == 0.1
+    assert mgr.get_settings_for_request("model-a").temperature == 0.9
+
+
+def test_template_apply_missing_template_and_model(client):
+    c, mgr = client
+    mgr.save_template("coding", "Coding", None, {})
+    assert (
+        c.post("/admin/api/models/missing/profile-templates/coding/apply").status_code
+        == 404
+    )
+    assert (
+        c.post("/admin/api/models/model-a/profile-templates/missing/apply").status_code
+        == 404
+    )
+    assert mgr.list_profiles("model-a") == []
