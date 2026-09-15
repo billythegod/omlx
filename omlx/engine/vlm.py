@@ -1335,6 +1335,35 @@ _QWEN_VISION_MODELS = {
 _GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
 
 
+def _grid_image_token_starts(
+    token_ids: list[int], image_grid_thw: Any, image_token_id: int, merge_size: int
+) -> list[int]:
+    """Locate each grid image in the final, expanded processor token sequence."""
+    grid = (
+        image_grid_thw.tolist()
+        if hasattr(image_grid_thw, "tolist")
+        else image_grid_thw
+    )
+    counts = []
+    for t, h, w in grid:
+        patches = int(t) * int(h) * int(w)
+        if merge_size <= 0 or patches <= 0 or patches % (merge_size**2):
+            raise ValueError("Invalid image grid for cache boundaries")
+        counts.append(patches // (merge_size**2))
+    positions = [i for i, token in enumerate(token_ids) if token == image_token_id]
+    if sum(counts) != len(positions):
+        raise ValueError("Image grids do not match the final image tokens")
+    starts = []
+    offset = 0
+    for count in counts:
+        start = positions[offset]
+        if positions[offset + count - 1] != start + count - 1:
+            raise ValueError("Image token span is not contiguous")
+        starts.append(start)
+        offset += count
+    return starts
+
+
 # Conservative fallback upper bound on image-placeholder tokens per image
 # content part. Used by ``preflight_chat`` only when the actual
 # ``max_pixels`` cannot be derived from the loaded processor config.
@@ -3338,10 +3367,27 @@ class VLMBatchedEngine(BaseEngine):
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
+        token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
             try:
+                image_starts = None
+                if (
+                    model_type in _GRID_VISION_MODELS
+                    and inputs.get("image_grid_thw") is not None
+                ):
+                    image_starts = _grid_image_token_starts(
+                        token_ids,
+                        inputs["image_grid_thw"],
+                        self._vlm_model.config.image_token_id,
+                        self._processor.image_processor.merge_size,
+                    )
+                    if (
+                        len(image_starts) != num_images
+                        or sum(count for _, count in image_message_ranges) != num_images
+                    ):
+                        raise ValueError("Image boundary count does not match images")
                 prefix_template_kwargs = {
                     "tokenize": False,
                     "add_generation_prompt": False,
@@ -3358,7 +3404,9 @@ class VLMBatchedEngine(BaseEngine):
                 for msg_idx, msg_num_images in image_message_ranges:
                     prefix_messages = formatted_messages[:msg_idx]
                     boundary_tokens = 0
-                    if prefix_messages:
+                    if image_starts is not None:
+                        boundary_tokens = image_starts[images_consumed]
+                    elif prefix_messages:
                         try:
                             prefix_prompt = (
                                 apply_chat_template_with_reasoning_effort_fallback(
@@ -3391,16 +3439,29 @@ class VLMBatchedEngine(BaseEngine):
                             ),
                         )
                         prefix_ids = prefix_inputs["input_ids"]
-                        boundary_tokens = (
-                            len(prefix_ids[0].tolist())
+                        prefix_tokens = (
+                            prefix_ids[0].tolist()
                             if prefix_ids.ndim > 1
-                            else len(prefix_ids.tolist())
+                            else prefix_ids.tolist()
                         )
+                        # Rendering a shorter conversation can retain reasoning
+                        # that the full template removes. Only a matching token
+                        # prefix is a valid position in the final model input.
+                        for actual, prefix in zip(token_ids, prefix_tokens):
+                            if actual != prefix:
+                                break
+                            boundary_tokens += 1
 
                     images_consumed += msg_num_images
                     cumulative_hash = compute_image_hash(images[:images_consumed])
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
+                # A later image's prefix can diverge earlier. Its cumulative
+                # hash must apply there, including all preceding images.
+                for i in range(len(image_cache_key_ranges) - 2, -1, -1):
+                    start, image_key = image_cache_key_ranges[i]
+                    next_start = image_cache_key_ranges[i + 1][0]
+                    image_cache_key_ranges[i] = (min(start, next_start), image_key)
                 image_cache_key_start = image_cache_key_ranges[0][0]
             except Exception:
                 logger.debug(
@@ -3578,11 +3639,6 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
 
-            # Extract token IDs as list
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
-
             return (
                 token_ids,
                 embed_features.inputs_embeds,
@@ -3593,9 +3649,6 @@ class VLMBatchedEngine(BaseEngine):
             )
         else:
             # Text-only (no images in this message)
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
             return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
