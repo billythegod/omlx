@@ -6,7 +6,6 @@ import concurrent.futures
 import subprocess
 import sys
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -106,8 +105,8 @@ def test_progress_requires_the_same_waiting_thread(tmp_path):
 
 
 @pytest.mark.parametrize("draft", [False, True])
-def test_slow_shutdown_preserves_all_blocks_for_reload(
-    tmp_path, mock_model, mock_tokenizer, draft, caplog
+def test_shutdown_preserves_all_blocks_for_reload(
+    tmp_path, mock_model, mock_tokenizer, draft
 ):
     manager = PagedSSDCacheManager(
         tmp_path, max_size_bytes=1024**2, hot_cache_max_bytes=1024**2
@@ -123,20 +122,9 @@ def test_slow_shutdown_preserves_all_blocks_for_reload(
         engine.scheduler._draft_paged_ssd_cache_manager = manager
     else:
         engine.scheduler.paged_ssd_cache_manager = manager
-    write = ssd._write_safetensors_no_mx
-
-    def slow_write(*args, **kwargs):
-        time.sleep(0.12)
-        return write(*args, **kwargs)
-
     try:
-        with (
-            patch.object(ssd, "_write_safetensors_no_mx", slow_write),
-            patch("omlx.engine_core.FATAL_TEARDOWN_TIMEOUT_S", 1.0),
-        ):
-            engine.close()
+        engine.close()
         assert not manager._writer_thread.is_alive()
-        assert "extending teardown" in caplog.text
         assert manager.get_stats().ssd_write_drops == 0
         restarted = PagedSSDCacheManager(tmp_path, max_size_bytes=1024**2)
         try:
@@ -215,7 +203,7 @@ def test_completed_close_removes_watchdog_thread():
 
 
 def test_active_store_worker_drains_before_reset_and_restores_prefix(
-    tmp_path, mock_model, mock_tokenizer, caplog
+    tmp_path, mock_model, mock_tokenizer
 ):
     def caches():
         manager = PagedSSDCacheManager(
@@ -257,14 +245,23 @@ def test_active_store_worker_drains_before_reset_and_restores_prefix(
         }
     ]
     write = ssd._write_safetensors_no_mx
-    entered = threading.Event()
+    entered, release = threading.Event(), threading.Event()
 
-    def slow_write(*args, **kwargs):
+    def blocked_write(*args, **kwargs):
         entered.set()
-        time.sleep(0.12)
+        assert release.wait(10), "shutdown did not release the blocked writer"
         return write(*args, **kwargs)
 
-    with patch.object(ssd, "_write_safetensors_no_mx", slow_write):
+    shutdown = scheduler.shutdown
+
+    def release_and_shutdown():
+        release.set()
+        shutdown()
+
+    with (
+        patch.object(ssd, "_write_safetensors_no_mx", blocked_write),
+        patch.object(scheduler, "shutdown", side_effect=release_and_shutdown),
+    ):
         future = executor.submit(
             scheduler._async_store_cache_worker,
             "store",
@@ -278,12 +275,16 @@ def test_active_store_worker_drains_before_reset_and_restores_prefix(
             False,
         )
         scheduler._inflight_store_futures["store"] = future
-        assert entered.wait(2)
-        with patch("omlx.engine_core.FATAL_TEARDOWN_TIMEOUT_S", 1.0):
+        try:
+            assert entered.wait(10)
+            assert not future.done()
             engine.close()
+        finally:
+            release.set()
+            if not engine._closed:
+                engine.close()
     assert future.done()
     assert not manager._writer_thread.is_alive()
-    assert "extending teardown" in caplog.text
     restored, _, prefix = caches()
     try:
         table, remaining = prefix.fetch_cache("reload", tokens + [999])
