@@ -4596,6 +4596,23 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
 class TestParseXmlToolCallsHyphenatedName:
     """Regex fix: <function=NAME> must accept hyphens and dots in NAME."""
 
+    @pytest.mark.parametrize("function_name", ["123lookup", "날씨", "get-weather"])
+    @pytest.mark.parametrize("parameter_name", ["123", "도시", "filter.lang"])
+    def test_existing_names_survive_xml_fallback(self, function_name, parameter_name):
+        text = (
+            f"<tool_call><function={function_name}>"
+            f"<parameter={parameter_name}>Paris</parameter>"
+            "</function></tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, None)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == function_name
+        assert json.loads(tool_calls[0].function.arguments) == {parameter_name: "Paris"}
+
     def test_hyphenated_function_name_parses(self):
         text = (
             "<tool_call>\n<function=get-weather>\n"
