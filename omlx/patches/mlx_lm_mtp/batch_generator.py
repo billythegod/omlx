@@ -1355,8 +1355,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         logits = None
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
         for start in range(0, total, step):
-            logits, _, _ = _call_backbone(
-                gen_batch.model, tok_arr[None, start : start + step], new_cache
+            # Committed history needs no per-token speculative rollback states.
+            logits = gen_batch.model(
+                tok_arr[None, start : start + step], cache=new_cache
             )
             if start + step < total:
                 mx.eval(logits)
@@ -1374,9 +1375,6 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
-        # Reconciliation produces committed standard-decoding state. A long
-        # re-prefill is still an armed MTP-managed backbone call, so discard
-        # its speculative snapshots before exposing or merging the cache.
         _clear_rollback(new_cache)
         gen_batch.prompt_cache = new_cache
         gen_batch._next_tokens = next_tok
