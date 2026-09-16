@@ -661,14 +661,17 @@ const source = fs.readFileSync('omlx/admin/static/js/dashboard_layout.js', 'utf8
 const context = { window: {} };
 vm.runInNewContext(source, context);
 const lib = context.window.DashboardLayout;
+// Objects built inside the vm realm have a different Object.prototype, so
+// strict deepEqual rejects them; compare plain JSON copies instead.
+const plain = value => JSON.parse(JSON.stringify(value));
 
 assert.equal(lib.COLUMNS, 24);
 assert.equal(lib.MIN_W, 6);
 const def = lib.defaultLayout();
 assert.equal(def.blocks.length, 8);
 assert.ok(def.blocks.every((b, i) => b.x === 0 && b.y === i && b.w === 24));
-assert.deepEqual(lib.normalizeLayout(null), def);
-assert.deepEqual(lib.normalizeLayout({ blocks: 'nope' }), def);
+assert.deepEqual(plain(lib.normalizeLayout(null)), plain(def));
+assert.deepEqual(plain(lib.normalizeLayout({ blocks: 'nope' })), plain(def));
 
 const messy = lib.normalizeLayout({
     width: 'huge',
@@ -681,12 +684,12 @@ const messy = lib.normalizeLayout({
     ],
 });
 assert.equal(messy.width, 'default');
-assert.deepEqual(messy.blocks, [
+assert.deepEqual(plain(messy.blocks), [
     { id: 'serving_stats', x: 12, y: 3, w: 12 },
     { id: 'engine_versions', x: 0, y: 0, w: 6 },
     { id: 'applications', x: 0, y: 1, w: 24 },
 ]);
-assert.deepEqual(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks, []);
+assert.deepEqual(plain(lib.normalizeLayout({ width: 'full', blocks: [] }).blocks), []);
 assert.equal(lib.widthClass('wide'), 'max-w-[90rem]');
 assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
 """
