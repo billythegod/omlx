@@ -180,23 +180,8 @@ def apply() -> bool:
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
-            active = getattr(self, "_omlx_mtp_batch_state", None)
-            if (
-                active is not None
-                and all(not state.queue for state in active.states.values())
-                and not _generation_batch_has_active_mtp(batch)
-            ):
-                # Completed ragged emits leave each UID at its own frontier.
-                # Preserve those histories; only newly admitted UIDs need priming.
-                from . import batched_head
-
-                batched_head.flush(active)
-                return original_extend(self, batch, *args, **kwargs)
-            # The host (self) may have active MTP about to gain a co-runner.
-            # The MTP path never maintains mlx-lm's _next_tokens, so a plain
-            # drop here would leave standard batched decode resuming from a
-            # stale _next_tokens against an MTP-advanced cache. Reconcile
-            # before merge while ownership is still well defined.
+            # Reconcile before adding rows without MTP state so the drained
+            # batch can feed its last tokens without replaying its history.
             if not _reconcile_mtp_batch_to_standard(self):
                 raise RuntimeError(
                     "Lightning MTP could not restore the committed batch cache"
