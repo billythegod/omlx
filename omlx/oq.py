@@ -5277,6 +5277,8 @@ def _source_imatrix_signature(
         # Invalidate caches produced by the old independent-block walk, which
         # captured only q_proj in the shared-KV tail of E2B/E4B.
         signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif _is_qwen4_exp_config(config):
+        signature["layer_walk"] = "qwen4_mtp_batch_positions_v1"
     elif str(config.get("model_type", "")).lower() == "deepseek_v41":
         signature["layer_walk"] = "deepseek_v41_full_forward_v1"
     elif str(config.get("model_type", "")).lower() == "glm5_next":
@@ -6165,6 +6167,7 @@ def quantize_oq_streaming(
         # measurement into that sweep: one weight load serves both passes.
         fuse_sensitivity = (
             stream_imatrix
+            and static_sensitivity_map is None
             and not sensitivity_map_path.exists()
             and not sensitivity_model_path
         )
@@ -6574,18 +6577,6 @@ def quantize_oq_streaming(
                 # Strip MTP tensors when the caller asked not to preserve them.
                 # _normalize_mtp_in_config will zero mtp_num_hidden_layers in
                 # the output config so the result stays self-consistent.
-                del w_mx
-                processed_bytes += tensor_bytes
-                continue
-
-            if _stream_source_model_type(config) == "qwen4_exp" and tensor_name.endswith(
-                ".ple.ple_embedding.ngram_embedding.weight_scale"
-            ):
-                # Synthetic runtime placeholder, not checkpoint data: the
-                # sanitize plan discovers the model through the mmap-mode PLE,
-                # whose disk-backed embedding registers a weight_scale of ones.
-                # Emitting it makes strict loaders reject the artifact as
-                # carrying a parameter the model does not define.
                 del w_mx
                 processed_bytes += tensor_bytes
                 continue
@@ -8411,43 +8402,30 @@ def _stream_calibration_supported(model_type: str | None) -> bool:
     return str(model_type or "").lower() in _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES
 
 
-def _streamed_text_args(model_path, *, trust_remote_code: bool = False):
-    """TextConfig plus the concrete decoder layer class for streamed sourcing.
-
-    Lazy-loads the VLM once through the same path _collect_imatrix uses (so
-    the M3 compat patches apply), reads language_model.model.args and the
-    layer class off the live model, then drops it. Lazy load never
-    materializes weights, so this costs seconds, not RAM.
-    """
+def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
+    """Resolve decoder classes without loading or dequantizing the checkpoint."""
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
-    maybe_apply_pre_load_patches(str(model_path), for_vlm=True)
+    settings = _calibration_model_settings(
+        config, has_mtp_heads=False, has_mtp_weights=False
+    )
+    maybe_apply_pre_load_patches(str(model_path), for_vlm=True, model_settings=settings)
+    if _stream_source_model_type(config) == "qwen4_exp":
+        from mlx_vlm.models.qwen4_exp.config import TextConfig
+        from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
 
-    from mlx_vlm.utils import load_model as vlm_load_model
+        layer_cls = Qwen4ExpDecoderLayer
+    else:
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxDecoderLayer
 
-    orig_load_weights = nn.Module.load_weights
-
-    def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
-        kwargs.pop("strict", None)
-        return orig_load_weights(self, file_or_weights, *args, strict=False, **kwargs)
-
-    nn.Module.load_weights = _lenient_load_weights
-    try:
-        model = vlm_load_model(
-            Path(model_path), lazy=True, trust_remote_code=trust_remote_code
-        )
-    finally:
-        nn.Module.load_weights = orig_load_weights
-
-    lm = model.language_model.model
-    args = lm.args
-    layer_cls = type(lm.layers[0])
-    del lm, model
-    mx.clear_cache()
-    return args, layer_cls
+        layer_cls = MiniMaxDecoderLayer
+    return TextConfig.from_dict(config["text_config"]), layer_cls
 
 
-def _streamed_source_plan(model_path, config: dict) -> "_DiscoveredPlan":
+def _streamed_source_plan(
+    model_path, config: dict, *, preserve_mtp: bool = False
+) -> "_DiscoveredPlan":
     """Private lazy index plus discovered sanitize plan for one pass.
 
     _DiscoveredPlan.pop is destructive, so every streaming pass builds its
@@ -8457,8 +8435,10 @@ def _streamed_source_plan(model_path, config: dict) -> "_DiscoveredPlan":
     weight_files = sorted(Path(model_path).glob("*.safetensors"))
     if not weight_files:
         raise FileNotFoundError(f"no safetensors shards under {model_path}")
-    lazy_index = _LazyTensorIndex(weight_files)
-    sanitize_fn = _build_model_sanitizer(config)
+    lazy_index = _LazyTensorIndex(weight_files, config=config)
+    sanitize_fn = _build_model_sanitizer(
+        config, model_path=model_path, preserve_mtp=preserve_mtp
+    )
     if sanitize_fn is None:
         raise RuntimeError(f"no sanitizer for model_type={config.get('model_type')!r}")
     plan = _discover_sanitize_plan(sanitize_fn, lazy_index)
@@ -8543,7 +8523,9 @@ def _iter_streamed_layer_blocks(
     next layer so at most one layer's weights are ever resident here.
     """
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
-    args, layer_cls = _streamed_text_args(source, trust_remote_code=trust_remote_code)
+    args, layer_cls = _streamed_text_args(
+        source, config, trust_remote_code=trust_remote_code
+    )
     lang_module = (
         _qwen4_exp_stream_language_module(layer_cls, source) if is_qwen4_exp else None
     )
@@ -8859,6 +8841,34 @@ def _log_streamed_sensitivity(oq_level, scores: dict[int, float]) -> None:
     )
 
 
+def _collect_streamed_qwen4_mtp(source, config, collector, calib_data, working, ranges):
+    """Collect the head after the trunk generator has released its last block."""
+    from mlx_vlm.models.qwen4_exp.config import TextConfig
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpMTPModule
+
+    plan = _streamed_source_plan(source, config, preserve_mtp=True)
+    head = Qwen4ExpMTPModule(TextConfig.from_dict(config["text_config"]))
+    head.eval()
+    head.load_weights(
+        [(key[4:], plan.pop(key)) for key in list(plan) if key.startswith("mtp.")],
+        strict=True,
+    )
+    embed_weight = plan.pop(_STREAM_EMBED_KEY)
+    embed = nn.Embedding(*embed_weight.shape)
+    embed.weight = embed_weight
+    del embed_weight
+    mx.eval(head.parameters(), embed.parameters())
+    installed = collector.install(head, name_prefix="mtp.")
+    try:
+        for hidden, (lo, hi) in zip(working, ranges):
+            cache = [QSAKVCache() for _ in head.layers]
+            outputs = head(hidden[:, :-1, :], calib_data[lo:hi, 1:], embed, cache)
+            mx.eval(*outputs)
+    finally:
+        collector.restore(head)
+    return installed
+
+
 def _collect_imatrix_streaming(
     source,
     tokenizer,
@@ -8879,6 +8889,7 @@ def _collect_imatrix_streaming(
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
     sensitivity_calib_seed: int = _OQE_STREAM_CALIB_SEED,
+    require_mtp_entries: bool = True,
 ) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
     """Collect the oQe imatrix with one decoder layer resident at a time.
 
@@ -8912,7 +8923,15 @@ def _collect_imatrix_streaming(
     """
     if measure_sensitivity and sensitivity_oq_level is None:
         raise ValueError("measure_sensitivity requires sensitivity_oq_level")
+    from omlx.utils.model_loading import _checkpoint_has_mtp_weights, _has_mtp_heads
+
     source = Path(source)
+    collect_mtp = (
+        require_mtp_entries
+        and _stream_source_model_type(config) == "qwen4_exp"
+        and _has_mtp_heads(config)
+        and _checkpoint_has_mtp_weights(source)
+    )
     adaptive_max_samples = max(
         int(num_samples),
         min(
@@ -9039,11 +9058,6 @@ def _collect_imatrix_streaming(
             else None
         )
 
-        # No MTP-head pass here: the checkpoints this path serves declare
-        # MTP modules without shipping their weights (MiniMax-M3), so the
-        # resident collector's head pass is a no-op for them too. A source
-        # with real mtp.* tensors needs the _collect_mtp_head_imatrix
-        # equivalent added after the last layer.
         first_streamed_layer = round_index == 0
         for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
             source, config, trust_remote_code=trust_remote_code
@@ -9146,6 +9160,13 @@ def _collect_imatrix_streaming(
                     "active_memory_bytes": int(active),
                 },
             )
+
+        if collect_mtp:
+            head_installed = _collect_streamed_qwen4_mtp(
+                source, config, collector, calib_data, working, ranges
+            )
+            if round_index == 0:
+                installed += head_installed
 
         if round_index == 0:
             # Counter snapshot after the first full sweep. Later rounds
@@ -9408,20 +9429,6 @@ def _load_or_collect_imatrix(
     sensitivity_seq_length: int = 256,
     require_mtp_entries: bool = True,
 ) -> OQImatrixData:
-    # ``require_mtp_entries=False`` skips the mtp.*-entries completeness
-    # check on a cache hit. A build that drops the MTP head
-    # (preserve_mtp=False) never quantizes mtp.* tensors, so a cache
-    # without head entries is complete for it — and the streaming
-    # collector never runs the MTP-head pass, so on a source that ships
-    # real mtp.* weights (e.g. qwen4_exp) the check would otherwise force
-    # a full recollect on every reuse.
-    # ``measure_sensitivity`` asks the streaming collector to fuse the
-    # per-layer qdq sensitivity measurement into the collection sweep; the
-    # scores come back under metadata["collection"]["sensitivity_map"]. It
-    # only applies to a fresh streamed collection: a cache hit returns
-    # early (the cached map, if any, may have been measured at another
-    # oq_level, so callers must not consume it and should fall back to
-    # _measure_sensitivity_streaming instead).
     source = Path(model_path)
     path = Path(cache_path)
     expected = _source_imatrix_signature(
@@ -9501,6 +9508,7 @@ def _load_or_collect_imatrix(
             sensitivity_oq_level=sensitivity_oq_level,
             sensitivity_num_samples=sensitivity_num_samples,
             sensitivity_seq_length=sensitivity_seq_length,
+            require_mtp_entries=require_mtp_entries,
         )
     else:
         # ``load_path_factory`` swaps in an alternate checkpoint for the
