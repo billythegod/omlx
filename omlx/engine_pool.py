@@ -1285,6 +1285,10 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if entry is None:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.engine is not None:
+                failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
+                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                    self._raise_if_reload_busy(entry, "activate distributed cluster")
             pending_task = self._pending_unload_tasks.pop(model_id, None)
             if pending_task is not None and not pending_task.done():
                 pending_task.cancel()
@@ -1294,9 +1298,6 @@ class EnginePool:
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
-            if not (isinstance(failed_reason, str) and failed_reason.strip()):
-                self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 
