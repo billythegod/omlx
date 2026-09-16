@@ -1406,23 +1406,73 @@ class TestBatchGeneratorDispatch:
         assert batch._next_tokens.tolist() == [999]
         assert backbone_calls == []
 
-    def test_late_join_handoff_failure_keeps_state(self, monkeypatch):
-        import mlx.core as mx
+    @pytest.mark.parametrize(
+        "handoff", ["_handoff_mtp_for_late_join", "_park_mtp_to_standard"]
+    )
+    @pytest.mark.parametrize("recovery_fails", [False, True])
+    def test_handoff_recovers_after_cache_mutation(
+        self, monkeypatch, handoff, recovery_fails
+    ):
+        from mlx_lm.models.cache import TokenBuffer
 
         bg, batch, state, backbone_calls = self._make_handoff_batch(
-            monkeypatch,
-            queue_entries=[],
-            next_main=mx.array([7], dtype=mx.uint32),
+            monkeypatch, queue_entries=[], next_main=mx.array([13], dtype=mx.uint32)
         )
+        batch.model = CountingModel()
+        backbone = bg._call_backbone
+        sampler = batch.fallback_sampler
+        error = RuntimeError("sampling failed after cache write")
+        samples = []
 
-        def broken_backbone(*_, **__):
-            raise RuntimeError("boom")
+        class Processor:
+            def __init__(self):
+                self.count = 0
+                self.prefixes = []
 
-        monkeypatch.setattr(bg, "_call_backbone", broken_backbone)
+            def __call__(self, tokens, logits):
+                self.count += 1
+                self.prefixes.append(tokens.tolist())
+                return logits
 
-        assert bg._handoff_mtp_for_late_join(batch, state) is False
-        assert batch._omlx_mtp_state is state
-        assert batch._next_tokens.tolist() == [999]
+            def snapshot_state(self):
+                return self.count
+
+            def restore_state(self, count):
+                self.count = count
+
+        processor = Processor()
+        batch.logits_processors = [[processor]]
+        batch._token_context = [TokenBuffer([10, 11, 12])]
+
+        def advancing_backbone(model, inputs, cache, **kwargs):
+            cache[0].offset += int(inputs.shape[1])
+            return backbone(model, inputs, cache, **kwargs)
+
+        def fail_once(logprobs):
+            samples.append(True)
+            if len(samples) == 1:
+                raise error
+            return sampler(logprobs)
+
+        monkeypatch.setattr(bg, "_call_backbone", advancing_backbone)
+        batch.fallback_sampler = fail_once
+        if recovery_fails:
+            monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+            with pytest.raises(RuntimeError, match="could not restore") as caught:
+                getattr(bg, handoff)(batch, state)
+            assert caught.value.__cause__ is error
+            assert batch._omlx_mtp_state is state
+            assert batch._next_tokens.tolist() == [999]
+        else:
+            assert getattr(bg, handoff)(batch, state)
+            assert batch._next_tokens.tolist() == [14]
+            cache = batch.prompt_cache[0].extract(0)
+            assert cache.keys[0, 0, : cache.offset, 0].tolist() == [10, 11, 12, 13]
+            assert batch._token_context[0].tokens.tolist() == [10, 11, 12, 13]
+            assert processor.count == 1
+            assert processor.prefixes == [[10, 11, 12, 13]] * 2
+            assert not hasattr(batch, "_omlx_mtp_state")
+        assert backbone_calls == [1]
 
     def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
         import mlx.core as mx
@@ -1853,10 +1903,10 @@ class TestBatchGeneratorDispatch:
             queue_entries=[],
         )
 
-        # Nothing streamed yet -> cannot re-prefill; signal plain-drop fallback.
+        # No committed history is available to reconstruct.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
 
-    def test_reconcile_fallback_on_rebuild_failure(self, monkeypatch):
+    def test_reconcile_reports_rebuild_failure(self, monkeypatch):
         import mlx.core as mx
 
         bg, batch, state = self._make_reconcile_batch(
@@ -1867,8 +1917,28 @@ class TestBatchGeneratorDispatch:
         )
         monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
 
-        # Cache rebuild unavailable -> degrade to plain drop, never crash.
+        # The caller must stop decoding when cache recovery is unavailable.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
+
+    def test_extend_stops_when_singleton_cache_recovery_fails(self, monkeypatch):
+        from mlx_lm.generate import GenerationBatch
+
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch, uid=7, tokens=[10, 11], queue_entries=[]
+        )
+        monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+
+        class UnmergeableUids(list):
+            def extend(self, other):
+                pytest.fail("Merged rows after cache recovery failed")
+
+        batch.uids = UnmergeableUids(batch.uids)
+        donor = SimpleNamespace(uids=[8])
+
+        with pytest.raises(RuntimeError, match="could not restore the committed cache"):
+            GenerationBatch.extend(batch, donor)
+        assert batch.uids == [7]
+        assert batch._omlx_mtp_state is state
 
 
 # ---------------------------------------------------------------------------
@@ -3008,6 +3078,77 @@ def generate(
         return output, terminal
     finally:
         gen.close()
+
+
+@pytest.mark.parametrize("recovery_fails", [False, True])
+def test_singleton_rollback_requires_successful_cache_recovery(
+    monkeypatch, recovery_fails
+):
+    class RejectDrafts(CountingModel):
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            logits = self._logits(tokens + 1)
+            return (
+                (logits, tokens[..., None].astype(mx.float32))
+                if return_hidden
+                else logits
+            )
+
+    monkeypatch.setattr(bg, "_chain_rollback", lambda *args: False)
+    if recovery_fails:
+        monkeypatch.setattr(bg, "_rebuild_singleton_cache", lambda model: None)
+        with pytest.raises(RuntimeError, match="could not restore the committed cache"):
+            generate(RejectDrafts(), [[1, 2]], [8])
+    else:
+        output, terminal = generate(RejectDrafts(), [[1, 2]], [8])
+        assert output[0] == list(range(3, 11))
+        cache = terminal[0].prompt_cache[0]
+        assert cache.keys[0, 0, : cache.offset, 0].tolist() == list(range(1, 10))
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_park_recovery_includes_the_token_being_emitted(monkeypatch, stop):
+    class RejectDrafts(CountingModel):
+        def mtp_forward(self, hidden, tokens, cache, return_hidden=False, **kwargs):
+            logits = self._logits(tokens + 1)
+            return (
+                (logits, tokens[..., None].astype(mx.float32))
+                if return_hidden
+                else logits
+            )
+
+    feed = bg._feed_next_main_to_standard
+    backbone = bg._call_backbone
+    failures = []
+    in_handoff = False
+
+    def observed_feed(*args):
+        nonlocal in_handoff
+        in_handoff = True
+        try:
+            return feed(*args)
+        finally:
+            in_handoff = False
+
+    def fail_after_forward(*args, **kwargs):
+        result = backbone(*args, **kwargs)
+        if in_handoff and not failures:
+            failures.append(True)
+            raise RuntimeError("injected handoff failure")
+        return result
+
+    monkeypatch.setattr(bg, "_feed_next_main_to_standard", observed_feed)
+    monkeypatch.setattr(bg, "_call_backbone", fail_after_forward)
+    monkeypatch.setattr(bg._DepthController, "should_exit", lambda self: True)
+    output, terminal = generate(
+        RejectDrafts(), [[1, 2]], [8], stop_tokens=[[5]] if stop else None
+    )
+    assert failures == ([] if stop else [True])
+    assert output[0] == list(range(3, 6 if stop else 11))
+    assert terminal[0].finish_reason == ("stop" if stop else "length")
+    cache = terminal[0].prompt_cache[0]
+    assert cache.keys[0, 0, : cache.offset, 0].tolist() == list(
+        range(1, 5 if stop else 11)
+    )
 
 
 @pytest.mark.parametrize("limits", [[8, 9], [1, 8], [3, 8], [4, 8]])

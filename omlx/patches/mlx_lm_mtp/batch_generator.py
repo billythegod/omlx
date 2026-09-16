@@ -154,7 +154,10 @@ def apply() -> bool:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
-                            _reconcile_mtp_to_standard(self, active)
+                            if not _reconcile_mtp_to_standard(self, active):
+                                raise RuntimeError(
+                                    "Lightning MTP could not restore the committed cache"
+                                ) from exc
                             if active.reentry_probe:
                                 try:
                                     delattr(self, "_omlx_mtp_park_state")
@@ -195,7 +198,10 @@ def apply() -> bool:
                     park_state = _mtp_park_state_for_batch(self)
                     if park_state is not None:
                         park_state.defer_probe()
-                _reconcile_mtp_to_standard(self, host_state)
+                if not _reconcile_mtp_to_standard(self, host_state):
+                    raise RuntimeError(
+                        "Lightning MTP could not restore the committed cache"
+                    )
                 _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
@@ -1320,7 +1326,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
 
     Leaves ``tokens[0]`` / ``_num_tokens[0]`` untouched (they already reflect
     streamed tokens), so there is no duplicated or skipped token. Returns False
-    (caller falls back to a plain drop) when reconcile cannot be done safely.
+    when reconcile cannot be done safely; callers must stop decoding.
     """
     import mlx.core as mx
 
@@ -1353,7 +1359,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_tok = mx.array([int(next_id)], dtype=mx.uint32)
             next_lp = next_lp_1d
         else:
-            prev_buf = gen_batch._token_context[0].tokens if procs is not None else None
+            prev_buf = (
+                mx.array(list(tokens), dtype=mx.int32) if procs is not None else None
+            )
             ll = _apply_processors(procs, prev_buf, last_logits)
             next_lp_2d = _logprobs(ll)
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
@@ -1376,7 +1384,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         )
         return True
     except Exception as exc:
-        logger.warning("MTP reconcile failed, falling back to plain drop: %s", exc)
+        logger.warning("MTP reconcile failed: %s", exc)
         return False
 
 
@@ -2843,21 +2851,18 @@ def _feed_batch_mains_to_standard(gen_batch: Any, batch_state: _MtpBatchState) -
 
 
 def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
-    """Materialize ``state.next_main`` and sample its successor.
+    """Materialize the committed main token and sample its successor.
 
-    At a cycle boundary with an empty queue the cache is exactly one token
-    behind the streamed sequence: ``state.next_main`` (already streamed) has
-    no KV yet. Feed it through the backbone, sample ``_next_tokens`` from
-    the resulting logits, and leave the batch in the standard-resumable
-    state. Shared by the depth-0 park and the late-join handoff. Returns
-    False on failure with the batch untouched.
+    A failed one-token handoff retries once by rebuilding committed history.
+    Only an absent main token returns False; failed recovery stops decoding.
     """
     import mlx.core as mx
 
     if state.next_main is None:
         return False
+    procs = _proc_list(gen_batch)
+    snapshot = _snap_snapshotable(procs)
     try:
-        procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         prev_buf = None
         if procs is not None:
@@ -2871,10 +2876,14 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         mx.eval(next_tok)
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
+        _clear_rollback(gen_batch.prompt_cache)
     except Exception as exc:
-        logger.debug("MTP feed-to-standard handoff failed: %s", exc)
-        return False
-    _clear_rollback(gen_batch.prompt_cache)
+        logger.warning("MTP handoff failed; rebuilding committed cache: %s", exc)
+        _restore_snapshotable(procs, snapshot)
+        if not _reconcile_mtp_to_standard(gen_batch, state):
+            raise RuntimeError(
+                "Lightning MTP could not restore the committed cache"
+            ) from exc
     return True
 
 
@@ -2960,16 +2969,17 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
+    result = _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
     if (
         state.chain
         and state.controller is not None
         and state.controller.should_exit()
         and not state.queue
+        and result[0].finish_reason is None
     ):
-        # Emit this cycle's token either way; on a successful handoff the
-        # next next() call runs the standard step with _next_tokens set.
+        # Record the emitted token before a handoff can rebuild its history.
         _park_mtp_to_standard(gen_batch, state)
-    return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+    return result
 
 
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
