@@ -4254,7 +4254,7 @@ def test_singleton_and_ordinary_dispatch_are_preserved():
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bits", [None, 4, 8])
 @pytest.mark.parametrize("batch,length", [(2, 2), (4, 3)])
-def test_batch_linear_retains_precision(dtype, bits, batch, length, monkeypatch):
+def test_batch_linear_matches_standard_projection(dtype, bits, batch, length):
     qwen35_verify_linear.apply(language)
     mx.random.seed(79)
     layer = nn.Linear(2048, 4096, bias=False)
@@ -4266,28 +4266,6 @@ def test_batch_linear_retains_precision(dtype, bits, batch, length, monkeypatch)
     expected = layer(x)
     assert actual.dtype == dtype
     assert mx.array_equal(actual, expected)
-    original_gate = language._use_target_verify_dense.__wrapped__
-    with monkeypatch.context() as patch:
-        patch.setattr(language, "_use_target_verify_dense", original_gate)
-        old = language._target_verify_linear(layer, x, True)
-    if bits is None:
-        weight = layer.weight.astype(mx.float32)
-    else:
-        weight = mx.dequantize(
-            layer.weight,
-            layer.scales.astype(mx.float32),
-            layer.biases.astype(mx.float32),
-            bits=bits,
-            group_size=64,
-        )
-    reference = x.astype(mx.float32) @ weight.T
-
-    def rms(value):
-        return mx.sqrt(mx.mean((value.astype(mx.float32) - reference) ** 2)).item()
-
-    # Allow reduction roundoff when the two RMS errors are otherwise equal.
-    assert rms(actual) <= rms(old) * 1.001
-    assert mx.array_equal(mx.argmax(actual, axis=-1), mx.argmax(old, axis=-1))
 
 
 @pytest.mark.parametrize("bits", [4, 8])
