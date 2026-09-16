@@ -4270,14 +4270,14 @@
                 if (this.benchRunExternal) {
                     lines.push(
                         window.t('bench.results.text_export.benchmark_model_endpoint')
-                            .replace('{model}', this.benchRunExternal.model)
-                            .replace('{url}', this.benchRunExternal.base_url)
+                            .replace('{model}', () => this.benchRunExternal.model)
+                            .replace('{url}', () => this.benchRunExternal.base_url)
                     );
                     lines.push(window.t('bench.results.text_export.engine_external'));
                 } else {
                     lines.push(
                         window.t('bench.results.text_export.benchmark_model')
-                            .replace('{model}', this.benchModelId)
+                            .replace('{model}', () => this.benchModelId)
                     );
                     lines.push(this.benchForceLmEngine
                         ? window.t('bench.results.text_export.engine_force_lm')
@@ -4842,7 +4842,7 @@
                     lines.push('');
                     lines.push(
                         window.t('acc_bench.results.text_export.model')
-                            .replace('{model}', m)
+                            .replace('{model}', () => m)
                     );
                     lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
                     lines.push('-'.repeat(62));
@@ -4955,9 +4955,9 @@
                 } else {
                     const lines = [
                         window.t('acc_bench.results.text_export.model')
-                            .replace('{model}', r.model_id),
+                            .replace('{model}', () => r.model_id),
                         window.t('acc_bench.results.text_export.benchmark_line')
-                            .replace('{benchmark}', r.benchmark.toUpperCase()),
+                            .replace('{benchmark}', () => r.benchmark.toUpperCase()),
                         window.t('acc_bench.results.text_export.accuracy_line')
                             .replace('{accuracy}', (r.accuracy * 100).toFixed(1))
                             .replace('{correct}', r.correct)
@@ -4989,47 +4989,47 @@
                         lines.push(
                             window.t('acc_bench.results.text_export.question_header')
                                 .replace('{id}', q.id)
-                                .replace('{label}', label)
+                                .replace('{label}', () => label)
                         );
                         if (q.category) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.category_line')
-                                    .replace('{category}', q.category)
+                                    .replace('{category}', () => q.category)
                             );
                         }
                         if (r.external && q.finish_reason) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.finish_reason_line')
-                                    .replace('{reason}', q.finish_reason)
+                                    .replace('{reason}', () => q.finish_reason)
                             );
                         }
                         if (r.external && (q.reasoning_fields_nonempty || []).length) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.reasoning_fields_line')
-                                    .replace('{fields}', q.reasoning_fields_nonempty.join(', '))
+                                    .replace('{fields}', () => q.reasoning_fields_nonempty.join(', '))
                             );
                         }
                         if (r.external && q.error_message) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.error_line')
-                                    .replace('{error}', q.error_message)
+                                    .replace('{error}', () => q.error_message)
                             );
                         }
                         lines.push(
                             window.t('acc_bench.results.text_export.question_line')
-                                .replace('{question}', q.question || '')
+                                .replace('{question}', () => q.question || '')
                         );
                         lines.push(
                             window.t('acc_bench.results.text_export.expected_line')
-                                .replace('{expected}', q.expected)
+                                .replace('{expected}', () => q.expected)
                         );
                         lines.push(
                             window.t('acc_bench.results.text_export.predicted_line')
-                                .replace('{predicted}', q.predicted)
+                                .replace('{predicted}', () => q.predicted)
                         );
                         lines.push(
                             window.t('acc_bench.results.text_export.raw_response_line')
-                                .replace('{response}', q.raw_response
+                                .replace('{response}', () => q.raw_response
                                     || window.t('acc_bench.results.text_export.empty_value'))
                         );
                         lines.push(
