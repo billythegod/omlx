@@ -4656,8 +4656,7 @@ async def test_naked_qwen_calls_preserve_arguments_without_streamed_xml(
     assert json.loads(arguments) == {"content": value}
 
 
-# Final Qwen parsing uses the real dependency parser and the production SSE
-# generators. Only model generation is replaced with deterministic text.
+# Use the real Qwen parser and SSE handlers with fixed model output.
 _RECOVERY_TOOLS = [
     {
         "type": "function",

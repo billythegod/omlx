@@ -1967,9 +1967,8 @@ def parse_qwen_tool_calls(
                 and _QWEN_OPEN_RE.search(text, function_start + len(_XML_FUNCTION_OPEN))
                 is None
             ):
-                # Only the last function may contain a literal envelope close
-                # with its actual outer close missing. Never scan through a
-                # later sibling and consume it as part of a malformed call.
+                # A literal close tag can hide the last function's missing outer close.
+                # Do not scan through a later call to recover it.
                 relative_end = _NakedFunctionBoundary().feed(
                     text[function_start:], len(_XML_FUNCTION_OPEN)
                 )
@@ -2003,8 +2002,7 @@ def parse_qwen_tool_calls(
         else:
             _, parsed = parse_tool_calls(envelope, tokenizer, tools)
         if recovered and parsed:
-            # A schema is evidence for recovery, not permission to fabricate
-            # required fields, coerce a tool name, or truncate a string.
+            # Recovery requires a declared tool and complete, schema-valid arguments.
             schemas = {
                 t["function"]["name"]: t["function"].get("parameters", {})
                 for t in tools
