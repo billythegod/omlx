@@ -540,7 +540,7 @@ def _skip_ws(text: str, idx: int) -> int:
 def _xml_function_payload_end(
     text: str, payload_start: int, end_marker: str
 ) -> Optional[int]:
-    """Index just past the ``</function>`` closing a qwen3_coder payload.
+    """Index just past the ``</function>`` closing an XML function payload.
 
     The ``qwen3_coder`` parser (Qwen3.5/3.6 builds) wraps XML rather than JSON
     in the envelope::
@@ -560,6 +560,10 @@ def _xml_function_payload_end(
     which leaves the caller on the historical first-match behaviour.
     """
     idx = _skip_ws(text, payload_start)
+    attr_open = _ATTR_FUNCTION_OPEN_RE.match(text, idx)
+    if attr_open:
+        span = _find_attr_function_span(text, attr_open)
+        return span[1] if span else None
     if not text.startswith(_XML_FUNCTION_OPEN, idx):
         return None
     search = idx
@@ -1921,6 +1925,31 @@ def _parse_tool_calls_impl(
         r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
     ).strip()
 
+    if tools and _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
+        # Select outer envelopes before inspecting markers inside CDATA values.
+        finder = ToolCallStreamFilter(tokenizer, tools=tools)
+        pos, prose, attr_calls = 0, [], []
+        while start := finder._find_start_envelope(cleaned_text, pos):
+            opening = _ATTR_FUNCTION_OPEN_RE.match(cleaned_text, start[0])
+            if opening is None:
+                break
+            span = _find_attr_function_span(cleaned_text, opening)
+            if span is None:
+                break
+            _, calls = _parse_attribute_function_tool_calls(
+                cleaned_text[span[0] : span[1]], tools
+            )
+            if not calls:
+                break
+            prose.append(cleaned_text[pos : span[0]])
+            attr_calls.extend(calls)
+            pos = span[1]
+        if attr_calls:
+            remainder = cleaned_text[pos:]
+            tail, calls = _parse_tool_calls_impl(remainder, tokenizer, tools)
+            prose.append(remainder[: len(remainder) - len(remainder.lstrip())] + tail)
+            return "".join(prose).strip(), attr_calls + (calls or [])
+
     # Recover missing outer wrappers through the same schema-aware XML path.
     normalized = _wrap_naked_function_calls(cleaned_text)
     if normalized is not None:
@@ -2665,9 +2694,12 @@ class ToolCallStreamFilter:
                         return  # still ambiguous, wait for more
                     self._json_state = "not_json"
                 else:
-                    self._json_state = (
-                        "xml" if head == _XML_FUNCTION_OPEN else "not_json"
-                    )
+                    if head == _XML_FUNCTION_OPEN:
+                        self._json_state = "xml"
+                    elif head.startswith("<function") and head[-1].isspace():
+                        self._json_state = "attr_xml"
+                    else:
+                        self._json_state = "not_json"
 
         if self._json_state == "array_head":
             while i < n and buffer[i] in " \t\r\n":
@@ -2719,7 +2751,7 @@ class ToolCallStreamFilter:
                 continue
 
             cdata_start = buffer.find("<![CDATA[", cursor)
-            close_tag = buffer.find("</function>", cursor)
+            close_tag = buffer.find(self._suppressing_until, cursor)
 
             if close_tag < 0:
                 if cdata_start >= 0:
@@ -2771,6 +2803,8 @@ class ToolCallStreamFilter:
             return self._find_attr_function_suppression_end(buffer)
 
         self._advance_json_scan(buffer)
+        if self._json_state == "attr_xml":
+            return self._find_attr_function_suppression_end(buffer)
 
         if self._json_state == "xml":
             # qwen3_coder dialect: the envelope ends with </function> right
@@ -3249,13 +3283,16 @@ class ToolCallStreamFilter:
             if self._suppressing_until is not None:
                 end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
-                    if self._suppressing_until == "</function>":
+                    if (
+                        self._suppressing_until == "</function>"
+                        or self._json_state == "attr_xml"
+                    ):
                         if self._attr_func_in_cdata:
                             keep = self._partial_prefix_len(self._buffer, "]]>")
                         else:
                             keep = max(
                                 self._partial_prefix_len(
-                                    self._buffer, "</function>"
+                                    self._buffer, self._suppressing_until
                                 ),
                                 self._partial_prefix_len(
                                     self._buffer, "<![CDATA["

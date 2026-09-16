@@ -5326,3 +5326,68 @@ class TestAttributeStyleFunctionDialect:
         assert envelopes == [raw_call]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Use <tool_call> for calls",
+        '<tool_call>{"name":"read","arguments":{"path":"/example"}}</tool_call>',
+        '<minimax:tool_call><invoke name="read"><parameter name="path">'
+        "/example</parameter></invoke></minimax:tool_call>",
+        "<function=read><parameter=path>/example</parameter></function>",
+    ],
+)
+def test_attribute_cdata_does_not_select_an_embedded_dialect(value):
+    tools = [TestAttributeStyleFunctionDialect.READ_TOOL]
+    raw = (
+        '<function name="read"><param name="path"><![CDATA['
+        + value
+        + "]]></param></function>"
+    )
+    cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), tools)
+    assert cleaned == ""
+    assert len(calls) == 1
+    assert calls[0].function.name == "read"
+    assert json.loads(calls[0].function.arguments) == {"path": value}
+
+
+@pytest.mark.parametrize("dialect", ["json", "qwen", "namespaced"])
+def test_attribute_example_does_not_override_outer_dialect(dialect):
+    value = TestAttributeStyleFunctionDialect.BARE_CALL
+    tools = [TestAttributeStyleFunctionDialect.READ_TOOL]
+    if dialect == "json":
+        raw = (
+            "<tool_call>"
+            + json.dumps({"name": "read", "arguments": {"path": value}})
+            + "</tool_call>"
+        )
+    elif dialect == "qwen":
+        raw = (
+            "<tool_call><function=read><parameter=path>"
+            + value
+            + "</parameter></function></tool_call>"
+        )
+    else:
+        raw = (
+            '<minimax:tool_call><invoke name="read"><parameter name="path">'
+            + value
+            + "</parameter></invoke></minimax:tool_call>"
+        )
+    cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), tools)
+    assert cleaned == ""
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"path": value}
+
+
+def test_attribute_call_preserves_following_other_dialect_call():
+    first = TestAttributeStyleFunctionDialect.BARE_CALL
+    second = '<tool_call>{"name":"read","arguments":{"path":"/second"}}</tool_call>'
+    cleaned, calls = parse_tool_calls(
+        "Before " + first + " Between " + second + " After",
+        _make_tokenizer(),
+        [TestAttributeStyleFunctionDialect.READ_TOOL],
+    )
+    assert cleaned == "Before  Between  After"
+    assert [json.loads(call.function.arguments)["path"] for call in calls] == [
+        "/workspace/TASK.md",
+        "/second",
+    ]

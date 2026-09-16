@@ -4961,3 +4961,82 @@ async def test_qwen_malformed_first_call_does_not_consume_later_valid_call():
     assert len(calls) == 1
     assert json.loads(calls[0]["arguments"]) == {"content": "hello"}
     assert events[-1]["error"]["code"] == "invalid_tool_call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api,chunk_size",
+    [("chat", 1), ("chat", 7), ("chat", 4096), ("anthropic", 7), ("responses", 7)],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Use <tool_call> for calls",
+        '<tool_call>{"name":"read","arguments":{"path":"/example"}}</tool_call>',
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_attribute_cdata_preserves_write_call_in_stream(
+    api, chunk_size, value, wrapped
+):
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.anthropic_models import MessagesRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_chat_completion,
+        stream_anthropic_messages,
+        stream_responses_api,
+    )
+
+    engine = MockBaseEngine()
+    raw = (
+        '<function name="write"><param name="content"><![CDATA['
+        + value
+        + "]]></param></function>"
+    )
+    if wrapped:
+        raw = "<tool_call>" + raw + "</tool_call>"
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=raw[: i + chunk_size], new_text=raw[i : i + chunk_size]
+            )
+            for i in range(0, len(raw), chunk_size)
+        ]
+        + [MockGenerationOutput(text=raw, finished=True, finish_reason="stop")]
+    )
+    messages = [{"role": "user", "content": "Write the example"}]
+    request = ChatCompletionRequest(model="test", messages=messages, stream=True)
+    if api == "chat":
+        stream = stream_chat_completion(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    elif api == "anthropic":
+        request = MessagesRequest(
+            model="test", messages=messages, max_tokens=1024, stream=True
+        )
+        stream = stream_anthropic_messages(
+            engine, messages, request, tools=_RECOVERY_TOOLS
+        )
+    else:
+        request = ResponsesRequest(model="test", input="Write the example", stream=True)
+        stream = stream_responses_api(
+            engine, messages, request, tools=_RECOVERY_TOOLS, store_response=False
+        )
+    events = []
+    async for event in stream:
+        for line in event.splitlines():
+            if line.startswith("data: {"):
+                events.append(json.loads(line[6:]))
+    calls = _recovery_calls(events, api)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write"
+    assert json.loads(calls[0]["arguments"]) == {"content": value}
+    if api == "chat":
+        choices = [c for event in events for c in event.get("choices", [])]
+        assert not any(c.get("delta", {}).get("content") for c in choices)
+        assert any(c.get("finish_reason") == "tool_calls" for c in choices)
+    elif api == "anthropic":
+        assert not any(e.get("delta", {}).get("text") for e in events)
+    else:
+        assert not any(e.get("type") == "response.output_text.delta" for e in events)
