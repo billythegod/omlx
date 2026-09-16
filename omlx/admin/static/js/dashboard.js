@@ -105,6 +105,11 @@
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
     function dashboard() {
+        // GridStack instance and helpers stay outside the reactive Alpine state.
+        let dashGrid = null;
+        let dashObserver = null;
+        let dashRefitFrame = null;
+        let dashRefitTimer = null;
         return {
             // Theme
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
@@ -159,7 +164,7 @@
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
                 },
-                ui: { language: 'en' },
+                ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -359,6 +364,14 @@
             },
 
             statsScope: 'session',
+            // Dashboard block layout (see dashboard_layout.js)
+            dashLayout: null,
+            dashDraft: null,
+            dashEditing: false,
+            dashSaving: false,
+            dashSaveError: '',
+            dashPlacedIds: [],
+            dashEditAvailable: true,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -741,6 +754,7 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
+                    this.$nextTick(() => this.ensureDashboardGrid());
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -905,7 +919,12 @@
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
-                        this.globalSettings.ui = data.ui || { language: 'en' };
+                        this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        const layoutLib = this._dashLayoutLib();
+                        this.dashLayout = layoutLib
+                            ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
+                            : null;
+                        if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -3241,6 +3260,219 @@
                     }
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                }
+            },
+
+            // ---- Dashboard block layout ----
+            _dashLayoutLib() {
+                return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
+            },
+            get dashboardWidthClass() {
+                const lib = this._dashLayoutLib();
+                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
+                return lib ? lib.widthClass(width) : 'max-w-7xl';
+            },
+            get dashWidthOptions() {
+                const lib = this._dashLayoutLib();
+                if (!lib) return [];
+                return lib.WIDTH_IDS.map(id => ({ id, label: window.t(`status.layout.width_${id}`) }));
+            },
+            get dashTrayEmpty() {
+                const lib = this._dashLayoutLib();
+                return !!lib && this.dashPlacedIds.length >= lib.BLOCK_IDS.length;
+            },
+            dashPlaced(id) {
+                return this.dashPlacedIds.includes(id);
+            },
+            _dashBlockEl(id) {
+                return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
+            },
+            // Creates the grid the first time the status tab is visible; GridStack
+            // needs a measurable width. Later calls only refit block heights.
+            ensureDashboardGrid() {
+                const lib = this._dashLayoutLib();
+                if (!lib || typeof GridStack === 'undefined' || this.mainTab !== 'status') return;
+                if (dashGrid) {
+                    this.refitDashboardBlocks();
+                    return;
+                }
+                const el = this.$refs.dashGrid;
+                if (!el || !el.offsetWidth) return;
+                dashGrid = GridStack.init({
+                    column: lib.COLUMNS,
+                    cellHeight: 8,
+                    margin: 12,
+                    sizeToContent: true,
+                    float: false,
+                    animate: true,
+                    minRow: 1,
+                    disableDrag: true,
+                    disableResize: true,
+                    acceptWidgets: '.dash-tray-pill',
+                    draggable: { handle: '.dash-block-handle', appendTo: 'body' },
+                    resizable: { handles: 'e, w, se' },
+                    columnOpts: {
+                        columnMax: lib.COLUMNS,
+                        breakpointForWindow: true,
+                        breakpoints: [{ w: 752, c: 1, layout: 'list' }],
+                    },
+                }, el);
+                dashGrid.on('dropped', (event, previous, node) => this._onDashTrayDrop(node));
+                dashGrid.on('dragstop resizestop', () => this.refitDashboardBlocks());
+                GridStack.setupDragIn('.dash-tray-pill', { appendTo: 'body', helper: 'clone' });
+                if (typeof ResizeObserver !== 'undefined') {
+                    dashObserver = new ResizeObserver(() => this.refitDashboardBlocks());
+                    el.querySelectorAll('.dash-block-body').forEach(body => dashObserver.observe(body));
+                }
+                const narrow = window.matchMedia('(max-width: 751.98px)');
+                const syncNarrow = () => {
+                    this.dashEditAvailable = !narrow.matches;
+                    if (narrow.matches && this.dashEditing) this.cancelDashboardEdit();
+                };
+                narrow.addEventListener('change', syncNarrow);
+                syncNarrow();
+                this.applyDashboardLayout(this.dashLayout || lib.defaultLayout());
+            },
+            // Block heights follow their content (stats polling, x-show toggles).
+            // GridStack measures the item's current box, which is still mid-transition
+            // right after a move or resize, so run a second pass once it settles.
+            refitDashboardBlocks() {
+                if (!dashGrid || this.mainTab !== 'status') return;
+                const run = () => {
+                    if (!dashGrid || !this.$refs.dashGrid?.offsetWidth) return;
+                    dashGrid.getGridItems().forEach(item => dashGrid.resizeToContent(item));
+                };
+                if (!dashRefitFrame) {
+                    dashRefitFrame = requestAnimationFrame(() => {
+                        dashRefitFrame = null;
+                        run();
+                    });
+                }
+                clearTimeout(dashRefitTimer);
+                dashRefitTimer = setTimeout(run, 400);
+            },
+            _dashPark(el) {
+                dashGrid.removeWidget(el, false, false);
+                el.classList.add('dash-block-parked');
+            },
+            _dashPlace(id, pos) {
+                const lib = this._dashLayoutLib();
+                const el = this._dashBlockEl(id);
+                if (!el || el.gridstackNode) return null;
+                el.classList.remove('dash-block-parked');
+                dashGrid.makeWidget(el, { id, x: pos.x, y: pos.y, w: pos.w, h: 1, minW: lib.MIN_W });
+                dashGrid.resizeToContent(el);
+                if (!this.dashPlacedIds.includes(id)) this.dashPlacedIds = [...this.dashPlacedIds, id];
+                return el;
+            },
+            applyDashboardLayout(layout) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib) return;
+                layout = lib.normalizeLayout(layout);
+                // No transition while rebuilding: the first content measurement of a
+                // freshly placed item must see its final box, not an animating one.
+                dashGrid.setAnimation(false);
+                dashGrid.getGridItems().forEach(item => this._dashPark(item));
+                this.dashPlacedIds = [];
+                // Heights come from content, so saved y values only encode order. Pack
+                // each block under the tallest block already occupying its columns;
+                // a later block inserted at an occupied row would push earlier ones down.
+                const bottoms = new Array(lib.COLUMNS).fill(0);
+                [...layout.blocks]
+                    .sort((a, b) => a.y - b.y || a.x - b.x)
+                    .forEach(block => {
+                        const y = Math.max(...bottoms.slice(block.x, block.x + block.w));
+                        const el = this._dashPlace(block.id, { x: block.x, y, w: block.w });
+                        const h = el?.gridstackNode?.h || 1;
+                        for (let c = block.x; c < block.x + block.w; c++) bottoms[c] = y + h;
+                    });
+                dashGrid.setAnimation(true);
+                this.refitDashboardBlocks();
+            },
+            collectDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
+                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+            },
+            _onDashTrayDrop(node) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib || !node?.el) return;
+                const id = node.el.dataset.block;
+                const pos = { x: node.x, y: node.y, w: node.w };
+                // The dropped element is GridStack's clone of the tray pill.
+                dashGrid.removeWidget(node.el, true, false);
+                if (!lib.BLOCK_IDS.includes(id) || !this.dashEditing) return;
+                this._dashPlace(id, pos);
+                this.refitDashboardBlocks();
+            },
+            dashRemoveBlock(id) {
+                const el = this._dashBlockEl(id);
+                if (!dashGrid || !this.dashEditing || !el?.gridstackNode) return;
+                this._dashPark(el);
+                this.dashPlacedIds = this.dashPlacedIds.filter(placed => placed !== id);
+                dashGrid.compact();
+            },
+            _dashAfterLayoutChange() {
+                this.$nextTick(() => {
+                    dashGrid?.onResize();
+                    this.refitDashboardBlocks();
+                });
+            },
+            startDashboardEdit() {
+                if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
+                this.dashDraft = { width: this.dashLayout.width };
+                this.dashSaveError = '';
+                this.dashEditing = true;
+                dashGrid.enable();
+                this._dashAfterLayoutChange();
+            },
+            cancelDashboardEdit() {
+                if (!this.dashEditing) return;
+                this.dashEditing = false;
+                this.dashDraft = null;
+                this.dashSaveError = '';
+                if (dashGrid) {
+                    dashGrid.disable();
+                    this.applyDashboardLayout(this.dashLayout);
+                }
+                this._dashAfterLayoutChange();
+            },
+            resetDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib) return;
+                this.dashDraft.width = 'default';
+                this.applyDashboardLayout(lib.defaultLayout());
+                this._dashAfterLayoutChange();
+            },
+            setDashboardWidth(width) {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
+                this.dashDraft.width = width;
+                this._dashAfterLayoutChange();
+            },
+            async saveDashboardLayout() {
+                if (!dashGrid || !this.dashEditing || this.dashSaving) return;
+                const layout = this.collectDashboardLayout();
+                this.dashSaving = true;
+                this.dashSaveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_dashboard_layout: layout }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    this.dashLayout = layout;
+                    this.globalSettings.ui.dashboard_layout = layout;
+                    this.dashEditing = false;
+                    this.dashDraft = null;
+                    dashGrid.disable();
+                    this._dashAfterLayoutChange();
+                } catch (err) {
+                    console.error('Failed to save dashboard layout:', err);
+                    this.dashSaveError = window.t('status.layout.save_failed');
+                } finally {
+                    this.dashSaving = false;
                 }
             },
 

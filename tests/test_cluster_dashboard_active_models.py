@@ -515,7 +515,7 @@ def test_runtime_cache_distributed_stale_marker_contributes_no_row(tmp_path):
 
 
 def test_status_template_renders_cluster_badge_and_rank_cache_row():
-    status = (ROOT / "omlx/admin/templates/dashboard/_status.html").read_text()
+    status = (ROOT / "omlx/admin/templates/dashboard/blocks/_active_models.html").read_text()
     javascript = (ROOT / "omlx/admin/static/js/dashboard.js").read_text()
     en = json.loads((ROOT / "omlx/admin/i18n/en.json").read_text())
 
