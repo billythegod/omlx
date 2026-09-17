@@ -149,20 +149,21 @@ class TestMacOSVMStats:
     """Tests for the host_statistics64 telemetry adapter."""
 
     def test_uses_layout_compatible_host_info64_count(self):
-        """Request only the fields needed across SDK-specific layouts."""
-
         class FakeLibc:
             def host_statistics64(self, host, flavor, stats, count):
                 assert host == 123
                 assert flavor == psutil_compat._HOST_VM_INFO64
-                assert count._obj.value == psutil_compat._HOST_INFO64_INITIAL_COUNT
+                requested = count._obj.value
+                assert requested <= 40
+                # The kernel returns complete revisions, not partial fields.
+                count._obj.value = 38 if requested >= 38 else 24
                 stats[0] = 10
                 stats[1] = 20
                 stats[2] = 30
                 stats[3] = 40
                 stats[psutil_compat._VM_SPECULATIVE_INDEX] = 50
-                stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
-                count._obj.value = 104
+                if count._obj.value >= 38:
+                    stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
                 return 0
 
         with (

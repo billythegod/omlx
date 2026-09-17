@@ -29,10 +29,8 @@ _VM_STATS_MIN_COUNT = 4
 # against `vm_stat` output on Apple Silicon.
 _VM_SPECULATIVE_INDEX = 23
 _VM_COMPRESSOR_INDEX = 32
-# Keep the initial request within both the 40-entry and 62-entry SDK layouts;
-# newer kernels can report a larger required count and trigger a safe retry.
-_HOST_INFO64_INITIAL_COUNT = _VM_COMPRESSOR_INDEX + 1
-# mach_vm.h's MIG_ARRAY_TOO_LARGE return value (KERN_INVALID_ARGUMENT - 307).
+# HOST_VM_INFO64 revision 2 fits older SDKs and includes compressor counters.
+_HOST_INFO64_INITIAL_COUNT = 40
 _MIG_ARRAY_TOO_LARGE = -307
 _VM_PAGE_SIZE = 16384
 _SYSCTL = "/usr/sbin/sysctl"
@@ -108,13 +106,8 @@ def get_total_memory() -> int:
 def get_macos_vm_stats() -> dict[str, int] | None:
     """Return macOS vm_statistics64 page counters in bytes.
 
-    The first four counters are stable across SDK versions. The oversized
-    host_info64_t buffer avoids binding oMLX to an SDK-specific struct tail,
-    while the initial count covers every field oMLX reads in both known SDK
-    layouts. If a newer kernel reports that it needs more entries, the call is
-    retried with that count when it still fits the allocation. "speculative"
-    and "compressed" sit further into the struct and are only reported when
-    the kernel filled that far, so callers must treat them as optional.
+    The buffer reserves space for newer layouts.
+    Tail counters are optional when the kernel returns an older revision.
     """
     if _libc is None or _MACH_HOST is None:
         return None
