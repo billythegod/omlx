@@ -362,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "Limit document attachments converted in one request.",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF processing engine",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "Select whether PDF document requests are processed by MarkItDown itself or by an OCR engine.",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "選択したOCRモデルは利用できません。モデルが再び利用可能になるか、別のエンジンを選択するまで、PDFはMarkItDownで処理されます。",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "Scanned or image-only PDFs will fail when MarkItDown is selected, and PDFs with tables may not be processed correctly.",
   "settings.integrations.websearch.section_label": "Web Search",
   "settings.integrations.websearch.provider": "Search provider",

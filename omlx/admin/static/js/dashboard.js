@@ -3710,6 +3710,11 @@
                 return this._launchCmd('pi');
             },
 
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
+            },
+
             get markitdownOcrModels() {
                 return (this.models || []).filter((model) => {
                     const configType = String(model.config_model_type || '').toLowerCase();

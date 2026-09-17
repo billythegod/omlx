@@ -362,6 +362,7 @@
   "settings.integrations.markitdown.max_files_hint": "限制单次请求中转换的文档附件数量。",
   "settings.integrations.markitdown.pdf_processing_engine": "PDF 处理引擎",
   "settings.integrations.markitdown.pdf_processing_engine_hint": "选择 PDF 文档请求由 MarkItDown 自身还是 OCR 引擎处理。",
+  "settings.integrations.markitdown.pdf_processing_missing_model": "所选 OCR 模型不可用。在模型恢复可用或选择其他引擎之前，PDF 将使用 MarkItDown 处理。",
   "settings.integrations.markitdown.pdf_processing_markitdown_warning": "选择 MarkItDown 时，扫描件或纯图片 PDF 将失败，含表格的 PDF 可能无法正确处理。",
   "settings.integrations.websearch.section_label": "联网搜索",
   "settings.integrations.websearch.provider": "搜索服务商",
