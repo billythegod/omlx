@@ -3835,15 +3835,9 @@ def _model(family):
 
         return Model(ModelArgs.from_dict(TINY_CFG))
     if family == "glm5":
-        from test_glm5_next_mtp import TINY_TEXT_CONFIG
+        from test_glm5_next_mtp import make_host
 
-        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
-
-        glm5_next_vlm_runtime.apply()
-        from mlx_vlm.models.glm5_next.config import TextConfig
-        from mlx_vlm.models.glm5_next.language import LanguageModel
-
-        return _adapter(LanguageModel(TextConfig.from_dict(TINY_TEXT_CONFIG)))
+        return _adapter(make_host(mtp_layers=1))
     if family == "step":
         from test_step3p7_patch import step3p7_mtp_model
 

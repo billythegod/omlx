@@ -30,6 +30,12 @@ from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
+@pytest.fixture(autouse=True)
+def _mock_explicit_gc(monkeypatch):
+    # These engines use mock models. Real reclamation is covered in test_engine_teardown.
+    monkeypatch.setattr("gc.collect", lambda: 0)
+
+
 class TestEngineConfig:
     """Tests for EngineConfig dataclass."""
 

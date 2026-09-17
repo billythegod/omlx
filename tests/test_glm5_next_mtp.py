@@ -4,8 +4,8 @@
 Covers nextn key matching, MTP block structure, the cache pair the head
 needs, and two sanitize paths: a raw checkpoint whose head lives at
 ``layers.<num_hidden_layers>.*``, and a checkpoint this patch already
-converted whose head is named ``mtp.*``. No weights are loaded; the config
-is shrunk so the routed MoE never allocates.
+converted whose head is named ``mtp.*``. No model checkpoint is loaded.
+Checkpoint-key tests keep the 45-layer layout; execution tests use eight layers.
 """
 
 from __future__ import annotations
@@ -709,14 +709,14 @@ def assert_row_states(actual, expected, size):
                         assert ac._processed == bc._processed
 
 
-def make_host(dtype):
+def make_host(dtype=mx.float32, *, mtp_layers=0):
     assert glm5_next_vlm_runtime.apply()
     from mlx_vlm.models.glm5_next import language
     from mlx_vlm.models.glm5_next.config import TextConfig
 
     values = copy.deepcopy(TINY_TEXT_CONFIG)
     values["num_hidden_layers"] = 8
-    values["num_nextn_predict_layers"] = 0
+    values["num_nextn_predict_layers"] = mtp_layers
     values["layer_types"] = values["layer_types"][:8]
     values["mlp_layer_types"] = values["mlp_layer_types"][:8]
     values["linear_attn_config"]["kda_layers"] = [0, 1, 2, 4, 5, 6]
