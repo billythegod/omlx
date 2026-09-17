@@ -62,6 +62,7 @@ from .exceptions import (
     is_cache_corruption_error,
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
+from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
@@ -3568,6 +3569,7 @@ class Scheduler:
                     self._apply_turboquant_kv_convert(cache)
             return cache, tokens
 
+        interrupt_batch_timing(getattr(self, "batch_generator", None))
         # Create or reuse cache
         if existing_cache is not None:
             prompt_cache = existing_cache
@@ -5480,6 +5482,7 @@ class Scheduler:
         if state.tokens_remaining.shape[1] == 0:
             return True
 
+        interrupt_batch_timing(getattr(self, "batch_generator", None))
         _t_chunk_start = time.perf_counter()
         _trace_processed_before = state.tokens_processed
         remaining = state.tokens_remaining.shape[1]
