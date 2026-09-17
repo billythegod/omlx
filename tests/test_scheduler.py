@@ -2989,16 +2989,39 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-cl-ok"]
 
+    @pytest.mark.parametrize(
+        "prompt_tokens,output_tokens,cached_tokens,shared_prefix_blocks,needs_think_prefix,"
+        "preserve_reasoning,expected_reason",
+        [
+            (34885, 1, 0, 0, False, False, "boundary_snapshot_unavailable"),
+            (34885, 1, 32768, 8, False, False, "no_new_boundary"),
+            (36863, 1, 32768, 8, False, False, "boundary_snapshot_unavailable"),
+            (34885, 3000, 32768, 8, True, False, "no_new_boundary"),
+            (34885, 3000, 32768, 8, True, True, "boundary_snapshot_unavailable"),
+            (1024, 1, 0, 0, False, False, "no_new_boundary"),
+            (34885, 1, 32768, 0, False, False, "boundary_snapshot_unavailable"),
+        ],
+    )
     def test_cleanup_finished_skips_store_without_boundary_snapshot(
-        self, mock_model, mock_tokenizer, caplog
+        self,
+        mock_model,
+        mock_tokenizer,
+        caplog,
+        prompt_tokens,
+        output_tokens,
+        cached_tokens,
+        shared_prefix_blocks,
+        needs_think_prefix,
+        preserve_reasoning,
+        expected_reason,
     ):
-        """Snapshot-needing models must not store live non-sliceable state
-        when no boundary-aligned snapshot exists (e.g. every capture was
-        skipped by the speculative-decode skew guard)."""
-        config = SchedulerConfig(paged_cache_block_size=4)
+        """Only missing snapshots beyond the restored prefix indicate a failure."""
+        config = SchedulerConfig(paged_cache_block_size=4096)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         scheduler.block_aware_cache = MagicMock()
-        scheduler.paged_cache_manager = None
+        scheduler.paged_cache_manager = MagicMock()
+        block_table = scheduler.paged_cache_manager.get_block_table.return_value
+        block_table.block_ids = [7, 8]
         scheduler._boundary_snapshot_required = True
 
         request = Request(
@@ -3006,33 +3029,84 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        request.prompt_token_ids = [1, 2, 3, 4]
-        request.num_prompt_tokens = 4
-        request.output_token_ids = [5, 6, 7, 8]  # Total = 8 (2 full blocks)
+        request.prompt_token_ids = [1] * prompt_tokens
+        request.num_prompt_tokens = prompt_tokens
+        request.output_token_ids = [2] * output_tokens
+        request.cached_tokens = cached_tokens
+        request.shared_prefix_blocks = shared_prefix_blocks
+        request.needs_think_prefix = needs_think_prefix
+        request.preserve_reasoning = preserve_reasoning
         request._extracted_cache = [{"state": "live-cache"}]
         request._model_cache_config = "live-config"
 
-        scheduler.running["req-no-snap"] = request
-        scheduler.requests["req-no-snap"] = request
-        # No boundary snapshots recorded for this request.
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
 
-        with caplog.at_level("INFO", logger="omlx.scheduler"):
-            scheduler._cleanup_finished({"req-no-snap"})
+        with caplog.at_level("DEBUG", logger="omlx.scheduler"):
+            scheduler._cleanup_finished({request.request_id})
 
         scheduler.block_aware_cache.store_cache.assert_not_called()
         scheduler.block_aware_cache.clear_request_entry.assert_called_with(
-            "req-no-snap"
+            request.request_id
+        )
+        scheduler.paged_cache_manager.release_for_eviction.assert_called_once_with(
+            [7, 8]
         )
         diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
         assert diagnostics["override_attempts"] == 1
         assert diagnostics["override_misses"] == 1
         assert diagnostics["store_skips"] == 1
-        assert diagnostics["reasons"] == {
-            "boundary_snapshot_unavailable": 1,
-            "no_snapshots": 1,
-        }
-        assert diagnostics["last_event"]["cause"] == "no_snapshots"
+        assert diagnostics["reasons"] == {expected_reason: 1, "no_snapshots": 1}
+        event = diagnostics["last_event"]
+        assert event["cause"] == "no_snapshots"
+        assert event["prompt_tokens"] == prompt_tokens
+        assert event["cached_tokens"] == cached_tokens
+        assert event["uncached_prompt_tokens"] == prompt_tokens - cached_tokens
+        skip = next(r for r in caplog.records if "Skipping cache store" in r.message)
+        assert f"reason={expected_reason}" in skip.message
+        assert f"prompt_tokens={prompt_tokens}" in skip.message
+        assert f"cached_tokens={cached_tokens}" in skip.message
+        assert f"uncached_prompt_tokens={prompt_tokens - cached_tokens}" in skip.message
+        assert skip.levelname == (
+            "DEBUG" if expected_reason == "no_new_boundary" else "INFO"
+        )
+
+    def test_cleanup_finished_reports_unreadable_existing_boundary(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4096),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.load.return_value = None
+        request = Request(
+            request_id="req-unreadable-snapshot",
+            prompt="hello",
+            prompt_token_ids=[1] * 34885,
+            sampling_params=SamplingParams(),
+        )
+        request.cached_tokens = 32768
+        request.shared_prefix_blocks = 8
+        request.output_token_ids = [2]
+        request._extracted_cache = [{"state": "live-cache"}]
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler._boundary_cache_snapshots[request.request_id] = {32768: None}
+
+        with caplog.at_level("INFO", logger="omlx.scheduler"):
+            scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        event = scheduler._boundary_snapshot_diagnostics.snapshot()["last_event"]
+        assert event["reason"] == "boundary_snapshot_unavailable"
+        assert event["cause"] == "ssd_load_failed"
+        assert event["available_boundaries"] == 1
         assert "reason=boundary_snapshot_unavailable" in caplog.text
+        assert "no_new_boundary" not in caplog.text
 
     def test_prefix_lookup_observation_explains_reprefill_boundary(
         self, mock_model, mock_tokenizer
