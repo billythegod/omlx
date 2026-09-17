@@ -2602,7 +2602,14 @@ class TestSchedulerXtcSpecialTokens:
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
 
-    def test_swallows_generation_stream_thread_error(self):
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "There is no Stream(gpu, 0) in current thread.",
+            "kIOGPUCommandBufferCallbackErrorTimeout",
+        ],
+    )
+    def test_swallows_generation_stream_thread_error(self, message):
         """generation_stream sync failing must not break cache clear.
 
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
@@ -2618,7 +2625,7 @@ class TestSyncAndClearCache:
 
         def fake_gen_sync(stream):
             calls.append(("gen_sync", stream))
-            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+            raise RuntimeError(message)
 
         def fake_default_sync():
             calls.append(("default_sync",))
@@ -2641,6 +2648,33 @@ class TestSyncAndClearCache:
         assert calls[0][0] == "gen_sync"
         assert ("default_sync",) in calls
         assert ("clear_cache",) in calls
+
+    @pytest.mark.parametrize("stage", ["generation", "default", "clear"])
+    def test_terminal_gpu_error_exits_before_further_cleanup(self, stage):
+        from omlx.utils import metal_sync
+
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: "
+            "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored"
+        )
+
+        def synchronize(*args):
+            if (stage == "generation" and args) or (stage == "default" and not args):
+                raise error
+
+        with (
+            patch.object(metal_sync.mx, "synchronize", side_effect=synchronize),
+            patch.object(
+                metal_sync.mx,
+                "clear_cache",
+                side_effect=error if stage == "clear" else None,
+            ) as clear,
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            metal_sync._sync_and_clear_cache()
+        fatal.assert_called_once()
+        assert clear.call_count == (1 if stage == "clear" else 0)
 
     def test_propagates_default_stream_error(self):
         """Errors on the default stream sync are not swallowed."""
@@ -4974,6 +5008,22 @@ class TestCacheCorruptionRecovery:
         assert list(scheduler.prefilling) == [req]
         assert "req-prefill" in scheduler._prefill_states
         assert req not in scheduler.waiting
+
+    def test_fail_all_requests_exits_on_terminal_gpu_error(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: "
+            "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored"
+        )
+        with (
+            patch("omlx.utils.metal_sync.mx.synchronize", side_effect=error),
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.fail_all_requests()
+        fatal.assert_called_once()
 
     def test_fail_all_requests_clears_everything(self, mock_model, mock_tokenizer):
         """fail_all_requests removes all running and waiting requests."""
