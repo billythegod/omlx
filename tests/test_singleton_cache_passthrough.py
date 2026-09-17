@@ -112,6 +112,46 @@ def test_join_finds_nested_model_owned_batch_conversion():
     assert nested == ("custom-batch", (0,))
 
 
+def test_join_converts_vendored_qwen4_exp_linear_cache():
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArraysCache
+
+    class Model:
+        def make_cache(self):
+            return [Qwen4ArraysCache(size=2)]
+
+    caches = [omlx.scheduler._to_batched_cache_layer(c) for c in Model().make_cache()]
+
+    assert isinstance(caches[0], Qwen4ArraysCache)
+    assert caches[0].left_padding.tolist() == [0]
+
+
+def test_join_leaves_running_qwen4_exp_linear_cache_unpadded():
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.cache import ArraysCache as Qwen4ArraysCache
+
+    warm = Qwen4ArraysCache(size=2)
+    warm[0] = mx.ones((1, 2, 3))
+    mx.eval(warm[0])
+
+    class Model:
+        def make_cache(self):
+            return [warm]
+
+    caches = [omlx.scheduler._to_batched_cache_layer(c) for c in Model().make_cache()]
+
+    assert caches[0] is warm
+    assert warm.left_padding is None
+
+
 def test_prompt_batch_full_split_moves_cache_without_copy():
     arrays = _arrays_cache()
     kv = _kv_cache(3)

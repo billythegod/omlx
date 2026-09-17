@@ -114,11 +114,12 @@ def apply() -> bool:
                             "standard", started, time.perf_counter()
                         )
                         policy.observe_standard(elapsed)
-                        logger.debug(
-                            "Lightning MTP ordinary batch sample: rows=%d ms=%.3f",
-                            len(self.uids),
-                            elapsed,
-                        )
+                        if elapsed is not None:
+                            logger.debug(
+                                "Lightning MTP ordinary batch sample: rows=%d ms=%.3f",
+                                len(self.uids),
+                                elapsed,
+                            )
                     return result
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
@@ -295,13 +296,24 @@ def apply() -> bool:
                         self.completion_batch_size = old_completion_batch_size
                     elif hasattr(self, "completion_batch_size"):
                         delattr(self, "completion_batch_size")
-            return original_bg_next(self, *args, **kwargs)
+            result = original_bg_next(self, *args, **kwargs)
+            if result[0]:
+                interrupt_batch_timing(self)
+            return result
 
         BatchGenerator._next = patched_bg_next
         BatchGenerator.remove = patched_bg_remove
         BatchGenerator.close = patched_bg_close
         BatchGenerator._omlx_mtp_patched = True
     return True
+
+
+def interrupt_batch_timing(generator: Any) -> None:
+    """Exclude a prefill-interrupted interval from batch cost learning."""
+    batch = getattr(generator, "_generation_batch", None)
+    policy = getattr(batch, "_omlx_mtp_batch_policy", None)
+    if policy is not None:
+        policy.interrupt_timing()
 
 
 def _model_has_mtp_module(model: Any) -> bool:
@@ -2687,14 +2699,15 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
             state.stats.accepts - count for state, (_, count) in zip(states, previous)
         ]
         policy.observe_mtp(depths[0], accepted, elapsed, stable=depths[0] == requested)
-        logger.debug(
-            "Lightning MTP batch cost: rows=%d depth=%d accepts=%s ms=%.3f next_depth=%d",
-            len(states),
-            depths[0],
-            accepted,
-            elapsed,
-            policy.cur,
-        )
+        if elapsed is not None:
+            logger.debug(
+                "Lightning MTP batch cost: rows=%d depth=%d accepts=%s ms=%.3f next_depth=%d",
+                len(states),
+                depths[0],
+                accepted,
+                elapsed,
+                policy.cur,
+            )
         if policy.should_park():
             if not _reconcile_mtp_batch_to_standard(gen_batch):
                 raise RuntimeError(

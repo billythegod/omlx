@@ -4229,6 +4229,75 @@ def test_cost_includes_scheduler_interval_but_not_a_mode_transition():
     assert abs(policy.cycle_time_ms("mtp", 2.034, 2.064) - 34) < 1e-9
 
 
+def test_prefill_wait_does_not_park_a_faster_batch():
+    policy = calibrated(batch=2, depth=2)
+    now = 0.0
+    for _ in range(40):
+        costs = {depth: list(values) for depth, values in policy.costs.items()}
+        policy.interrupt_timing()
+        now += 1.0
+        elapsed = policy.cycle_time_ms("mtp", now, now + 0.02)
+        policy.observe_mtp(2, [2, 2], elapsed, stable=True)
+        assert elapsed is None
+        assert {depth: list(values) for depth, values in policy.costs.items()} == costs
+        now += 0.02
+        for _ in range(3):
+            depth = policy.cur
+            elapsed = policy.cycle_time_ms("mtp", now, now + 0.02)
+            policy.observe_mtp(depth, [depth, depth], elapsed, stable=True)
+            now += 0.02
+        assert not policy.should_park()
+    assert all(abs(t - 20) < 1e-6 for costs in policy.costs.values() for t in costs)
+
+
+def test_interrupted_standard_sample_preserves_calibration_and_cooldown():
+    policy = calibrated()
+    policy.park()
+    for _ in range(128):
+        policy.interrupt_timing()
+        elapsed = policy.cycle_time_ms("standard", 1, 2)
+        policy.observe_standard(elapsed)
+    assert policy.remaining == 0
+    assert policy.standard_warmup == 2
+    assert list(policy.standard) == [10, 10, 10]
+    for i in range(3):
+        now = 2 + i * 0.01
+        policy.observe_standard(policy.cycle_time_ms("standard", now, now + 0.01))
+    assert not policy.needs_standard()
+
+
+def test_generator_prefill_interrupts_batch_cost_samples(monkeypatch):
+    observed = []
+    clock = BatchPolicy.cycle_time_ms
+
+    def record(policy, *args):
+        elapsed = clock(policy, *args)
+        observed.append(elapsed)
+        return elapsed
+
+    monkeypatch.setattr(BatchPolicy, "cycle_time_ms", record)
+    bg.apply()
+    gen = BatchGenerator(
+        CountingModel(),
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=2,
+        prefill_step_size=3,
+        max_tokens=100,
+    )
+    try:
+        gen.insert([[1, 2], [3, 4]])
+        for _ in range(12):
+            gen.next()
+        observed.clear()
+        gen.insert([[20] * 24])
+        for _ in range(6):
+            gen.next()
+        assert None in observed
+        assert any(value is not None for value in observed)
+    finally:
+        gen.close()
+
+
 def _coupled_sampler(index):
     key = mx.random.key(index + 90)
 

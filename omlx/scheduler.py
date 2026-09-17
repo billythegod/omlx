@@ -62,6 +62,7 @@ from .exceptions import (
     is_cache_corruption_error,
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
+from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
@@ -3521,6 +3522,7 @@ class Scheduler:
                     self._apply_turboquant_kv_convert(cache)
             return cache, tokens
 
+        interrupt_batch_timing(getattr(self, "batch_generator", None))
         # Create or reuse cache
         if existing_cache is not None:
             prompt_cache = existing_cache
@@ -5433,6 +5435,7 @@ class Scheduler:
         if state.tokens_remaining.shape[1] == 0:
             return True
 
+        interrupt_batch_timing(getattr(self, "batch_generator", None))
         _t_chunk_start = time.perf_counter()
         _trace_processed_before = state.tokens_processed
         remaining = state.tokens_remaining.shape[1]
@@ -11971,23 +11974,52 @@ class Scheduler:
                             available_boundaries = len(
                                 self._boundary_cache_snapshots.get(request_id, {})
                             )
+                            block_size = self.config.paged_cache_block_size
+                            prompt_tokens = len(request.prompt_token_ids)
+                            cached_tokens = request.cached_tokens
+                            uncached_prompt_tokens = max(
+                                0, prompt_tokens - cached_tokens
+                            )
+                            reason = "boundary_snapshot_unavailable"
+                            # Prefill retries can advance cached_tokens beyond the restored blocks.
+                            if (
+                                available_boundaries == 0
+                                and block_size > 0
+                                and len(cacheable_sequence) // block_size
+                                <= min(
+                                    cached_tokens // block_size,
+                                    request.shared_prefix_blocks,
+                                )
+                            ):
+                                reason = "no_new_boundary"
                             self._boundary_snapshot_diagnostics.record(
                                 "store_skip",
-                                reason="boundary_snapshot_unavailable",
+                                reason=reason,
                                 request_id=request_id,
                                 token_count=len(cacheable_sequence),
-                                block_size=self.config.paged_cache_block_size,
+                                block_size=block_size,
                                 available_boundaries=available_boundaries,
+                                prompt_tokens=prompt_tokens,
+                                cached_tokens=cached_tokens,
+                                uncached_prompt_tokens=uncached_prompt_tokens,
                             )
-                            logger.info(
+                            logger.log(
+                                (
+                                    logging.DEBUG
+                                    if reason == "no_new_boundary"
+                                    else logging.INFO
+                                ),
                                 "Skipping cache store for %s: reason=%s "
-                                "tokens=%d block_size=%d available_boundaries=%d; "
-                                "storing live non-sliceable state would corrupt "
-                                "later prefix hits",
+                                "tokens=%d prompt_tokens=%d cached_tokens=%d "
+                                "uncached_prompt_tokens=%d block_size=%d "
+                                "available_boundaries=%d",
                                 request_id,
-                                "boundary_snapshot_unavailable",
+                                reason,
                                 len(cacheable_sequence),
-                                self.config.paged_cache_block_size,
+                                prompt_tokens,
+                                cached_tokens,
+                                uncached_prompt_tokens,
+                                block_size,
                                 available_boundaries,
                             )
                             block_table = None
