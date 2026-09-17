@@ -2637,11 +2637,22 @@ class VLMBatchedEngine(BaseEngine):
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
         try:
             from mlx_vlm.tool_parsers import (
-                _infer_tool_parser,
+                _EXTRA_PATTERNS,
                 load_tool_module,
             )
 
-            tool_parser_type = _infer_tool_parser(chat_template)
+            from mlx_lm.tokenizer_utils import _infer_tool_parser
+
+            tool_parser_type = _infer_tool_parser(tokenizer)
+            if tool_parser_type is None and isinstance(chat_template, str):
+                tool_parser_type = next(
+                    (
+                        name
+                        for marker, name in _EXTRA_PATTERNS
+                        if marker in chat_template
+                    ),
+                    None,
+                )
             if tool_parser_type is None:
                 return
             try:
@@ -2659,7 +2670,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             except ImportError:
                 return
-            tool_parser_type = _mlx_lm_infer(chat_template)
+            tool_parser_type = _mlx_lm_infer(tokenizer)
             if tool_parser_type is None:
                 return
             try:

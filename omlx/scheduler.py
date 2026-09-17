@@ -34,7 +34,7 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
     PromptProcessingBatch,
-    SequenceStateMachine,
+    StopSequences,
 )
 from mlx_lm.models.cache import (
     ArraysCache as _MLXArraysCache,
@@ -224,7 +224,7 @@ class _VLMMTPDecodeState:
     state_machine: Any
     max_tokens: int
     # Plain stop-token set (EOS + request-specific) for direct membership
-    # check; mlx-lm's SequenceStateMachine doesn't expose a "did the last
+    # check; mlx-lm's StopSequences doesn't expose a "did the last
     # token finish" helper, so we keep a copy.
     stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
@@ -942,52 +942,9 @@ if _TQ_SINGLETON_CACHE_TYPE is not None:
         _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
-_original_make_cache = _mlx_lm_generate_module._make_cache
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
 _REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
-
-
-def _patched_make_cache(model, left_padding, max_kv_size):
-    """Honor model-owned batch conversion before MLX-LM's fallbacks."""
-    if not hasattr(model, "make_cache"):
-        return _original_make_cache(model, left_padding, max_kv_size)
-
-    model_cache = model.make_cache()
-
-    def has_model_owned_conversion(cache_obj):
-        if callable(getattr(cache_obj, "to_batch", None)):
-            return True
-        sub_caches = getattr(cache_obj, "caches", None)
-        return isinstance(sub_caches, (list, tuple)) and any(
-            has_model_owned_conversion(child) for child in sub_caches
-        )
-
-    class _SingleCacheModel:
-        layers = (None,)
-
-        def __init__(self, cache_obj):
-            self.cache_obj = cache_obj
-
-        def make_cache(self):
-            return [self.cache_obj]
-
-    def convert(cache_obj):
-        to_batch = getattr(cache_obj, "to_batch", None)
-        if callable(to_batch):
-            return to_batch(left_padding)
-
-        sub_caches = getattr(cache_obj, "caches", None)
-        if isinstance(sub_caches, (list, tuple)) and any(
-            has_model_owned_conversion(child) for child in sub_caches
-        ):
-            return type(cache_obj)(*(convert(child) for child in sub_caches))
-
-        return _original_make_cache(
-            _SingleCacheModel(cache_obj), left_padding, max_kv_size
-        )[0]
-
-    return [convert(cache_obj) for cache_obj in model_cache]
 
 
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
@@ -1011,10 +968,7 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
     ):
         return cache_obj.merge([cache_obj])
-    # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
-    # conversion via to_batch, which _patched_make_cache honors at creation;
-    # honor it on the continuous-batching join path too, or extend() hits a
-    # singleton without the method. A warm singleton is one unpadded row.
+    # Model-owned conversion preserves extra state when a singleton joins a batch.
     to_batch = getattr(cache_obj, "to_batch", None)
     if callable(to_batch):
         return to_batch([0])
@@ -1076,7 +1030,7 @@ def _patched_ppb_split(self, indices):
         # Defensive: normalise None → [] to avoid mlx-lm crash in _step
         lps = self.logits_processors if self.logits_processors is not None else []
         new_batch.logits_processors = lps
-        new_batch.state_machines = self.state_machines
+        new_batch.stop_sequences = self.stop_sequences
         new_batch.max_tokens = self.max_tokens
         if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
             new_batch._omlx_glm_dsa_adaptive_prefill = (
@@ -1088,13 +1042,12 @@ def _patched_ppb_split(self, indices):
         self.tokens = []
         self.samplers = []
         self.logits_processors = []
-        self.state_machines = []
+        self.stop_sequences = []
         self.max_tokens = []
         return new_batch
     return _original_ppb_split(self, indices)
 
 
-_mlx_lm_generate_module._make_cache = _patched_make_cache
 _mlx_lm_generate_module._merge_caches = _patched_merge_caches
 _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
@@ -3045,7 +2998,7 @@ class Scheduler:
         return stop_tokens
 
     # _update_stop_tokens deleted — per-request stop tokens are now
-    # handled via SequenceStateMachine passed to insert().
+    # handled via StopSequences passed to insert().
 
     def _get_detokenizer(self, request_id: str):
         """Get or create a streaming detokenizer for a request.
@@ -5831,7 +5784,7 @@ class Scheduler:
                 all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[state.sampler],
                 logits_processors=[per_row_lps],
-                state_machines=[state.sm],
+                stop_sequences=[state.sm],
             )
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
@@ -5992,8 +5945,8 @@ class Scheduler:
 
         self.prefilling = still_prefilling
 
-    def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
-        """Build a SequenceStateMachine for per-request stop tokens.
+    def _build_state_machine(self, request: "Request") -> StopSequences:
+        """Build a StopSequences for per-request stop tokens.
 
         Combines base stop tokens (EOS, Harmony) with request-specific
         stop_token_ids and tokenized stop strings into a single state
@@ -6004,13 +5957,11 @@ class Scheduler:
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
-        transitions: dict[str, list] = {
-            "normal": [([t], None) for t in stop_tokens_set]
-        }
+        sequences = [[t] for t in stop_tokens_set]
         stop_sequence_strings: dict[tuple[int, ...], str] = {}
 
         # Tokenize stop strings into token sequences. mlx-lm's
-        # SequenceStateMachine uses Aho-Corasick, so per-token match
+        # StopSequences uses Aho-Corasick, so per-token match
         # cost stays O(1) regardless of how many sequences are added.
         # Text matching below also covers context-dependent BPE boundaries.
         for stop_str in request.sampling_params.stop or []:
@@ -6022,7 +5973,7 @@ class Scheduler:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
                 token_sequence = tuple(int(token) for token in seq)
-                transitions["normal"].append((list(token_sequence), None))
+                sequences.append(list(token_sequence))
                 stop_sequence_strings[token_sequence] = stop_str
 
         # Response-side buffering is request-local so normal completion,
@@ -6031,9 +5982,7 @@ class Scheduler:
             strings=stop_sequence_strings
         )
 
-        if transitions["normal"]:
-            return SequenceStateMachine(transitions, initial="normal")
-        return SequenceStateMachine({}, initial="normal")
+        return StopSequences(sequences)
 
     def _buffer_stop_sequence_output(
         self,
@@ -6044,8 +5993,8 @@ class Scheduler:
     ) -> list[RequestOutput]:
         """Suppress every output chunk belonging to a matched stop sequence.
 
-        mlx-lm reports the full ``match_sequence`` but marks only its final
-        token as ``finish_reason=stop``. Keep token and text prefixes pending
+        mlx-lm marks only the final stop token as ``finish_reason=stop``.
+        Keep token and text prefixes pending
         until they either match or diverge, including context-dependent BPE
         tokens that differ from the standalone stop encoding.
         """
@@ -6070,15 +6019,13 @@ class Scheduler:
         pending.append((int(response.token), output))
 
         pending_tokens = tuple(token for token, _ in pending)
-        reported_match = tuple(
-            int(token)
-            for token in (getattr(response, "match_sequence", None) or ())
-        )
-        matched_sequence = (
-            reported_match
-            if output.finish_reason == "stop" and reported_match in state.strings
-            else None
-        )
+        matched_sequence = None
+        if output.finish_reason == "stop":
+            matched_sequence = max(
+                (seq for seq in state.strings if pending_tokens[-len(seq) :] == seq),
+                key=len,
+                default=None,
+            )
         if matched_sequence is not None:
             terminal_output = output
             matched_outputs = []
@@ -7880,8 +7827,8 @@ class Scheduler:
                     if (
                         type(expected_layer).__name__ == "ArraysCache"
                         and type(layer_cache).__name__ in arrays_names
-                        and len(getattr(layer_cache, "state", ()))
-                        != len(getattr(expected_layer, "state", ()))
+                        and len(getattr(layer_cache, "cache", ()))
+                        != len(getattr(expected_layer, "cache", ()))
                     ):
                         return False
 
@@ -8209,13 +8156,7 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    if handler is not None and class_name in (
-                        "MiniMaxM3KVCache",
-                        "MiniMaxM3BatchKVCache",
-                        "QSAKVCache",
-                        "QSAQuantizedKVCache",
-                        "BatchQSAKVCache",
-                    ):
+                    if handler is not None:
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
                     else:
@@ -11347,7 +11288,7 @@ class Scheduler:
                     all_tokens=[_batch_generator_all_tokens(request)],
                     samplers=[sampler],
                     logits_processors=[per_row_lps],
-                    state_machines=[sm],
+                    stop_sequences=[sm],
                 )
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])

@@ -11,6 +11,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
+from omlx.cache.type_registry import CacheTypeRegistry
+from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.models.cache import KVCache
 from mlx_vlm.models.qwen3_5 import language
@@ -135,10 +137,7 @@ class TestMtpBoundaryCommit:
             _token_context=[],
             max_tokens=[1000],
             _num_tokens=[0],
-            _matcher_states=[0],
-            state_machines=[
-                SimpleNamespace(match=lambda state, token: (0, None, None))
-            ],
+            _matchers=[SimpleNamespace(advance=lambda token: False)],
         )
 
         monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
@@ -1056,7 +1055,7 @@ class TestBatchGeneratorDispatch:
             _prompt_batch=prompt_batch,
             _currently_processing=[([[123]], 0, 1)],
             _unprocessed_sequences=[],
-            _gen_tokens_counter=0,
+            _counters=BatchCounters(),
             _steps_counter=0,
             _prompt_tokens_counter=0,
             _prompt_time_counter=0.0,
@@ -1262,7 +1261,6 @@ class TestBatchGeneratorDispatch:
 
         from omlx.patches.mlx_lm_mtp import batch_generator
 
-        matcher_state = object()
         batch = SimpleNamespace(
             uids=[7],
             _omlx_mtp_park_state=batch_generator._MtpParkState(
@@ -1272,12 +1270,7 @@ class TestBatchGeneratorDispatch:
             _step=lambda: ([42], [None]),
             _num_tokens=[0],
             max_tokens=[10],
-            state_machines=[
-                SimpleNamespace(
-                    match=lambda state, _token: (state, None, state)
-                )
-            ],
-            _matcher_states=[matcher_state],
+            _matchers=[SimpleNamespace(advance=lambda token: False)],
             Response=lambda **kwargs: kwargs,
             extract_cache=lambda _idx: [],
             tokens=[[]],
@@ -2477,7 +2470,7 @@ class TestRotatingCacheMtpUndo:
         mx.eval(ck, cv, rk, rv)
         assert mx.array_equal(ck, rk).item()
         assert mx.array_equal(cv, rv).item()
-        assert cache.meta_state == ref.meta_state
+        assert (cache.max_size, cache._idx) == (ref.max_size, ref._idx)
         c_off = cache.offset
         r_off = ref.offset
         if hasattr(c_off, "tolist"):
@@ -2962,8 +2955,12 @@ class TestReconcileChunked:
                 logits = model(tokens[None, start : start + step], cache=reference)
                 mx.eval(logits)
             for actual, wanted in zip(target.prompt_cache, reference):
-                for a, b in zip(actual.state, wanted.state):
-                    assert mx.allclose(a, b).item()
+                for (_, a), (_, b) in zip(
+                    tree_flatten(actual.state), tree_flatten(wanted.state)
+                ):
+                    assert (
+                        mx.allclose(a, b).item() if isinstance(a, mx.array) else a == b
+                    )
             expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
             assert target._next_tokens.item() == expected_token
         finally:
@@ -3901,7 +3898,9 @@ def test_reconcile_matches_ordinary_prefill_cache_and_next_token(family, queued)
                     assert mx.array_equal(value, ref).item(), (family, key)
                 else:
                     assert value == ref
-            assert actual.meta_state == expected.meta_state
+            assert getattr(actual, "meta_state", ()) == getattr(
+                expected, "meta_state", ()
+            )
         expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
         assert batch._next_tokens.item() == expected_token
         assert batch.tokens == [history]
@@ -3941,7 +3940,9 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
                     assert mx.array_equal(value, ref), (family, key)
                 else:
                     assert value == ref
-            assert actual.meta_state == expected.meta_state
+            assert getattr(actual, "meta_state", ()) == getattr(
+                expected, "meta_state", ()
+            )
         handoffs.append(tuple(batch.uids))
         return result
 
@@ -4303,7 +4304,16 @@ def test_batched_head_matches_row_caches_across_depth_changes(size, family, stoc
                     actual = layer.extract(index)
                     assert actual.offset == reference.offset
                     for (_, tensor), (_, expected) in zip(
-                        tree_flatten(actual.state), tree_flatten(reference.state)
+                        tree_flatten(
+                            CacheTypeRegistry.get_handler_for_object(
+                                actual
+                            ).serialize_state(actual)
+                        ),
+                        tree_flatten(
+                            CacheTypeRegistry.get_handler_for_object(
+                                reference
+                            ).serialize_state(reference)
+                        ),
                     ):
                         assert mx.allclose(tensor, expected, rtol=1e-4, atol=1e-4)
         batched_head.flush(owner)

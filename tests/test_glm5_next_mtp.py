@@ -964,8 +964,11 @@ def test_history_and_clone_match_independent_heads(size, stochastic, quantized):
             for layer, reference in zip(owner.head.cache, ref.mtp_cache):
                 actual = layer.extract(index)
                 assert actual.offset == reference.offset
-                actual_state = dict(tree_flatten(actual.state))
-                reference_state = dict(tree_flatten(reference.state))
+                from omlx.cache.type_registry import CacheTypeRegistry
+
+                handler = CacheTypeRegistry.get_handler_for_object(actual)
+                actual_state = dict(tree_flatten(handler.serialize_state(actual)))
+                reference_state = dict(tree_flatten(handler.serialize_state(reference)))
                 for key, value in actual_state.items():
                     expected = reference_state[key]
                     if isinstance(value, mx.array):

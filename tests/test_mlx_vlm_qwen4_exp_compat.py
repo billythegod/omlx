@@ -859,8 +859,7 @@ def test_qwen4_adapter_cache_only_prefill_skips_vocab_projection():
     assert offsets and max(offsets) == 4
 
 
-
-def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
+def test_qwen4_batch_join_honors_model_owned_cache_conversion():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
 
@@ -881,7 +880,10 @@ def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
             return [qsa_cache]
 
     generate = importlib.import_module("mlx_lm.generate")
-    caches = generate._make_cache(Model(), [0], None)
+    caches = [
+        omlx.scheduler._to_batched_cache_layer(c)
+        for c in generate._merge_caches([Model().make_cache()])
+    ]
 
     assert len(caches) == 1
     assert isinstance(caches[0], BatchQSAKVCache)

@@ -1036,7 +1036,7 @@ def _make_row_batch(
         logits_processors=[
             _row_value(getattr(gen_batch, "logits_processors", None), idx, [])
         ],
-        state_machines=[_row_value(getattr(gen_batch, "state_machines", None), idx)],
+        stop_sequences=[_row_value(getattr(gen_batch, "stop_sequences", None), idx)],
         max_tokens=[_row_value(getattr(gen_batch, "max_tokens", None), idx)],
         _next_tokens=next_tokens[idx : idx + 1] if next_tokens is not None else None,
         _next_logprobs=(
@@ -1046,7 +1046,7 @@ def _make_row_batch(
         ),
         _token_context=[gen_batch._token_context[idx]],
         _num_tokens=[gen_batch._num_tokens[idx]],
-        _matcher_states=[gen_batch._matcher_states[idx]],
+        _matchers=[gen_batch._matchers[idx]],
     )
     if state is not None:
         row._omlx_mtp_state = state
@@ -1291,17 +1291,12 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
-    """Build a fresh single-sequence batch-aware cache (left_padding=[0]).
-
-    Reuses mlx-lm's own ``_make_cache`` so the per-layer types match exactly
-    what ``extend()`` / ``_extend_cache`` expects, keeping the subsequent merge
-    type-compatible. Returns None if the converter is unavailable.
-    """
-    import sys
+    """Build a fresh cache through the same merge path as prompt processing."""
+    from mlx_lm.models.cache import make_prompt_cache
+    from omlx.scheduler import _patched_merge_caches
 
     try:
-        make_cache = sys.modules["mlx_lm.generate"]._make_cache
-        return make_cache(model, [0], None)
+        return _patched_merge_caches([make_prompt_cache(model)])
     except Exception as exc:
         logger.warning("MTP reconcile: cache rebuild unavailable: %s", exc)
         return None
@@ -2751,14 +2746,7 @@ def _emit_ragged_responses(
             gen_batch._num_tokens[idx] += 1
             if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
                 finish_reason = "length"
-            new_state, match_sequence, current_state = gen_batch.state_machines[
-                idx
-            ].match(
-                gen_batch._matcher_states[idx],
-                token_id,
-            )
-            gen_batch._matcher_states[idx] = new_state
-            if match_sequence is not None and current_state is None:
+            if gen_batch._matchers[idx].advance(token_id):
                 finish_reason = "stop"
             if finish_reason is not None:
                 responses.append(
@@ -2767,8 +2755,6 @@ def _emit_ragged_responses(
                         token=token_id,
                         logprobs=logprobs_1d,
                         finish_reason=finish_reason,
-                        current_state=current_state,
-                        match_sequence=match_sequence,
                         prompt_cache=gen_batch.extract_cache(idx),
                         all_tokens=gen_batch.tokens[idx],
                     )
@@ -2784,8 +2770,6 @@ def _emit_ragged_responses(
                     token=token_id,
                     logprobs=logprobs_1d,
                     finish_reason=None,
-                    current_state=current_state,
-                    match_sequence=match_sequence,
                     prompt_cache=None,
                     all_tokens=None,
                 )
@@ -3262,12 +3246,11 @@ def _run_verify_cycle_chain(
 
     remaining = gen_batch.max_tokens[0] - gen_batch._num_tokens[0]
     limit = max(0, remaining - 1)
-    matcher_state = gen_batch._matcher_states[0]
+    from copy import copy
+
+    matcher = copy(gen_batch._matchers[0])
     for j, token in enumerate(draft_ids[:m] + [emit_last_id]):
-        matcher_state, match, current = gen_batch.state_machines[0].match(
-            matcher_state, token
-        )
-        if match is not None and current is None:
+        if matcher.advance(token):
             limit = min(limit, j)
             break
     if limit < m:
@@ -3750,18 +3733,13 @@ def _emit_response(
     Response = type(gen_batch).Response
 
     finish_reason: Optional[str] = None
-    match_sequence = None
 
     gen_batch.tokens[0].append(token_id)
     gen_batch._num_tokens[0] += 1
     if gen_batch._num_tokens[0] >= gen_batch.max_tokens[0]:
         finish_reason = "length"
 
-    new_state, match_sequence, current_state = gen_batch.state_machines[0].match(
-        gen_batch._matcher_states[0], token_id
-    )
-    gen_batch._matcher_states[0] = new_state
-    if match_sequence is not None and current_state is None:
+    if gen_batch._matchers[0].advance(token_id):
         finish_reason = "stop"
 
     if finish_reason is not None:
@@ -3772,8 +3750,6 @@ def _emit_response(
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=finish_reason,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
@@ -3795,8 +3771,6 @@ def _emit_response(
             token=token_id,
             logprobs=logprobs_1d,
             finish_reason=None,
-            current_state=current_state,
-            match_sequence=match_sequence,
             prompt_cache=None,
             all_tokens=None,
         )
