@@ -263,9 +263,7 @@ struct AppearanceScreen: View {
                     ),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $enhancedReadability)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $enhancedReadability)
                 }
             }
         }
