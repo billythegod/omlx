@@ -620,10 +620,7 @@ def _has_audio_weights(model_dir: Path) -> bool:
     return False
 
 
-# Vision parameter paths that a text-only checkpoint can still carry. oQ's
-# text_only mode strips the encoder proper (`vision_tower.*`) but deliberately
-# keeps `embed_vision.*` — the projection into the vision space — so a
-# vision-less checkpoint is not necessarily a vision-free weight dict.
+# Text-only oQ checkpoints can retain embed_vision without a vision tower.
 _VISION_TOWER_MARKER = "vision_tower"
 _VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
 
@@ -634,11 +631,7 @@ def _is_vision_tensor_key(key: str) -> bool:
 
 
 def _is_vision_tower_key(key: str) -> bool:
-    """True for parameter paths under the vision encoder itself.
-
-    Stricter than :func:`_is_vision_tensor_key`: `embed_vision` is built *by*
-    the tower, so it is not evidence that one exists.
-    """
+    """Exclude orphan projection weights when detecting a vision tower."""
     return _VISION_TOWER_MARKER in key.split(".")
 
 
@@ -652,24 +645,14 @@ def _has_vision_tower_weights(model_dir: Path) -> bool:
         weight_files.append(sidecar)
 
     for sf in weight_files:
-        try:
-            with safetensors.safe_open(str(sf), framework="np") as f:
-                for k in f.keys():
-                    if _is_vision_tower_key(k):
-                        return True
-        except Exception:
-            # Corrupt or unreadable shard — treat as no vision info, let
-            # downstream loader produce its own error.
-            return False
+        with safetensors.safe_open(str(sf), framework="np") as f:
+            if any(_is_vision_tower_key(k) for k in f.keys()):
+                return True
     return False
 
 
 def _vision_config_is_orphaned(model_dir: Path) -> bool:
-    """True when the config declares no vision *and* the shards carry none.
-
-    Anything unreadable counts as "not orphaned": the guard must never fire on
-    doubt, only on positive evidence.
-    """
+    """Require absent vision config and readable shards without a tower."""
     try:
         raw = json.loads((model_dir / "config.json").read_text())
     except Exception:
@@ -745,37 +728,7 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
 @contextlib.contextmanager
 def _strip_vision_config_if_orphaned(model_dir: Path):
-    """Keep a vision-less VLM checkpoint loadable when its config is silent
-    about vision.
-
-    A text-only oQ quant of `diffusion_gemma` (oQ `text_only`, admin 「仅文本」)
-    drops every `vision_tower.*` tensor and pops `vision_config` out of
-    `config.json`. oMLX still routes that model type to the VLM engine —
-    mlx-lm has no `diffusion_gemma` class and the block-diffusion decode lane
-    only exists here — where mlx-vlm's `load_model` runs
-    `config.setdefault("vision_config", {})`. Two sites then turn that empty
-    dict into a *default* Gemma 4 vision tower (`ModelConfig.from_dict` tests
-    `is not None`, and `update_module_configs` re-deserializes it afterwards),
-    so strict loading fails with "Missing 210 parameters:
-    model.encoder.vision_tower.*" — parameters that never existed in the
-    checkpoint.
-
-    Nulling `vision_config` on the finished `ModelConfig` is the only position
-    that sticks (`EncoderModel.__init__` already handles `None`). Setting it to
-    `None` in the config dict instead crashes mlx-vlm on the later
-    `config.get("vision_config", {}).get("skip_vision", False)`. The
-    checkpoint's leftover `embed_vision.*` tensors have to be dropped too:
-    mlx-vlm only runs `Model.sanitize` for non-MLX-format checkpoints, and oQ
-    output is MLX-format.
-
-    No-op unless both hold: `config.json` carries no vision sub-config, and no
-    shard contains vision weights. Scoped to a single `vlm_load(...)` call;
-    other code paths (model_discovery, admin UI) bypass mlx-vlm entirely.
-    """
-    # Detection stays outside the generator body: a `yield` inside a broad
-    # `except` would swallow exceptions raised by the `with` body and then
-    # yield again, which contextlib reports as "generator didn't stop after
-    # throw()" instead of the real error.
+    """Suppress inferred vision modules and orphan weights for text-only loads."""
     if not _vision_config_is_orphaned(model_dir):
         yield
         return
@@ -791,6 +744,7 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
         model_config = original_update_module_configs(
             model_config, model_class, config, modules
         )
+        # Clear the deserialized config; the raw dict must stay valid for quantization.
         if hasattr(model_config, "vision_config") and not config.get(
             "vision_config"
         ):
@@ -802,9 +756,7 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
         if isinstance(weights_items, str):
             return original_load_weights(self, weights_items, *args, **kwargs)
 
-        # Only keys this model has no slot for are dropped: a text-only
-        # checkpoint may still carry `embed_vision.*` while the tower (and so
-        # `embed_vision`) was never built.
+        # MLX-format checkpoints skip upstream sanitize, leaving orphan projections.
         owned = {k for k, _ in _nn.utils.tree_flatten(self.parameters())}
         kept = []
         dropped = 0
