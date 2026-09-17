@@ -146,6 +146,7 @@ from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
+    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -6926,6 +6927,7 @@ async def create_response(
         # namespace member's wire name back for the return path.
         namespace_aliases: dict = {}
         openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)

@@ -333,6 +333,7 @@ def convert_responses_input_to_messages(
         elif item.type == "function_call":
             # Assistant's tool call — accumulate for grouping
             call_id = item.call_id or item.id or f"call_{uuid.uuid4().hex[:8]}"
+            namespace = getattr(item, "namespace", None)
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -340,6 +341,7 @@ def convert_responses_input_to_messages(
                     "function": {
                         "name": item.name or "",
                         "arguments": _try_parse_json(item.arguments or "{}"),
+                        **({"namespace": namespace} if namespace else {}),
                     },
                 }
             )
@@ -487,6 +489,23 @@ def split_namespace_tool_name(
         if entry:
             return entry
     return None, name
+
+
+def apply_namespace_tool_aliases(
+    messages: List[Dict[str, Any]],
+    aliases: Dict[str, Tuple[str, str]],
+) -> None:
+    """Map preserved history identities to the current request's tool names."""
+    wire_names = {identity: wire for wire, identity in aliases.items()}
+    for message in messages:
+        for call in message.get("tool_calls", []):
+            function = call.get("function", {})
+            namespace = function.pop("namespace", None)
+            if namespace:
+                name = function["name"]
+                function["name"] = wire_names.get(
+                    (namespace, name), _namespace_wire_name(namespace, name, set())
+                )
 
 
 # =============================================================================
@@ -812,6 +831,7 @@ def normalize_response_output_to_messages(
             messages.append(msg_dict)
         elif item_type == "function_call":
             call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:8]}")
+            namespace = item.get("namespace")
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -819,6 +839,7 @@ def normalize_response_output_to_messages(
                     "function": {
                         "name": item.get("name", ""),
                         "arguments": _try_parse_json(item.get("arguments", "{}")),
+                        **({"namespace": namespace} if namespace else {}),
                     },
                 }
             )

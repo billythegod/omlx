@@ -5170,3 +5170,106 @@ def test_responses_flat_tool_call_carries_no_namespace(monkeypatch, stream):
     assert calls[0]["name"] == "get_weather"
     assert {item["type"] for item in items} >= {"message", "reasoning"}
     assert all("namespace" not in item for item in items)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stored_history", [False, True])
+def test_responses_namespace_tool_continuation(
+    monkeypatch, tmp_path, stream, stored_history
+):
+    import copy
+
+    from omlx.api.responses_utils import ResponseStore
+    from omlx.server import _server_state
+
+    monkeypatch.setattr(
+        _server_state, "responses_store", ResponseStore(state_dir=tmp_path)
+    )
+    captured = []
+    apply_template = MockTokenizer.apply_chat_template
+
+    def capture_template(self, messages, *args, **kwargs):
+        captured.append(copy.deepcopy(messages))
+        return apply_template(self, messages, *args, **kwargs)
+
+    monkeypatch.setattr(MockTokenizer, "apply_chat_template", capture_template)
+    client = _responses_tool_call_client(
+        monkeypatch,
+        '<tool_call>{"name":"mcp__demo__search_2","arguments":{}}</tool_call>'
+        '<tool_call>{"name":"mcp__other__search","arguments":{}}</tool_call>',
+    )
+    groups = [
+        {
+            "type": "namespace",
+            "name": namespace,
+            "tools": [{"type": "function", "name": "search"}],
+        }
+        for namespace in ("mcp__demo", "mcp__other")
+    ]
+    payload = {
+        "model": "test-model",
+        "input": "Search both sources.",
+        "stream": stream,
+        "store": stored_history,
+        "tools": [{"type": "function", "name": "mcp__demo__search"}, *groups],
+    }
+    first = client.post("/v1/responses", json=payload)
+    assert first.status_code == 200, first.text
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in first.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        public = next(
+            event["response"]
+            for event in events
+            if event.get("type") == "response.completed"
+        )
+    else:
+        public = first.json()
+    calls = [item for item in public["output"] if item["type"] == "function_call"]
+    assert [(call["namespace"], call["name"]) for call in calls] == [
+        ("mcp__demo", "search"),
+        ("mcp__other", "search"),
+    ]
+    results = [
+        {"type": "function_call_output", "call_id": call["call_id"], "output": "Found"}
+        for call in calls
+    ]
+    payload["tools"] = groups
+    if stored_history:
+        monkeypatch.setattr(
+            _server_state, "responses_store", ResponseStore(state_dir=tmp_path)
+        )
+        payload["previous_response_id"] = public["id"]
+        payload["input"] = results
+    else:
+        payload["input"] = [
+            {"role": "user", "content": "Search both sources."},
+            *public["output"],
+            *results,
+        ]
+    output = _server_state.engine_pool._engine.generate.return_value
+    output.text = output.new_text = "Both sources checked."
+    captured.clear()
+    second = client.post("/v1/responses", json=payload)
+    assert second.status_code == 200, second.text
+    history = [
+        call for message in captured[-1] for call in message.get("tool_calls", [])
+    ]
+    # Removing the flat collision changes the current wire name.
+    assert [call["function"]["name"] for call in history] == [
+        "mcp__demo__search",
+        "mcp__other__search",
+    ]
+    assert [call["id"] for call in history] == [call["call_id"] for call in calls]
+    assert all("namespace" not in call["function"] for call in history)
+    if stored_history:
+        preserved = _server_state.responses_store.resolve_chain_messages(public["id"])
+        assert [
+            call["function"]["namespace"]
+            for message in preserved
+            for call in message.get("tool_calls", [])
+        ] == ["mcp__demo", "mcp__other"]
+    client.close()
