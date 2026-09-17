@@ -3,7 +3,7 @@
 import importlib
 
 import mlx.core as mx
-from mlx_lm.generate import PromptProcessingBatch, SequenceStateMachine
+from mlx_lm.generate import PromptProcessingBatch, StopSequences
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, CacheList, KVCache
 from mlx_vlm.turboquant import TurboQuantKVCache
 
@@ -94,8 +94,7 @@ def test_extend_keeps_arrays_cache_in_place():
     assert arrays_a[0].shape[0] == 2
 
 
-def test_make_cache_finds_nested_model_owned_batch_conversion():
-    gen = importlib.import_module("mlx_lm.generate")
+def test_join_finds_nested_model_owned_batch_conversion():
 
     class CustomCache:
         def to_batch(self, left_padding):
@@ -107,21 +106,13 @@ def test_make_cache_finds_nested_model_owned_batch_conversion():
         def make_cache(self):
             return [CacheList(CacheList(CustomCache()))]
 
-    caches = gen._make_cache(Model(), [2, 0], None)
+    caches = [omlx.scheduler._to_batched_cache_layer(c) for c in Model().make_cache()]
 
     nested = caches[0].caches[0].caches[0]
-    assert nested == ("custom-batch", (2, 0))
+    assert nested == ("custom-batch", (0,))
 
 
-def test_make_cache_converts_vendored_qwen4_exp_linear_cache():
-    """A vendored Qwen4-Exp linear cache must convert without mlx-lm's type table.
-
-    ``mlx_lm.generate._make_cache`` only knows mlx-lm cache classes, so a
-    vendored class without a ``to_batch`` hook raises there. Lightning MTP's
-    singleton rebuild calls exactly that converter, so the cache has to carry
-    its own conversion.
-    """
-    gen = importlib.import_module("mlx_lm.generate")
+def test_join_converts_vendored_qwen4_exp_linear_cache():
     from omlx.patches.mlx_vlm_qwen4_exp_compat import (
         apply_mlx_vlm_qwen4_exp_compat_patch,
     )
@@ -133,19 +124,13 @@ def test_make_cache_converts_vendored_qwen4_exp_linear_cache():
         def make_cache(self):
             return [Qwen4ArraysCache(size=2)]
 
-    caches = gen._make_cache(Model(), [0], None)
+    caches = [omlx.scheduler._to_batched_cache_layer(c) for c in Model().make_cache()]
 
     assert isinstance(caches[0], Qwen4ArraysCache)
     assert caches[0].left_padding.tolist() == [0]
 
 
-def test_make_cache_leaves_running_qwen4_exp_linear_cache_unpadded():
-    """A warm singleton is one unpadded row and keeps its own padding state.
-
-    The continuous-batching join path converts with the same hook, so
-    conversion must not stamp padding onto a cache that is already decoding.
-    """
-    gen = importlib.import_module("mlx_lm.generate")
+def test_join_leaves_running_qwen4_exp_linear_cache_unpadded():
     from omlx.patches.mlx_vlm_qwen4_exp_compat import (
         apply_mlx_vlm_qwen4_exp_compat_patch,
     )
@@ -161,7 +146,7 @@ def test_make_cache_leaves_running_qwen4_exp_linear_cache_unpadded():
         def make_cache(self):
             return [warm]
 
-    caches = gen._make_cache(Model(), [0], None)
+    caches = [omlx.scheduler._to_batched_cache_layer(c) for c in Model().make_cache()]
 
     assert caches[0] is warm
     assert warm.left_padding is None
@@ -179,7 +164,7 @@ def test_prompt_batch_full_split_moves_cache_without_copy():
         samplers=[None],
         fallback_sampler=lambda logits: logits,
         logits_processors=[[]],
-        state_machines=[SequenceStateMachine()],
+        stop_sequences=[StopSequences()],
         max_tokens=[8],
     )
 

@@ -10,6 +10,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
 from omlx.engine.vlm import _strip_vision_config_if_orphaned
+from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
 
 @pytest.mark.parametrize("case", ["declared", "tower", "unreadable", "no_config"])
@@ -50,6 +51,8 @@ def test_quantized_diffusion_gemma_loads_without_vision(tmp_path):
         },
         "quantization": {"bits": 4, "group_size": 32},
     }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
     model = Model(ModelConfig.from_dict(config))
     nn.quantize(model, bits=4, group_size=32)
     weights = dict(tree_flatten(model.parameters()))
