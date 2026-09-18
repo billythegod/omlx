@@ -36,27 +36,17 @@ from .paged_cache import (
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .paged_ssd_cache import _PM_SLICEABLE_SUB_CLASSES, PagedSSDCacheManager
+from .paged_ssd_cache import (
+    _PM_BOUNDARY_SUB_CLASSES,
+    _PM_SLICEABLE_SUB_CLASSES,
+    PagedSSDCacheManager,
+)
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
-# Non-sliceable CacheList member classes safe for per-member block storage.
-# ArraysCache state is small, positionless, and self-contained at every
-# boundary. PoolingCache is also safe: its ``pooled`` tensor is append-only
-# and the boundary snapshot carries the cumulative pool at that boundary,
-# while the small 3D remainder buffer is restored from the snapshot (GLM-5.x
-# CacheList(KVCache, PoolingCache); DeepSeek-V4's rotating member keeps that
-# layer on the legacy cumulative path). BatchPoolingCache is the batched
-# pooling shape: its boundary state (buf_kv, buf_gate, pooled) is likewise
-# self-contained and it is NOT compacted to per-block deltas
-# (compact_pooling_cache_snapshot only covers PoolingCache), so it restores
-# last-block-wins like ArraysCache. Must stay in sync with
-# ``paged_ssd_cache._PM_BOUNDARY_SUB_CLASSES``. Rotating families stay
-# legacy.
-_PM_SAFE_NON_SLICEABLE_SUBS = frozenset(
-    {"ArraysCache", "SizedArraysCache", "PoolingCache", "BatchPoolingCache"}
-)
+# Shared with class-level signature eligibility.
+_PM_SAFE_NON_SLICEABLE_SUBS = _PM_BOUNDARY_SUB_CLASSES
 
 
 def cachelist_pm_member_plan(
@@ -67,9 +57,9 @@ def cachelist_pm_member_plan(
 
     Returns a list aligned with the sub-caches: ``"slice"`` for 4D
     sliceable KV members (stored as true per-block slices), ``"boundary"``
-    for ArraysCache-style members (stored from the block's boundary
+    for ArraysCache or pooling members (stored from the block's boundary
     snapshot). ``None`` means the layer is not eligible for per-member
-    storage (missing class info, unknown / PoolingCache / rotating
+    storage (missing class info, unknown or rotating
     members, or nothing to slice) and must use the legacy cumulative
     last-block-only path.
 
@@ -1931,8 +1921,6 @@ class BlockAwarePrefixCache(CacheManager):
         source_layer: dict[str, Any],
         source_state: Any,
         sub_class_names: list[str],
-        live_state: Any = None,
-        slice_range: tuple[int, int] | None = None,
     ) -> list[Any] | None:
         """Build ``__cache_list__`` sub-tensors from an extracted layer dict.
 
@@ -1940,85 +1928,12 @@ class BlockAwarePrefixCache(CacheManager):
         ``pooled`` must survive the round-trip) and wraps PoolingCache subs
         that carry a delta range as ``PoolingCacheDelta`` storage entries.
         Returns None when the state is not a usable list.
-
-        ``live_state`` (optional) refills blanked (``()``) members — the
-        sliceable KV sub of a member-filtered snapshot — from the live
-        cache's corresponding member, sliced to ``slice_range`` so the
-        stored block carries real, restorable KV instead of an incomplete
-        CacheList. Used by the non-pm (legacy cumulative) CacheList store
-        path, where boundary snapshots blank the sliceable KV member to
-        avoid quadratic in-memory retention but the persisted block must
-        still restore it (maintainer review, GLM CacheList(KVCache,
-        PoolingCache)).
         """
         if not isinstance(source_state, list):
             return None
         pooling_delta_ranges = source_layer.get("pooling_delta_ranges", {})
-        live_members = live_state if isinstance(live_state, list) else None
         sub_tensors: list[Any] = []
         for sub_idx, sub_state in enumerate(source_state):
-            if isinstance(sub_state, (list, tuple)) and len(sub_state) == 0:
-                # Blanked sliceable member (member-filtered snapshot).
-                # Refill from the live cache's member, sliced to this block.
-                if (
-                    live_members is not None
-                    and sub_idx < len(live_members)
-                    and isinstance(live_members[sub_idx], (list, tuple))
-                    and len(live_members[sub_idx]) >= 1
-                ):
-                    live_sub = live_members[sub_idx]
-                    cloned = [
-                        self._clone_tensor(elem)
-                        if hasattr(elem, "shape")
-                        else elem
-                        for elem in live_sub
-                    ]
-                    if slice_range is not None and cloned:
-                        start_idx, end_idx = slice_range
-                        seq_len = (
-                            cloned[0].shape[2]
-                            if hasattr(cloned[0], "shape")
-                            and len(cloned[0].shape) >= 3
-                            else -1
-                        )
-                        if seq_len > 0:
-                            actual_end = min(end_idx, seq_len)
-                            start_idx = min(start_idx, actual_end)
-                            sliced = []
-                            for elem in cloned:
-                                if (
-                                    hasattr(elem, "shape")
-                                    and len(elem.shape) == 4
-                                    and elem.shape[2] == seq_len
-                                ):
-                                    sliced.append(
-                                        self._clone_tensor(
-                                            elem[:, :, start_idx:actual_end, :]
-                                        )
-                                    )
-                                elif (
-                                    hasattr(elem, "shape")
-                                    and len(elem.shape) == 3
-                                    and elem.shape[1] == seq_len
-                                ):
-                                    sliced.append(
-                                        self._clone_tensor(
-                                            elem[:, start_idx:actual_end, :]
-                                        )
-                                    )
-                                else:
-                                    sliced.append(elem)
-                            cloned = sliced
-                    sub_tensors.append(
-                        _wrap_cachelist_sub_marker(
-                            sub_idx, cloned, sub_class_names
-                        )
-                    )
-                else:
-                    # No live member to refill from: skip (restore will
-                    # reject incomplete CacheList blocks rather than corrupt).
-                    continue
-                continue
             if not (isinstance(sub_state, (list, tuple)) and len(sub_state) >= 1):
                 continue
             cloned = [
@@ -2585,14 +2500,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in source
                             ]
-                            # A compacted PoolingCache boundary member is a
-                            # per-block pooled DELTA, not the cumulative pool:
-                            # persist the absolute row range and stamp
-                            # PoolingCacheDelta (same storage entry the legacy
-                            # path uses) so the per-member restore rebuilds
-                            # the cumulative pooled tensor across blocks
-                            # instead of last-blocking a single delta
-                            # (maintainer review #3290).
+                            # Preserve absolute pooled-row ranges for chain reconstruction.
                             delta_range = pm_pooling_delta_ranges.get(str(sub_idx))
                             sub_class = (
                                 sub_class_names[sub_idx]
@@ -2642,11 +2550,7 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             source_state = source_layer["state"]
                             sub_tensors = self._cachelist_snapshot_sub_tensors(
-                                source_layer,
-                                source_state,
-                                sub_class_names,
-                                live_state=layer_state.get("state"),
-                                slice_range=(start_idx, end_idx),
+                                source_layer, source_state, sub_class_names
                             )
                             if sub_tensors is not None:
                                 block_slices.append(("__cache_list__", sub_tensors))
@@ -3710,22 +3614,9 @@ class BlockAwarePrefixCache(CacheManager):
                         _block_data: list[Any] = cl_block_data,
                         _layer_idx: int = layer_idx,
                     ) -> Any:
-                        """Rebuild a PoolingCache sub from its delta chain.
+                        """Rebuild pooled rows, using cumulative snapshots as new bases.
 
-                        A compacted PoolingCache boundary member persists as
-                        a ``PoolingCacheDelta`` storage entry carrying this
-                        block's pooled rows plus its absolute row range; the
-                        cumulative pool must be rebuilt in block order —
-                        last-blocking would restore one block's rows instead
-                        of the chain (maintainer review #3290). Shared by the
-                        per-member and legacy cumulative restore branches.
-                        A legacy full snapshot appearing before the deltas
-                        becomes the reconstruction base.
-
-                        Returns ``_NO_POOLING_DELTA`` when no block carries a
-                        delta marker (caller takes the last block's state),
-                        the reconstructed state tuple on success, or None when
-                        the chain is invalid (caller must reject the cache).
+                        Return _NO_POOLING_DELTA for an unmarked chain or None for an invalid chain.
                         """
                         if not any(
                             _sub_state_class(bd[j]) == POOLING_CACHE_DELTA_CLASS
