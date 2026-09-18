@@ -108,10 +108,14 @@ def _patch_batch_cache_padding_identity() -> None:
             original_finalize = cls.finalize
 
             def finalize(self, _original=original_finalize):
+                padding_pending = (
+                    getattr(self, "_right_padding", None) is not None
+                    or getattr(self, "_lengths", None) is not None
+                )
                 before = getattr(self, "left_padding", None)
                 _original(self)
                 after = getattr(self, "left_padding", None)
-                if isinstance(after, mx.array) and after is before:
+                if padding_pending and isinstance(after, mx.array) and after is before:
                     self.left_padding = mx.array(after)
 
             cls.finalize = finalize
