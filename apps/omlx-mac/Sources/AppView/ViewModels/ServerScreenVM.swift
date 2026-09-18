@@ -22,6 +22,8 @@ final class ServerScreenVM {
     /// auto-apply rows rather than the Apply button.
     var usageHistoryEnabled: Bool = true
     private(set) var hasPendingDefaults = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
     var showResetNotice = false
     private(set) var isLoading = false
     private(set) var isResetting = false
@@ -68,11 +70,50 @@ final class ServerScreenVM {
     private var hasLoaded = false
 
     func resetDefaults(client: OMLXClient) async {
-        guard !isLoading, !isResetting else { return }
+        guard !isLoading, !isResetting, !showResetNotice else { return }
         isResetting = true
         defer { isResetting = false }
+        let previous = (
+            host: host,
+            portText: portText,
+            logLevel: logLevel,
+            autoStartOnLaunch: autoStartOnLaunch,
+            sseKeepaliveMode: sseKeepaliveMode,
+            maxAudioUploadSizeText: maxAudioUploadSizeText,
+            serverAliasesText: serverAliasesText,
+            hfCacheEnabled: hfCacheEnabled,
+            usageHistoryEnabled: usageHistoryEnabled,
+            samplingContextText: samplingContextText,
+            samplingMaxTokensText: samplingMaxTokensText,
+            samplingTemperatureText: samplingTemperatureText,
+            samplingTopPText: samplingTopPText,
+            samplingTopKText: samplingTopKText,
+            samplingRepetitionPenaltyText: samplingRepetitionPenaltyText,
+            hasPendingDefaults: hasPendingDefaults,
+            lastError: lastError
+        )
         do {
             let dto = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.host = previous.host
+                self.portText = previous.portText
+                self.logLevel = previous.logLevel
+                self.autoStartOnLaunch = previous.autoStartOnLaunch
+                self.sseKeepaliveMode = previous.sseKeepaliveMode
+                self.maxAudioUploadSizeText = previous.maxAudioUploadSizeText
+                self.serverAliasesText = previous.serverAliasesText
+                self.hfCacheEnabled = previous.hfCacheEnabled
+                self.usageHistoryEnabled = previous.usageHistoryEnabled
+                self.samplingContextText = previous.samplingContextText
+                self.samplingMaxTokensText = previous.samplingMaxTokensText
+                self.samplingTemperatureText = previous.samplingTemperatureText
+                self.samplingTopPText = previous.samplingTopPText
+                self.samplingTopKText = previous.samplingTopKText
+                self.samplingRepetitionPenaltyText = previous.samplingRepetitionPenaltyText
+                self.hasPendingDefaults = previous.hasPendingDefaults
+                self.lastError = previous.lastError
+            }
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
@@ -98,6 +139,16 @@ final class ServerScreenVM {
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
     }
 
     func load(client: OMLXClient) async {

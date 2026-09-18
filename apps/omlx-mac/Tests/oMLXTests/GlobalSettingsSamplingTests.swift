@@ -40,6 +40,10 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertNil(performance.lastError)
         XCTAssertNil(network.lastError)
         server.basePathText = "/custom/base"
+        server.samplingTemperatureText = "0.23"
+        performance.maxConcurrentText = "42"
+        performance.idleTimeoutText = "900"
+        network.httpProxy = "http://unsaved-proxy:8080"
         let modelDirs = server.modelDirTexts
         let cacheDir = performance.ssdCacheDir
         let caBundle = network.caBundle
@@ -75,6 +79,41 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         ), save: { XCTFail("Reset drafts must wait for Apply") })
         logBinding.wrappedValue = "debug"
         XCTAssertEqual(server.logLevel, "debug")
+
+        server.cancelReset()
+        performance.cancelReset()
+        network.cancelReset()
+        XCTAssertFalse(server.showResetNotice)
+        XCTAssertFalse(performance.showResetNotice)
+        XCTAssertFalse(network.showResetNotice)
+        XCTAssertFalse(server.hasPendingDefaults)
+        XCTAssertEqual(server.host, "0.0.0.0")
+        XCTAssertEqual(server.samplingTemperatureText, "0.23")
+        XCTAssertEqual(server.logLevel, "info")
+        XCTAssertEqual(performance.maxConcurrentText, "42")
+        XCTAssertEqual(performance.idleTimeoutText, "900")
+        XCTAssertEqual(network.httpProxy, "http://unsaved-proxy:8080")
+        XCTAssertEqual(performance.loadedMaxConcurrent, loadedConcurrent)
+        XCTAssertEqual(network.loadedHttpProxy, loadedProxy)
+
+        await server.resetDefaults(client: client)
+        await performance.resetDefaults(client: client)
+        await network.resetDefaults(client: client)
+        server.confirmReset()
+        performance.confirmReset()
+        network.confirmReset()
+        server.cancelReset()
+        performance.cancelReset()
+        network.cancelReset()
+        XCTAssertTrue(server.hasPendingDefaults)
+        XCTAssertEqual(server.host, "127.0.0.1")
+        XCTAssertEqual(performance.maxConcurrentText, "8")
+        XCTAssertEqual(network.httpProxy, "")
+        server.samplingTemperatureText = "0.45"
+        await server.resetDefaults(client: client)
+        server.cancelReset()
+        XCTAssertTrue(server.hasPendingDefaults)
+        XCTAssertEqual(server.samplingTemperatureText, "0.45")
     }
 
     // MARK: - Decode

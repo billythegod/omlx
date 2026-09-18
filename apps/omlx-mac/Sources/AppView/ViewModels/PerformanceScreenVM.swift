@@ -42,6 +42,8 @@ final class PerformanceScreenVM {
     private(set) var loadedInitialCacheBlocks: Int? = nil
 
     private(set) var isSaving: Bool = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
     var showResetNotice = false
     private(set) var isLoading = false
     private(set) var isResetting = false
@@ -72,11 +74,46 @@ final class PerformanceScreenVM {
     }
 
     func resetDefaults(client: OMLXClient) async {
-        guard !isLoading, !isResetting else { return }
+        guard !isLoading, !isResetting, !showResetNotice else { return }
         isResetting = true
         defer { isResetting = false }
+        let previous = (
+            maxConcurrentText: maxConcurrentText,
+            embeddingBatchSizeText: embeddingBatchSizeText,
+            chunkedPrefill: chunkedPrefill,
+            prefillPriority: prefillPriority,
+            prefillMemoryGuard: prefillMemoryGuard,
+            memoryGuardTier: memoryGuardTier,
+            memoryGuardCustomCeilingText: memoryGuardCustomCeilingText,
+            modelFallback: modelFallback,
+            idleTimeoutText: idleTimeoutText,
+            cacheEnabled: cacheEnabled,
+            hotCacheOnly: hotCacheOnly,
+            hotCacheMaxSize: hotCacheMaxSize,
+            ssdCacheMaxSize: ssdCacheMaxSize,
+            initialCacheBlocksText: initialCacheBlocksText,
+            lastError: lastError
+        )
         do {
             let s = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.maxConcurrentText = previous.maxConcurrentText
+                self.embeddingBatchSizeText = previous.embeddingBatchSizeText
+                self.chunkedPrefill = previous.chunkedPrefill
+                self.prefillPriority = previous.prefillPriority
+                self.prefillMemoryGuard = previous.prefillMemoryGuard
+                self.memoryGuardTier = previous.memoryGuardTier
+                self.memoryGuardCustomCeilingText = previous.memoryGuardCustomCeilingText
+                self.modelFallback = previous.modelFallback
+                self.idleTimeoutText = previous.idleTimeoutText
+                self.cacheEnabled = previous.cacheEnabled
+                self.hotCacheOnly = previous.hotCacheOnly
+                self.hotCacheMaxSize = previous.hotCacheMaxSize
+                self.ssdCacheMaxSize = previous.ssdCacheMaxSize
+                self.initialCacheBlocksText = previous.initialCacheBlocksText
+                self.lastError = previous.lastError
+            }
             if let sched = s.scheduler {
                 self.maxConcurrentText = String(sched.maxConcurrentRequests)
                 let embeddingBatchSize = sched.embeddingBatchSize ?? 32
@@ -112,6 +149,16 @@ final class PerformanceScreenVM {
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
     }
 
     func load(client: OMLXClient) async {

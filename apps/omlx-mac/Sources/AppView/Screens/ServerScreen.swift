@@ -209,7 +209,12 @@ struct ServerScreen: View {
         }
         .alert(String(localized: "settings.reset_defaults.title",
                       defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
-            Button(String(localized: "common.ok", defaultValue: "OK"), role: .cancel) {}
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {
+                vm.cancelReset()
+            }
+            Button(String(localized: "common.ok", defaultValue: "OK")) {
+                vm.confirmReset()
+            }
         } message: {
             Text(String(localized: "settings.reset_defaults.message",
                         defaultValue: "Settings have been reset to defaults. Click Apply to save the changes."))

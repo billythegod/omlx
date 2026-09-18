@@ -116,6 +116,8 @@ test('reset stages defaults and preserves paths and credentials until Save', asy
     assert.equal(s.auth.sub_keys[0].key, 'keep-sub-key');
     assert.equal(s.server.distributed_inference_active, true);
     assert.equal(s.ui.language, 'en');
+    state.confirmGlobalSettingsReset();
+    assert.equal(state.globalResetSnapshot, null);
     await state.saveGlobalSettings();
     assert.equal(requests.length, 1);
     assert.equal(requests[0].port, defaults.server.port);
@@ -134,5 +136,33 @@ test('failed defaults request leaves drafts untouched without a success modal', 
     assert.equal(state.showGlobalResetNotice, false);
     assert.equal(state.resettingGlobalSettings, false);
     assert.equal(state.saveError, 'settings.global.reset_failed');
+    assert.equal(requests.length, 0);
+});
+
+
+test('Cancel restores unsaved edits, controls, and the previous pending state', async () => {
+    const defaults = JSON.parse(JSON.stringify(fixture().state.globalSettings));
+    const {state, requests} = fixture(defaults);
+    for (const pending of [false, true]) {
+        state.globalSettings.server.port = 9456;
+        state.globalSettings.sampling.temperature = 0.23;
+        state.globalSettings.ui.language = 'ko';
+        state.globalSettings.idle_timeout.idle_timeout_seconds = 900;
+        state.idleTimeoutValue = '900';
+        state.cachePercent = 27;
+        state.hotCachePercent = 12;
+        state.globalDefaultsPending = pending;
+        const before = JSON.stringify(state.globalSettings);
+        await state.resetGlobalSettingsDefaults();
+        assert.equal(state.globalSettings.sampling.temperature, 1);
+        state.cancelGlobalSettingsReset();
+        assert.equal(JSON.stringify(state.globalSettings), before);
+        assert.equal(state.globalDefaultsPending, pending);
+        assert.equal(state.idleTimeoutValue, '900');
+        assert.equal(state.cachePercent, 27);
+        assert.equal(state.hotCachePercent, 12);
+        assert.equal(state.showGlobalResetNotice, false);
+        assert.equal(state.globalResetSnapshot, null);
+    }
     assert.equal(requests.length, 0);
 });

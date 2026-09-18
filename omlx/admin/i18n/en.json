@@ -1981,5 +1981,6 @@
   "settings.global.reset_failed": "Failed to load default settings.",
   "settings.global.reset_title": "Settings Reset",
   "settings.global.reset_message": "Settings have been reset to defaults. Click Save to save the changes.",
-  "settings.global.reset_ok": "OK"
+  "settings.global.reset_ok": "OK",
+  "settings.global.reset_cancel": "Cancel"
 }

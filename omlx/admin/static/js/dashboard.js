@@ -926,10 +926,20 @@
             loadingGlobalSettings: false,
             resettingGlobalSettings: false,
             showGlobalResetNotice: false,
+            globalResetSnapshot: null,
             globalDefaultsPending: false,
 
             async resetGlobalSettingsDefaults() {
-                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings) return;
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
                 this.resettingGlobalSettings = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -937,6 +947,7 @@
                     const response = await fetch('/admin/api/global-settings/defaults');
                     if (!response.ok) throw new Error('Failed to load defaults');
                     const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
                     const s = this.globalSettings;
                     for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
                         'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
@@ -964,6 +975,16 @@
                 } finally {
                     this.resettingGlobalSettings = false;
                 }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
             },
 
             async loadGlobalSettings() {

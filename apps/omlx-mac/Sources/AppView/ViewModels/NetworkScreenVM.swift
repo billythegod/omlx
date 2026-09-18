@@ -16,6 +16,8 @@ final class NetworkScreenVM {
     private(set) var loadedCaBundle: String = ""
 
     private(set) var isSaving: Bool = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
     var showResetNotice = false
     private(set) var isLoading = false
     private(set) var isResetting = false
@@ -31,11 +33,24 @@ final class NetworkScreenVM {
     }
 
     func resetDefaults(client: OMLXClient) async {
-        guard !isLoading, !isResetting else { return }
+        guard !isLoading, !isResetting, !showResetNotice else { return }
         isResetting = true
         defer { isResetting = false }
+        let previous = (
+            httpProxy: httpProxy,
+            httpsProxy: httpsProxy,
+            noProxy: noProxy,
+            lastError: lastError
+        )
         do {
             let settings = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.httpProxy = previous.httpProxy
+                self.httpsProxy = previous.httpsProxy
+                self.noProxy = previous.noProxy
+                self.lastError = previous.lastError
+            }
             if let net = settings.network {
                 self.httpProxy = net.httpProxy
                 self.httpsProxy = net.httpsProxy
@@ -47,6 +62,16 @@ final class NetworkScreenVM {
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
     }
 
     func load(client: OMLXClient) async {
