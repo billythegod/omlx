@@ -249,8 +249,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)
             finish(commit_ms)
-            # A boundary emit ran a one-token forward on a private copy of
-            # this row; merge it back instead of keeping the shared cache.
+            # Boundary forwards advance private row caches that must be merged back.
             if not whole_batch or row.prompt_cache is not cache:
                 replacements[index] = row.prompt_cache
                 batch._token_context[index] = row._token_context[0]

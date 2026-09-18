@@ -716,9 +716,7 @@ class _MtpState:
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
     reentry_probe: bool = False
 
-    # The last token of the pending commit lands on a paged block boundary
-    # and must be run through the backbone before it is emitted. A shared
-    # verify must hand this row a private cache for that one-token forward.
+    # Boundary tokens need a one-row forward on a private cache.
     boundary_emit_pending: bool = False
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.

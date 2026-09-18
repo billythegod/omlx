@@ -4765,7 +4765,6 @@ def _cache_rows(cache):
 
 @pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
 def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
-    """A paged boundary emit must not run a one-row forward on the shared cache."""
     previous = mlx_lm_mtp.is_mtp_active()
     previous_depth = mlx_lm_mtp.get_mtp_depth()
     mlx_lm_mtp.set_mtp_active(True)
@@ -4782,9 +4781,8 @@ def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family)
         host._omlx_mtp_decode_enabled = False
         expected, _ = generate(model, prompts, limits)
         host._omlx_mtp_decode_enabled = True
-        # Paged boundary snapshots ask MTP to land commits every 4 tokens.
+        # Force boundary crossings within the short generation.
         model._omlx_mtp_commit_align = 4
-        # Batch size of the verify that precedes each boundary materialization.
         materialized = []
         last_verify_rows = [0]
         original_materialize = bg._materialize_mtp_boundary_emit

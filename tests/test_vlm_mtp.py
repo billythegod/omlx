@@ -617,7 +617,6 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     ],
 )
 def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cache_name):
-    """A ragged commit must not leave stale per-row padding in the qwen3_5 caches."""
     import importlib
 
     from mlx_vlm.models.qwen3_5 import language as q35_lang

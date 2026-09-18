@@ -84,16 +84,9 @@ def apply() -> bool:
 
 
 def _patch_batch_cache_padding_identity() -> None:
-    """Rebind ``left_padding`` after a ragged ``finalize()`` on batch caches.
+    """Refresh Qwen's padding metadata after ragged finalization.
 
-    The mlx-lm and mlx-vlm batch caches roll right padding into
-    ``left_padding`` with an in-place ``+=`` that keeps the array object. The
-    Qwen3.5 language model caches each row's padding by that object's
-    identity (``_qwen3_5_left_padding_info`` and the decode mask cache), so
-    after a batched Lightning MTP commit with ragged acceptance the next
-    single-token step masked each row at its old padding, and the merged MTP
-    head cache drafted with the same stale padding. A fresh array object
-    makes the language model re-read the padding.
+    Qwen keys it by array identity, so in-place updates require rebinding.
     """
     for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
         try:
