@@ -36,6 +36,7 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 
 from __future__ import annotations
 
+import importlib
 import logging
 import weakref
 from typing import Any
@@ -75,10 +76,46 @@ def apply() -> bool:
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
     _patch_vlm_outer_model_load_weights()
+    _patch_batch_cache_padding_identity()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_batch_cache_padding_identity() -> None:
+    """Rebind ``left_padding`` after a ragged ``finalize()`` on batch caches.
+
+    The mlx-lm and mlx-vlm batch caches roll right padding into
+    ``left_padding`` with an in-place ``+=`` that keeps the array object. The
+    Qwen3.5 language model caches each row's padding by that object's
+    identity (``_qwen3_5_left_padding_info`` and the decode mask cache), so
+    after a batched Lightning MTP commit with ragged acceptance the next
+    single-token step masked each row at its old padding, and the merged MTP
+    head cache drafted with the same stale padding. A fresh array object
+    makes the language model re-read the padding.
+    """
+    for module_name in ("mlx_lm.models.cache", "mlx_vlm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as e:
+            logger.debug(f"{module_name} not importable: {e}")
+            continue
+        for name in ("BatchKVCache", "BatchRotatingKVCache", "BatchQuantizedKVCache"):
+            cls = getattr(module, name, None)
+            if cls is None or getattr(cls, "_omlx_padding_rebind_patched", False):
+                continue
+            original_finalize = cls.finalize
+
+            def finalize(self, _original=original_finalize):
+                before = getattr(self, "left_padding", None)
+                _original(self)
+                after = getattr(self, "left_padding", None)
+                if isinstance(after, mx.array) and after is before:
+                    self.left_padding = mx.array(after)
+
+            cls.finalize = finalize
+            cls._omlx_padding_rebind_patched = True
 
 
 def _patch_vlm_outer_model_load_weights() -> None:
