@@ -227,14 +227,14 @@ class TestApplyAndForward:
         apply_moe_expert_offload(model, tmp_path, 0.25)
         glu = model.layers[0].experts.switch_glu
         fetched = []
-        inner = glu.cache.disk.fetch
+        inner = glu.cache.disk.plan
 
         def spy(proj, field, e):
             if proj == "gate_proj" and field == "weight":
                 fetched.append(e)
             return inner(proj, field, e)
 
-        glu.cache.disk.fetch = spy
+        glu.cache.disk.plan = spy
         # 2 x 60 tokens x k=2 = 240 routes: sorted kernel, ~all 32 experts
         x, i = mx.random.normal((2, 60, D)), _ri(2, 60, K)
         distinct = set(i.reshape(-1).tolist())
@@ -648,6 +648,89 @@ class TestParallelFetch:
         mx.eval(got)
         assert bool(mx.array_equal(ref, got))
         assert (_io_pool() is None) is (workers is not None)
+
+    @pytest.mark.parametrize("workers", ["1", "4"])
+    @pytest.mark.parametrize("full", [False, True])
+    def test_read_failure_preserves_cache_for_retry(
+        self, tmp_path, monkeypatch, workers, full
+    ):
+        glu = _make_glu(seed=8)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+        if full:
+            cache.ensure(mx.arange(cache.capacity))
+        before = list(cache.slot_of.items()), list(cache.free), cache.map.tolist()
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "weight", expert)
+        read = CheckpointExpertStore.read
+
+        def fail_read(current):
+            if current == plan:
+                raise OSError("injected read failure")
+            return read(current)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "read", staticmethod(fail_read))
+            with pytest.raises(OSError, match="injected read failure"):
+                cache.ensure(mx.array([expert]))
+        assert (list(cache.slot_of.items()), cache.free, cache.map.tolist()) == before
+        cache.ensure(mx.array([expert]))
+        slot = cache.slot_of[expert]
+        for name in cache.projs:
+            for field, actual in zip(
+                ("weight", "scales", "biases"), cache.resident[name]
+            ):
+                assert bool(
+                    mx.array_equal(actual[slot], getattr(glu, name)[field][expert])
+                )
+
+    def test_partial_write_failure_releases_slot(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=9)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        cache.ensure(mx.arange(cache.capacity))
+        victim = next(iter(cache.slot_of))
+        expert = cache.capacity
+        plan = cache.disk.plan("gate_proj", "scales", expert)
+        convert = CheckpointExpertStore.to_mx
+
+        def fail_convert(current, raw):
+            if current == plan:
+                raise ValueError("injected conversion failure")
+            return convert(current, raw)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CheckpointExpertStore, "to_mx", staticmethod(fail_convert))
+            with pytest.raises(ValueError, match="injected conversion failure"):
+                cache.ensure(mx.array([expert]))
+        assert expert not in cache.slot_of and victim not in cache.slot_of
+        assert cache.map[expert].item() == cache.map[victim].item() == -1
+        assert len(cache.free) == 1
+        cache.ensure(mx.array([expert, victim]))
+        for e in (expert, victim):
+            slot = cache.slot_of[e]
+            assert bool(
+                mx.array_equal(
+                    cache.resident["gate_proj"][0][slot], glu.gate_proj.weight[e]
+                )
+            )
+
+    def test_single_expert_window_keeps_reads_on_pool(self, tmp_path, monkeypatch):
+        glu = _make_glu(seed=10)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "1")
+        _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        read = CheckpointExpertStore.read
+        threads = []
+
+        def record(current):
+            threads.append(threading.current_thread())
+            return read(current)
+
+        monkeypatch.setattr(CheckpointExpertStore, "read", staticmethod(record))
+        cache.ensure(mx.arange(4))
+        assert len(threads) == 4 * 9
+        assert all(t is not threading.current_thread() for t in threads)
 
     def test_store_reads_are_thread_safe(self, tmp_path):
         glu = _make_glu(seed=6)

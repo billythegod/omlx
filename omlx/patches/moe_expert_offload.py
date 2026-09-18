@@ -30,7 +30,6 @@ assertion policy).
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -38,7 +37,7 @@ import re
 import struct
 import threading
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import mlx.core as mx
@@ -136,8 +135,10 @@ class CheckpointExpertStore:
 
     def __del__(self):
         for fd in self._fds.values():
-            with contextlib.suppress(Exception):  # interpreter teardown
+            try:
                 os.close(fd)
+            except Exception:
+                pass
 
     def __bool__(self) -> bool:
         return bool(self._specs)
@@ -354,19 +355,14 @@ class ExpertCache:
                 out.append((name, 2, self.disk.plan(name, "biases", e)))
         return out
 
-    def _reserve(self, e: int) -> int:
-        """Claim a slot for ``e``, evicting the LRU expert if none is free."""
+    def _reserve(self) -> int:
+        """Claim a slot, evicting the LRU expert if none is free."""
         if self.free:
             slot = self.free.pop()
         else:
             old_e = next(iter(self.slot_of))  # LRU victim
             slot = self.slot_of.pop(old_e)
             self.map[old_e] = -1
-        self.slot_of[e] = slot
-        self.map[e] = slot
-        # once every expert has a slot no eviction can occur, so residency is
-        # permanently satisfied and the per-token check is pure overhead
-        self.warm = len(self.slot_of) == self.n_experts
         return slot
 
     def _write(self, slot: int, payload: list) -> None:
@@ -374,12 +370,22 @@ class ExpertCache:
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
 
-    def _install(self, e: int) -> int:
-        plans = self._plans(e)
-        slot = self._reserve(e)
-        self._write(
-            slot, [(n, f, pl, CheckpointExpertStore.read(pl)) for n, f, pl in plans]
-        )
+    def _install(self, e: int, payload: list | None = None) -> int:
+        if payload is None:
+            payload = [
+                (n, f, pl, CheckpointExpertStore.read(pl))
+                for n, f, pl in self._plans(e)
+            ]
+        slot = self._reserve()
+        try:
+            self._write(slot, payload)
+        except BaseException:
+            # A partial write invalidates the evicted expert too.
+            self.free.append(slot)
+            raise
+        self.slot_of[e] = slot
+        self.map[e] = slot
+        self.warm = len(self.slot_of) == self.n_experts
         return slot
 
     def ensure(self, idx: mx.array) -> None:
@@ -415,33 +421,49 @@ class ExpertCache:
             while sent < min(upto, len(queue)):
                 e = queue[sent]
                 sent += 1
-                pending[e] = [
-                    (name, field, plan, pool.submit(CheckpointExpertStore.read, plan))
-                    for name, field, plan in self._plans(e)
-                ]
+                pending[e] = []
+                for name, field, plan in self._plans(e):
+                    pending[e].append(
+                        (
+                            name,
+                            field,
+                            plan,
+                            pool.submit(CheckpointExpertStore.read, plan),
+                        )
+                    )
 
-        prefetch(window)
-        done = 0
-        for e in needed:
-            if e in self.slot_of:
-                slot = self.slot_of.pop(e)  # re-insert: LRU order
-                self.slot_of[e] = slot
-                self.hits += 1
-                continue
-            self.misses += 1
-            group = pending.pop(e, None)
-            if group is None:
-                self._install(e)
-                continue
-            # Refill before the writes, never after, and only up to the
-            # experts already drained: at most ``window`` experts' payloads
-            # exist at once, counting the one being written here.
-            prefetch(done + window)
-            self._write(
-                self._reserve(e),
-                [(name, field, plan, f.result()) for name, field, plan, f in group],
-            )
-            done += 1
+        try:
+            prefetch(window)
+            done = 0
+            for e in needed:
+                if e in self.slot_of:
+                    slot = self.slot_of.pop(e)  # re-insert: LRU order
+                    self.slot_of[e] = slot
+                    self.hits += 1
+                    continue
+                self.misses += 1
+                # Refill an exhausted window before falling back to a serial read.
+                if sent < len(queue) and queue[sent] == e:
+                    prefetch(done + window)
+                group = pending.get(e)
+                if group is None:
+                    self._install(e)
+                    continue
+                # Count the current payload in the window until its writes finish.
+                prefetch(done + window)
+                self._install(
+                    e,
+                    [(name, field, plan, f.result()) for name, field, plan, f in group],
+                )
+                del pending[e], group
+                done += 1
+        finally:
+            # Finish reads before the store's shard descriptors can be released.
+            futures = [f for group in pending.values() for _, _, _, f in group]
+            for future in futures:
+                future.cancel()
+            if futures:
+                wait(futures)
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
