@@ -2211,7 +2211,6 @@
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
                         <input type="number"
                             :value="modelSettings.thinking_budget_tokens ?? ''"
-                            @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                             @input="onThinkingBudgetTokensInput($event)"
@@ -2590,7 +2589,6 @@
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
-            _thinkingBudgetBeforeInput: null,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2771,29 +2769,18 @@
                 } else {
                     this.modelSettings.thinking_budget_tokens = v - step;
                 }
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
                 this.onModelSettingsChange();
             },
 
             onThinkingBudgetTokensInput(event) {
-                // The field is the only writer of the model here. Typing must land
-                // verbatim: an earlier revision re-stepped any change smaller than
-                // the step size, which turned a typed "512" into 1029 and made the
-                // first digit flash. Stepping happens only where it is explicit —
-                // the arrow keys below, and the native spinner, whose grid the
-                // input's own step/min attributes line up with 1024.
                 const el = event.target;
-                // Cleared (or a lone sign, which browsers keep out of a number
-                // input's value): record "no budget" instead of NaN.
                 if (el.value === '') {
-                    this._thinkingBudgetBeforeInput = null;
                     this.modelSettings.thinking_budget_tokens = null;
                     this.onModelSettingsChange();
                     return;
                 }
                 const raw = Number(el.value);
                 if (!Number.isFinite(raw)) return;
-                this._thinkingBudgetBeforeInput = raw;
                 this.modelSettings.thinking_budget_tokens = raw;
                 this.onModelSettingsChange();
             },
@@ -2803,7 +2790,6 @@
                 this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
                     this.modelSettings.thinking_budget_tokens
                 );
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
             },
 
             setThinkingMode(mode) {
@@ -2816,13 +2802,14 @@
             },
 
             captureSessionModelSettings() {
-                if (this.modelSettings.thinking_budget_enabled) {
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
+                const modelSettings = this.cloneData(this.modelSettings);
+                if (modelSettings.thinking_budget_enabled) {
+                    modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        modelSettings.thinking_budget_tokens
                     );
                 }
                 return {
-                    modelSettings: this.cloneData(this.modelSettings),
+                    modelSettings,
                     speculativeEngine: this.speculativeEngine,
                     speculativeDraftModel: this.speculativeDraftModel,
                 };
