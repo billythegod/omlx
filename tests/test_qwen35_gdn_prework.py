@@ -180,17 +180,39 @@ def test_verify_gate_routes_qwen4_l2_norm(monkeypatch):
     transaction2.abort()
 
 
-def test_verify_gate_resolves_compat_vendor_verifier(monkeypatch):
+def test_prework_patch_does_not_import_qwen4_exp(monkeypatch):
+    """The patch runs at every VLM start. Importing qwen4_exp there would
+    pin the upstream module before the compat vendor registers its own, and
+    a later Qwen4 load would fail on the vendor-only runtime symbols.
+    """
+    import sys
+
+    for name in [n for n in sys.modules if n.startswith("mlx_vlm.models.qwen4_exp")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    assert not [n for n in sys.modules if n.startswith("mlx_vlm.models.qwen4_exp")]
+
+
+@pytest.mark.parametrize("vendor_registered_first", [True, False])
+def test_verify_gate_resolves_compat_vendor_verifier(
+    monkeypatch, vendor_registered_first
+):
     """Regression: the compat vendor inserts its qwen4_exp module at
     __path__[0], whose verifier is ``_Qwen4Verifier`` (no
-    ``Qwen4ExpBatchInvariantForward``). The gate must capture it and
-    engage the L2 variant, pinned to the layer's ``_normalize_qk`` site.
+    ``Qwen4ExpBatchInvariantForward``). The gate must resolve it and
+    engage the L2 variant, pinned to the layer's ``_normalize_qk`` site,
+    whether the vendor registered before the patch (Qwen4 loaded first) or
+    after it (another VLM started first).
     """
     import sys
 
     from mlx_vlm.models.cache import ArraysCache
 
     pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    if not vendor_registered_first:
+        monkeypatch.setattr(prework_mod, "_PATCHED", False)
+        assert prework_mod.apply_qwen35_gdn_prework_patch()
 
     class VendorGDN(language.Qwen3_5GatedDeltaNet):
         @staticmethod
@@ -213,8 +235,9 @@ def test_verify_gate_resolves_compat_vendor_verifier(monkeypatch):
 
     monkeypatch.setattr(q4_pkg, "language", fake, raising=False)
 
-    monkeypatch.setattr(prework_mod, "_PATCHED", False)
-    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    if vendor_registered_first:
+        monkeypatch.setattr(prework_mod, "_PATCHED", False)
+        assert prework_mod.apply_qwen35_gdn_prework_patch()
 
     args = SimpleNamespace(
         hidden_size=64,

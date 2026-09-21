@@ -26,6 +26,7 @@ stock path.
 from __future__ import annotations
 
 import logging
+import sys
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -591,6 +592,27 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
+def _qwen4_l2_norm_sites():
+    """Return the (verifier, layer) normalize functions of the loaded qwen4_exp.
+
+    Looked up in sys.modules only: importing qwen4_exp here would pin the
+    upstream copy before the compat vendor registers its own.
+    """
+    q4_lang = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    if q4_lang is None:
+        return None
+    verifier_cls = getattr(q4_lang, "_Qwen4Verifier", None) or getattr(
+        q4_lang, "Qwen4ExpBatchInvariantForward", None
+    )
+    gdn_cls = getattr(q4_lang, "Qwen4ExpGatedDeltaNet", None)
+    if verifier_cls is None or gdn_cls is None:
+        return None
+    return (
+        verifier_cls._normalize_gated_delta_qk,
+        getattr(gdn_cls, "_normalize_qk", None),
+    )
+
+
 def apply_qwen35_gdn_prework_patch() -> bool:
     """Install fused prework at ordinary decode and speculative entry points."""
     global _PATCHED
@@ -602,25 +624,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     from mlx_vlm.models.qwen3_5 import language as q35
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
     from mlx_vlm.speculative.ops.linear import _target_verify_linears
-
-    # Resolve the Qwen4 verifier from whichever qwen4_exp module wins at
-    # runtime: the oMLX compat vendor (``_Qwen4Verifier``, inserted at
-    # __path__[0]) or upstream mlx-vlm (``Qwen4ExpBatchInvariantForward``).
-    # Both normalize with the same L2 chain; the vendor delegates to
-    # ``layer._normalize_qk``, so pin the layer site by identity too.
-    q4_verifier_cls = None
-    q4_gdn_norm = None
-    try:
-        from mlx_vlm.models.qwen4_exp import language as q4_lang
-
-        q4_verifier_cls = getattr(q4_lang, "_Qwen4Verifier", None) or getattr(
-            q4_lang, "Qwen4ExpBatchInvariantForward", None
-        )
-        q4_gdn = getattr(q4_lang, "Qwen4ExpGatedDeltaNet", None)
-        if q4_gdn is not None:
-            q4_gdn_norm = getattr(q4_gdn, "_normalize_qk", None)
-    except Exception:
-        pass
 
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
@@ -678,13 +681,15 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             type(verifier)._normalize_gated_delta_qk
             is Qwen3_5BatchInvariantForward._normalize_gated_delta_qk
         )
-        l2_norm = (
-            q4_verifier_cls is not None
-            and type(verifier)._normalize_gated_delta_qk
-            is q4_verifier_cls._normalize_gated_delta_qk
-            and q4_gdn_norm is not None
-            and getattr(type(layer), "_normalize_qk", None) is q4_gdn_norm
-        )
+        l2_norm = False
+        if not compatible_norm:
+            sites = _qwen4_l2_norm_sites()
+            l2_norm = (
+                sites is not None
+                and type(verifier)._normalize_gated_delta_qk is sites[0]
+                and sites[1] is not None
+                and getattr(type(layer), "_normalize_qk", None) is sites[1]
+            )
         if not (
             (compatible_norm or l2_norm)
             and cache is not None
