@@ -326,3 +326,31 @@ def test_admission_estimate_counts_dsv4_experts(tmp_path):
     assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full - int(
         expert_bytes * 0.75
     )
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_wrap_and_release_return_descriptors_to_baseline(
+    tmp_path, reference, monkeypatch, workers
+):
+    import gc
+    import os
+
+    from omlx.patches.moe_expert_offload import _shutdown_io_pool
+
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+    _shutdown_io_pool()
+
+    def cycle():
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        mx.eval(wrapped(_x(1, 1, D), mx.arange(K).reshape(1, 1, K)))
+
+    try:
+        cycle()
+        gc.collect()
+        baseline = len(os.listdir("/dev/fd"))
+        for _ in range(10):
+            cycle()
+            gc.collect()
+        assert len(os.listdir("/dev/fd")) == baseline
+    finally:
+        _shutdown_io_pool()
