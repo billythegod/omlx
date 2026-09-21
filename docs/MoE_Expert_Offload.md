@@ -84,10 +84,9 @@ A call's misses are read in parallel with `os.pread` on a shared thread pool. `e
 
 ## Supported models
 
-The experimental toggle is available for `deepseek_v41`, `qwen4_exp`,
-`gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes
-validation. Dense Gemma models and other model types do not show the toggle.
-The settings API and model loader use the same eligibility check.
+The experimental toggle is available for `deepseek_v41`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, and `olmoe` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
+
+Qwen3.5/3.6 supports stacked expert projections under `language_model.model.layers.*.mlp.switch_mlp` and `model.layers.*.mlp.switch_mlp`. The offload adapter resolves the original checkpoint path after the loader normalizes the text-only naming layout.
 
 The common adapter supports stacked `[num_experts, ...]` quantized
 `SwitchGLU` projections and the per-expert layout used by OLMoE conversions.

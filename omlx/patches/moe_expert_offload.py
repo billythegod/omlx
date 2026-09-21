@@ -683,6 +683,17 @@ def _iter_switch_glus(model):
     yield from walk(None, None, model, "")
 
 
+def _qwen35_checkpoint_prefix(store, path):
+    # Qwen's loader adds language_model. to text-only checkpoint keys.
+    if path.startswith("language_model.model.layers.") and not store.has(
+        path + ".gate_proj.weight"
+    ):
+        flat = path.removeprefix("language_model.")
+        if store.has(flat + ".gate_proj.weight"):
+            return flat
+    return path
+
+
 def _resolve_store_view(
     glu: SwitchGLU, store: CheckpointExpertStore, path: str
 ) -> tuple[_GLUStoreView | None, str | None]:
@@ -762,6 +773,12 @@ def apply_moe_expert_offload(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
+    config_path = Path(model_dir) / "config.json"
+    kind = (
+        json.loads(config_path.read_text()).get("model_type")
+        if config_path.exists()
+        else None
+    )
     store = CheckpointExpertStore(model_dir)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
@@ -770,7 +787,10 @@ def apply_moe_expert_offload(
     wrapped = 0
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
-        view, reason = _resolve_store_view(glu, store, path)
+        checkpoint_path = (
+            _qwen35_checkpoint_prefix(store, path) if kind == "qwen3_5_moe" else path
+        )
+        view, reason = _resolve_store_view(glu, store, checkpoint_path)
         if view is None:
             logger.info("moe expert offload: skipping %s (%s)", path, reason)
             continue
@@ -839,6 +859,11 @@ def estimate_offload_admission_bytes(
             kind = json.loads(config_path.read_text()).get("model_type", "")
             if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
                 return full_size
+            if kind == "qwen3_5_moe":
+                from .moe_offload_compat import moe_offload_compatibility
+
+                if not moe_offload_compatibility(model_dir)[0]:
+                    return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the

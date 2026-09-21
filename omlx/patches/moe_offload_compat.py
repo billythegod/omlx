@@ -7,7 +7,9 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-_SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
+_SUPPORTED_TYPES = frozenset(
+    {"deepseek_v41", "qwen4_exp", "qwen3_5_moe", "gemma4", "olmoe"}
+)
 
 
 def moe_offload_compatibility(model_path):
@@ -41,7 +43,7 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
-    from .moe_expert_offload import CheckpointExpertStore
+    from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
     count = int(text.get("num_experts") or 0)
@@ -63,12 +65,19 @@ def _inspect(path, signature):
         if kind == "olmoe":
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
-        elif kind == "qwen4_exp":
+        elif kind in ("qwen4_exp", "qwen3_5_moe"):
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"
+        if kind == "qwen3_5_moe":
+            prefix = _qwen35_checkpoint_prefix(store, prefix)
+            if not store.has(prefix + ".gate_proj.weight"):
+                return (
+                    False,
+                    f"Checkpoint is missing expert tensor: {prefix}.gate_proj.weight",
+                )
         per_expert = not store.has(prefix + ".gate_proj.weight")
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj
