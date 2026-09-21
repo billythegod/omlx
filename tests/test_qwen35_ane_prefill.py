@@ -302,16 +302,15 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
         block_aware_cache=object(),
     )
 
-    # Boundary snapshots cap delivered chunks at the 2048 block edge, so a
-    # 4096 shape can never receive a full tile and must warn loudly.
+    # Boundary snapshots cap chunks below the compiled shape.
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
-    assert "never execute" in caplog.text
+    assert "require eligible tail padding" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
     caplog.clear()
     no_boundary = SimpleNamespace(
@@ -320,13 +319,13 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
     )
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(no_boundary, 4096)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
 
-def test_oversized_shape_recommends_a_sequence_length_the_validator_accepts(caplog):
-    """A 2048-token chunk can still host a legal shape, so name it."""
+@pytest.mark.parametrize("width, recommended", [(2048, 2048), (1500, 1472)])
+def test_oversized_shape_recommends_a_valid_sequence_length(caplog, width, recommended):
     scheduler = SimpleNamespace(
-        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=2048),
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=width),
         _qwen35_prefill_floor=4096,
         block_aware_cache=object(),
     )
@@ -334,19 +333,14 @@ def test_oversized_shape_recommends_a_sequence_length_the_validator_accepts(capl
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
 
-    assert "never execute" in caplog.text
-    assert "Set sequence_length=2048 or smaller" in caplog.text
-    # The advice has to survive the validator it is advising about.
-    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+    assert "require eligible tail padding" in caplog.text
+    assert f"Set sequence_length={recommended} or a smaller valid shape" in caplog.text
+    caplog.clear()
+    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, recommended)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
-def test_sub_minimum_delivered_width_reports_an_impossible_geometry(caplog):
-    """A 512-token chunk is below the minimum shape: no sequence_length works.
-
-    The earlier message recommended ``sequence_length=512``, which the
-    validator in this same function rejects, so following it raised
-    ValueError instead of fixing anything.
-    """
+def test_sub_minimum_width_requires_padding_or_wider_chunks(caplog):
     scheduler = SimpleNamespace(
         config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=512),
         _qwen35_prefill_floor=4096,
@@ -356,20 +350,17 @@ def test_sub_minimum_delivered_width_reports_an_impossible_geometry(caplog):
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
 
-    assert "never execute" in caplog.text
+    assert "require eligible tail padding" in caplog.text
     assert str(ane_patch._ANE_MIN_SEQUENCE_LENGTH) in caplog.text
     assert "prefill chunk width" in caplog.text
-    # Never advise a shape the validator refuses.
-    assert "sequence_length=512" not in caplog.text
-    for width in (512, 448, 64):
-        assert f"Set sequence_length={width}" not in caplog.text
+    assert "Set sequence_length=" not in caplog.text
+    assert "changing sequence_length alone" in caplog.text
 
     with pytest.raises(ValueError):
         ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 512)
 
 
 def test_validator_and_warning_share_one_minimum(caplog):
-    """The rejected range and the warned range must not drift apart."""
     minimum = ane_patch._ANE_MIN_SEQUENCE_LENGTH
     alignment = ane_patch._ANE_SEQUENCE_LENGTH_ALIGNMENT
 
@@ -380,7 +371,6 @@ def test_validator_and_warning_share_one_minimum(caplog):
             SimpleNamespace(), sequence_length=minimum - alignment
         )
 
-    # Exactly at the minimum, a chunk of the same width is a clean fit.
     exact = SimpleNamespace(
         config=SimpleNamespace(
             prefill_step_size=2048, paged_cache_block_size=minimum
@@ -390,7 +380,7 @@ def test_validator_and_warning_share_one_minimum(caplog):
     )
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(exact, minimum)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
 
 def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
@@ -516,7 +506,8 @@ def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
     assert bool(mx.all(result == 7))
 
 
-def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+@pytest.mark.parametrize("rows, threshold", [(1400, 1358), (512, 512)])
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch, rows, threshold):
     seen = []
 
     def exact(_mlp, block, _target_verify=False):
@@ -526,10 +517,10 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
     monkeypatch.setattr(ane_patch, "_backend_exact", exact)
     mlp = SimpleNamespace(
         _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
-            2048, 0.53, 8, tail_padding_min_tokens=1358
+            2048, 0.53, 8, tail_padding_min_tokens=threshold
         )
     )
-    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+    x = mx.ones((1, rows, 8), dtype=mx.float16)
 
     result = ane_patch._backend(mlp, x)
     assert result is not None
@@ -537,8 +528,8 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
 
     assert result.shape == x.shape
     assert seen[0].shape == (1, 2048, 8)
-    assert bool(mx.all(seen[0][:, :1400] == 1))
-    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(seen[0][:, :rows] == 1))
+    assert bool(mx.all(seen[0][:, rows:] == 0))
     assert bool(mx.all(result == 3))
 
 
