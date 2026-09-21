@@ -4587,12 +4587,7 @@ def _global_settings_response(global_settings):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
-            # Resolve "auto" to actual value (10% of SSD capacity)
-            "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(
-                    global_settings.base_path
-                )
-            ),
+            "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
@@ -5101,6 +5096,9 @@ async def update_global_settings(
     requested_storage = request.gdn_snapshot_storage
     if requested_storage is not None:
         requested_storage = requested_storage.strip().lower()
+        requested_storage = {"ssd": "ssd_sidecar", "hot": "embedded"}.get(
+            requested_storage, requested_storage
+        )
         if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
             raise HTTPException(
                 status_code=400,
@@ -5178,18 +5176,21 @@ async def update_global_settings(
             ),
         )
     # Apply cache settings
-    # The WebUI saves the FULL settings payload on every click, so a plain
-    # `is not None` test flags "changed" for every field on every save and
-    # unloads all models each time (_apply_cache_settings_runtime unloads by
-    # design). Compare against the live value first; only a real difference
-    # may unload engines.
+    # The dashboard sends all cache fields. Unchanged values must not unload engines.
     cache_changed = False
     if request.cache_enabled is not None:
         if request.cache_enabled != global_settings.cache.enabled:
             global_settings.cache.enabled = request.cache_enabled
             cache_changed = True
     if request.ssd_cache_dir is not None:
-        if request.ssd_cache_dir != global_settings.cache.ssd_cache_dir:
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
+            else (global_settings.base_path / "cache").resolve()
+        )
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
             global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
             cache_changed = True
     if request.ssd_cache_max_size is not None:
