@@ -1416,24 +1416,10 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
 
 
 def _is_deepseek_v41_loadable_config(config) -> bool:
-    """True for DeepSeek V4.1 checkpoints the V4.1 loader reads unconverted.
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
 
-    The loader gates source checkpoints on the model type alone (the FP8/FP4
-    release, or bf16), and reads oMLX conversions by their
-    ``omlx_deepseek_v41`` spec (e.g. ``Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp``).
-    Shards exported before #3583 declare no ``format: mlx`` metadata and the
-    repo names carry no MLX token, so the generic heuristics skip them.
-    Community ``mlx_lm`` affine conversions declare the format in a top-level
-    ``quantization`` dict instead of the spec, so they are accepted when that
-    dict declares the affine mode the loader reads with an integer bit width
-    and group size, and no per-module override the loader would reject.
-
-    This gate only ever *adds* a candidate. A declaration it refuses falls
-    through to the generic MLX heuristics below, which accept an mlx_lm shard
-    by its ``format: mlx`` metadata or by the repo name — so a declared
-    non-affine conversion can still be listed and then fail at load with the
-    loader's own message, and this is not the only place loadability is
-    decided.
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
     """
     if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
         return False

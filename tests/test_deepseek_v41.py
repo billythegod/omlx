@@ -403,14 +403,7 @@ def write_affine_checkpoint(
     index_order="sorted",
     **config_overrides,
 ):
-    """A source checkpoint whose projections are mlx_lm-style affine packed.
-
-    ``write_checkpoint`` emits dense tensors only. This repacks every 2-D
-    projection whose width fits the quantization group into a U32 weight plus
-    float scales and biases, records a per-module spec for it, and declares
-    the projections left dense as ``False`` — the layout a community mlx_lm
-    conversion has, including its mixed dense/packed form.
-    """
+    """Write mixed dense/affine weights with mlx_lm quantization metadata."""
     import json
 
     source, model = write_checkpoint(
@@ -426,9 +419,7 @@ def write_affine_checkpoint(
     tensors, quantized = {}, {}
     for name, value in originals.items():
         base = name.removesuffix(".weight") if name.endswith(".weight") else ""
-        # The router stays dense, as every mlx_lm quantization predicate
-        # leaves it. Biased projections *are* packed, with their bias left
-        # dense beside the metadata, which is the real checkpoint's layout.
+        # Keep the router dense and preserve linear biases beside packed weights.
         if (
             base
             and not base.endswith("ffn.gate")
@@ -451,13 +442,10 @@ def write_affine_checkpoint(
             tensors[name] = value
             if name.endswith(".weight"):
                 quantized[name.removesuffix(".weight")] = False
-    # mx.load is lazy: materialize before overwriting the file it reads from.
+    # Materialize lazy reads before overwriting their source file.
     mx.eval(list(tensors.values()))
     mx.save_safetensors(str(source / "model.safetensors"), tensors)
-    # `mlx_lm.utils.save_model` rewrites the index with the weight map sorted,
-    # so a real conversion lists `<module>.biases` before `<module>.weight`.
-    # That order is the default here; `index_order="insertion"` keeps the
-    # unsorted layout the official release ships.
+    # Match mlx_lm's sorted index by default, with biases before weights.
     keys = sorted(tensors) if index_order == "sorted" else list(tensors)
     (source / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {k: "model.safetensors" for k in keys}})

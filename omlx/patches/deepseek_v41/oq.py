@@ -180,9 +180,7 @@ def quantize_engram(
     if bits not in (2, 3, 4, 6, 8):
         raise ValueError("Unsupported Engram affine bit width")
     if table.get("bias_key"):
-        # A table that already carries affine metadata is quantized. The reads
-        # below assume published FP8 bytes, so requantizing would produce
-        # garbage instead of a smaller table.
+        # This path reads published FP8 bytes, not packed affine tables.
         raise ValueError(
             "Engram table is already quantized: requantization is unsupported"
         )

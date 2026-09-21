@@ -23,14 +23,9 @@ _FLOAT_DTYPES = frozenset({"BF16", "F16", "F32"})
 
 
 def source_quantization_spec(config, path):
-    """The declared mlx_lm quantization of one source checkpoint module.
+    """Resolve affine defaults and per-module overrides; False means dense.
 
-    mlx_lm writes a flat ``quantization`` dict, mirrored to
-    ``quantization_config``: ``bits``/``group_size``/``mode`` are the section
-    defaults and a module path maps to ``False`` when that module is left
-    dense, or to a per-module override. Only the *format* is resolved here —
-    a caller that knows the logical width still validates the shapes against
-    it, so a wrong declaration fails loudly instead of decoding garbage.
+    Callers validate tensor shapes against the logical module dimensions.
     """
     for section in (config.get("quantization"), config.get("quantization_config")):
         if not isinstance(section, dict):
@@ -57,9 +52,7 @@ def source_quantization_spec(config, path):
             raise ValueError(f"Unsupported source quantization mode: {path}")
         if not isinstance(group_size, int) or isinstance(group_size, bool):
             raise ValueError(f"Affine source declares no group size: {path}")
-        # Third-party mlx_lm conversions quantize weights only. Their
-        # producer runs stock float activations, so oQ3e's FP8 activation
-        # scheme would inject error the checkpoint was never validated with.
+        # mlx_lm affine conversions use float activations, without FP8 rounding.
         return {
             "bits": bits,
             "group_size": group_size,
@@ -76,8 +69,8 @@ def _repack_affine(raw, scale, scale_dtype, bias, bias_dtype, spec, force_dense)
     if scale_dtype not in _FLOAT_DTYPES or bias_dtype != scale_dtype:
         raise ValueError("Affine scales and biases must share a float dtype")
     bits, group_size = spec["bits"], spec["group_size"]
-    if raw.ndim != 2 or raw.shape[-1] % 4:
-        raise ValueError("Packed matrix must be rank two with 4-byte-aligned rows")
+    if raw.ndim != 2 or raw.dtype != np.dtype("<u4"):
+        raise ValueError("Packed affine matrix must be rank two with U32 elements")
     width = raw.shape[-1] * 32 // bits
     if width % group_size:
         raise ValueError("Packed row width is not a multiple of the group size")
@@ -86,9 +79,6 @@ def _repack_affine(raw, scale, scale_dtype, bias, bias_dtype, spec, force_dense)
         raise ValueError("Unexpected affine metadata shape")
     weight = mx.array(raw.view(np.uint8).copy().view("<u4"))
     if force_dense:
-        # Affine metadata stays float: the native block kernels require
-        # ``scales.dtype == biases.dtype ==`` the activation dtype, unlike
-        # the MXFP path below which keeps raw E8M0 bytes.
         value = mx.dequantize(
             weight,
             decode_array(scale, scale_dtype),
@@ -201,11 +191,8 @@ def strip_draft_config(config):
 def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
     """Repack one projection at a time for either direct loading or export."""
     source = Path(source)
-    # Quantization metadata belongs to the `.weight` it describes, whichever
-    # order the index lists them in. `mlx_lm.utils.save_model` rewrites the
-    # index with the weight map sorted, which puts every `<module>.biases`
-    # ahead of its `<module>.weight`; claiming the metadata here, rather than
-    # when the weight is repacked, keeps the loader independent of that order.
+    # Sorted mlx_lm indexes put biases before weights.
+    # Claim metadata first so only its weight emits it.
     readers, consumed = (
         {},
         {key for key in mapping if key.endswith((".scales", ".biases", ".scale"))},
@@ -218,9 +205,7 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
         return readers[filename].read(key)
 
     def matrix(key, force_dense=False):
-        # mlx_lm affine metadata is plural (``.scales``/``.biases``) where the
-        # official checkpoint publishes singular E8M0 ``.scale``; probe the
-        # whole sibling set so neither layout's metadata leaks to the caller.
+        # Affine sources use scales/biases; official MXFP sources use scale.
         prefix = key.removesuffix(".weight")
         fields = {}
         for field in ("weight", "scales", "biases", "scale"):
@@ -233,9 +218,7 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
         spec = source_quantization_spec(config, prefix) if dtype == "U32" else None
         scale, scale_dtype = fields.get("scales") or fields.get("scale") or (None, None)
         bias, bias_dtype = fields.get("biases") or (None, None)
-        # mlx_lm quantizes a biased linear's weight and leaves its bias dense.
-        # A QuantizedProjection has nowhere to keep that bias, so the module
-        # has to materialize densely or the bias would be an unexpected tensor.
+        # QuantizedProjection cannot retain a linear bias, so keep that module dense.
         return repack_weight(
             raw,
             dtype,

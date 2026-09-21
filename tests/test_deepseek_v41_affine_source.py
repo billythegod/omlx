@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Community mlx_lm affine DeepSeek V4.1 sources: loading and expert offload.
-
-These checkpoints declare their format in a top-level ``quantization`` dict
-instead of an ``omlx_deepseek_v41`` spec, are packed per expert with a U32
-weight plus float scales and biases, and leave a mixed set of projections
-dense. ``write_affine_checkpoint`` reproduces that layout.
-"""
+"""Load and offload community mlx_lm affine DeepSeek V4.1 checkpoints."""
 
 import json
 
@@ -16,25 +10,23 @@ from mlx.utils import tree_flatten
 from test_deepseek_v41 import write_affine_checkpoint
 
 
+@pytest.mark.parametrize("bits", [2, 3])
 @pytest.mark.parametrize("index_order", ["sorted", "insertion"])
-def test_source_affine_checkpoint_loads_whatever_the_index_order(tmp_path, index_order):
-    """The loader must not depend on the order the index lists tensors in.
-
-    `mlx_lm.utils.save_model` writes the weight map sorted, which puts every
-    `<module>.biases` ahead of its `<module>.weight`; a loader that only skips
-    metadata after reading its weight raises
-    "Unexpected target tensor shape: language_model.embed.biases" on exactly
-    the checkpoints this module exists for.
-    """
+def test_source_affine_checkpoint_loads_whatever_the_index_order(
+    tmp_path, index_order, bits
+):
+    """Load packed rows with metadata before or after their weights."""
     from omlx.patches.deepseek_v41.loading import load
     from omlx.patches.deepseek_v41.quantization import QuantizedProjection
 
-    source, _ = write_affine_checkpoint(tmp_path, vision=False, index_order=index_order)
+    source, _ = write_affine_checkpoint(
+        tmp_path, vision=False, bits=bits, index_order=index_order
+    )
     model, _ = load(source)
     try:
         packed = model.language_model.layers[0].attn.wq_a
         assert isinstance(packed, QuantizedProjection)
-        assert (packed.bits, packed.mode, packed.group_size) == (2, "affine", 64)
+        assert (packed.bits, packed.mode, packed.group_size) == (bits, "affine", 64)
     finally:
         model.close()
 
@@ -84,9 +76,7 @@ def test_source_affine_biased_projection_stays_dense_with_its_bias(tmp_path):
     model, _ = load(source)
     try:
         attn = model.vision.blocks[0].attn
-        # The checkpoint packs wqkv and keeps wqkv.bias dense beside it.
         assert not isinstance(attn.wqkv, QuantizedProjection)
-        # The bias survives the module materializing densely.
         np.testing.assert_array_equal(
             np.asarray(attn.wqkv.bias.astype(mx.float32)),
             np.asarray(tensors["vision.blocks.0.attn.wqkv.bias"].astype(mx.float32)),
@@ -280,13 +270,7 @@ def test_source_engram_table_reports_affine_metadata():
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8])
 def test_affine_dequantize_matches_quantized_matmul(bits):
-    """force_dense relies on mx.dequantize agreeing with the packed matmul.
-
-    They agree to quantization rounding rather than bit for bit: the fused
-    kernel and the dequantize-then-multiply path differ by up to ~1e-3 on
-    bf16 inputs, and the exact difference is machine-dependent, so this pins
-    a tolerance rather than equality.
-    """
+    """Allow hardware-dependent bf16 rounding between packed and dense matmul."""
     mx.random.seed(11)
     weight = (mx.random.normal((128, 256)) * 0.05).astype(mx.bfloat16)
     x = (mx.random.normal((1, 4, 256)) * 0.05).astype(mx.bfloat16)
