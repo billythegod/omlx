@@ -41,69 +41,37 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         assert.equal(vm.runInNewContext(disabled, {modelSettings:{[enabled]:true}}), true);
     }
     const percent = 'moe_expert_offload_resident_percent';
-    // A stored fraction reopens as its whole percentage.
-    for (const value of [0.33, 0.4, 0.8]) {
-        app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:value});
-        assert.equal(app.modelSettings[percent], Math.round(value * 100));
+    for (const [stored, displayed] of [[0.125, 12.5], [0.333, 33.3], [0.02, 2], [1, 100]]) {
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:stored});
+        assert.equal(app.modelSettings[percent], displayed);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], stored, 'untouched values must survive blur and save');
+        assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
     }
-    // An out-of-range stored value (the old 12.5% preset) opens silently: the
-    // field reports an error only once the user has typed in it.
-    app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.125});
-    assert.equal(app.modelSettings[percent], 13);
-    assert.ok(app.moeExpertOffloadResidentInvalid());
-    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
-    // Focus and blur without typing settles nothing: the stored fraction the
-    // field cannot express (12.5%) has to survive, not be clamped to 20%.
-    app.onMoeExpertOffloadResidentBlur();
-    assert.equal(app.modelSettings[fraction], 0.125, 'blur alone must not rewrite a stored fraction');
-    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, false);
-    await app.saveModelSettings();
-    assert.equal(payload[fraction], 0.125);
-    app.onMoeExpertOffloadResidentPercent();
-    assert.equal(app.modelSettings.moe_expert_offload_resident_touched, true);
-    app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.33});
-    await app.saveModelSettings();
-    assert.equal(payload[fraction], 0.33);
-    // Editing the percentage moves the fraction that gets saved.
-    app.modelSettings[percent] = 40;
-    app.onMoeExpertOffloadResidentPercent();
-    await app.saveModelSettings();
-    assert.equal(payload[fraction], 0.4);
-    // Only two-digit percentages land: the "0" on the way to "50", a stray low
-    // or high value, and a third digit all leave the fraction alone.
-    for (const inert of [0, 15, 85, 100]) {
-        app.modelSettings[percent] = inert;
+    for (const [input, saved] of [[5, 0.05], [10, 0.1], [12.5, 0.125], [33.3, 0.333], [95, 0.95]]) {
+        app.modelSettings[percent] = input;
         app.onMoeExpertOffloadResidentPercent();
-        assert.equal(app.modelSettings[fraction], 0.4, `${inert} must not rewrite the fraction`);
+        assert.equal(app.moeExpertOffloadResidentInvalid(), false);
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(payload[fraction], saved);
+        app.modelSettings = app.buildModelSettingsState(app.selectedModel, payload);
+        assert.equal(app.modelSettings[percent], input);
     }
-    app.modelSettings[percent] = 50;
-    app.onMoeExpertOffloadResidentPercent();
-    assert.equal(app.modelSettings[fraction], 0.5);
-    // Out-of-range input reports itself rather than silently doing nothing.
-    for (const [value, invalid] of [[15, true], [20, false], [80, false], [85, true]]) {
-        app.modelSettings[percent] = value;
-        assert.equal(app.moeExpertOffloadResidentInvalid(), invalid, `${value}`);
+    for (const [input, settled] of [['', 5], [0, 5], [100, 95]]) {
+        const previous = app.modelSettings[fraction];
+        app.modelSettings[percent] = input;
+        app.onMoeExpertOffloadResidentPercent();
+        assert.equal(app.moeExpertOffloadResidentInvalid(), true);
+        assert.equal(app.modelSettings[fraction], previous, 'partial input must not change the saved fraction');
+        app.onMoeExpertOffloadResidentBlur();
+        await app.saveModelSettings();
+        assert.equal(app.modelSettings[percent], settled);
+        assert.equal(payload[fraction], settled / 100);
     }
-    // Settling the field brings it back into range instead of leaving a number
-    // that could never be saved.
-    app.modelSettings[percent] = 85;
-    app.onMoeExpertOffloadResidentBlur();
-    assert.equal(app.modelSettings[percent], 80);
-    assert.equal(app.modelSettings[fraction], 0.8);
-    app.modelSettings[percent] = 15;
-    app.onMoeExpertOffloadResidentBlur();
-    assert.equal(app.modelSettings[percent], 20);
-    assert.equal(app.modelSettings[fraction], 0.2);
-    app.modelSettings[percent] = 80;
-    app.onMoeExpertOffloadResidentPercent();
-    await app.saveModelSettings();
-    assert.equal(payload[fraction], 0.8);
-    // The selector is gone: only the bounded percentage field remains.
-    assert.ok(!/<select/.test(offload), 'the preset selector must be gone');
-    assert.ok(
-        /<input type="number" min="20" max="80" step="1"/.test(offload),
-        'the percentage field must span two digits',
-    );
-    assert.ok(offload.includes('>%</span>'), 'the field must be marked with %');
-    console.log('PASS: offload save/reopen, spec toggle exclusion and bounded resident fraction');
+    assert.match(offload, /<input type="number" min="5" max="95" step="any" inputmode="decimal"/);
+    assert.ok(offload.includes('@input="onMoeExpertOffloadResidentPercent()"'));
+    assert.ok(offload.includes('@blur="onMoeExpertOffloadResidentBlur()"'));
+    console.log('PASS: offload save/reopen, spec toggle exclusion and fractional resident percentage');
 })().catch(error => {console.error(error); process.exitCode = 1});

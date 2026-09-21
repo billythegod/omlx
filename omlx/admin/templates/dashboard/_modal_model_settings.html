@@ -1185,7 +1185,7 @@
                                         <div x-show="modelSettings.moe_expert_offload_enabled" x-transition class="pt-1">
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}</label>
                                             <div class="flex items-center gap-2">
-                                                <input type="number" min="20" max="80" step="1" inputmode="numeric"
+                                                <input type="number" min="5" max="95" step="any" inputmode="decimal"
                                                        aria-label="{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}"
                                                        :aria-invalid="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched"
                                                        x-model.number="modelSettings.moe_expert_offload_resident_percent"

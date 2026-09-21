@@ -8,10 +8,9 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
-    // The MoE expert offload resident fraction is edited as a two-digit
-    // percentage. The server itself accepts any fraction in (0, 1].
-    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 20;
-    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 80;
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -1900,7 +1899,7 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
-                    moe_expert_offload_resident_percent: Math.round((s.moe_expert_offload_resident_fraction ?? 0.25) * 100),
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
@@ -1965,26 +1964,17 @@
             moeExpertOffloadResidentInvalid() {
                 const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
                 return (
-                    !Number.isInteger(percent)
+                    !Number.isFinite(percent)
                     || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
                     || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
                 );
             },
 
             onMoeExpertOffloadResidentBlur() {
-                // A field nobody typed in settles nothing. The API accepts any
-                // fraction in (0, 1], so a model stored at 12.5% or 90% — the
-                // shapes this field cannot express — keeps its value until the
-                // field is actually edited; merely focusing and leaving it must
-                // not rewrite what is stored.
+                // Preserve untouched API values outside the UI range.
                 if (!this.modelSettings.moe_expert_offload_resident_touched) return;
-                // Leaving an edited field settles it: an out-of-range entry is
-                // shown as an error while it is typed, then becomes the nearest
-                // allowed percentage rather than staying unsaveable.
                 if (this.moeExpertOffloadResidentInvalid()) {
-                    const percent = Math.round(
-                        Number(this.modelSettings.moe_expert_offload_resident_percent)
-                    );
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
                     this.modelSettings.moe_expert_offload_resident_percent = Math.min(
                         MOE_EXPERT_OFFLOAD_MAX_PERCENT,
                         Math.max(
@@ -1997,18 +1987,11 @@
             },
 
             onMoeExpertOffloadResidentPercent() {
-                // Ignore partial or out-of-range typing instead of clamping it, so
-                // typing "0" on the way to "50" cannot rewrite the field to 10.
-                // Typing also marks the field touched: an out-of-range stored
-                // value opens silently and only reports an error once edited.
+                // Defer clamping until blur so partial input remains editable.
                 this.modelSettings.moe_expert_offload_resident_touched = true;
                 const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
-                if (
-                    Number.isInteger(percent)
-                    && percent >= MOE_EXPERT_OFFLOAD_MIN_PERCENT
-                    && percent <= MOE_EXPERT_OFFLOAD_MAX_PERCENT
-                ) {
-                    this.modelSettings.moe_expert_offload_resident_fraction = percent / 100;
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
                 }
             },
 
