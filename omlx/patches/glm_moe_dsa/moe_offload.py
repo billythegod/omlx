@@ -234,6 +234,8 @@ class _SlotCache:
 
         def submit(limit):
             nonlocal submitted
+            if pool is None:
+                return
             while submitted < min(limit, len(misses)):
                 e = misses[submitted]
                 submitted += 1

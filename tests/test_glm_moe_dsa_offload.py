@@ -326,3 +326,17 @@ def test_wrap_and_release_return_descriptors_to_baseline(tmp_path, reference):
         cycle()
         gc.collect()
     assert open_fds() == baseline
+
+
+def test_serial_reads_match_reference(tmp_path, reference, monkeypatch):
+    from omlx.patches.moe_expert_offload import _shutdown_io_pool
+
+    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", "1")
+    _shutdown_io_pool()
+    try:
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        x = _x(1, 1, D)
+        indices = mx.arange(K).reshape(1, 1, K)
+        assert mx.array_equal(reference(x, indices), wrapped(x, indices)).item()
+    finally:
+        _shutdown_io_pool()
