@@ -1011,6 +1011,9 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
+    # Chain parent and tail marker; a tail is found through its parent.
+    parent_hash: bytes | None = None
+    tail_terminal: bool = False
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1035,6 +1038,10 @@ class PagedSSDBlockMetadata:
         if self.layer_meta_states:
             # Convert tuples to lists for JSON serialization
             result["layer_meta_states"] = [list(m) for m in self.layer_meta_states]
+        if self.parent_hash is not None:
+            result["parent_hash"] = self.parent_hash.hex()
+        if self.tail_terminal:
+            result["tail_terminal"] = True
         return result
 
     @classmethod
@@ -1058,6 +1065,10 @@ class PagedSSDBlockMetadata:
             cache_signature=data.get("cache_signature", ""),
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
+            parent_hash=(
+                bytes.fromhex(data["parent_hash"]) if data.get("parent_hash") else None
+            ),
+            tail_terminal=bool(data.get("tail_terminal", False)),
         )
 
 
@@ -2986,6 +2997,7 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     return None
 
+            parent_hash_hex = metadata.get("parent_hash", "")
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
@@ -2999,6 +3011,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=metadata.get("cache_signature", ""),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=bytes.fromhex(parent_hash_hex) if parent_hash_hex else None,
+                tail_terminal=metadata.get("tail_terminal") == "1",
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
@@ -3176,6 +3190,8 @@ class PagedSSDCacheManager(CacheManager):
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
         replace_existing: bool = False,
+        parent_hash: bytes | None = None,
+        tail_terminal: bool = False,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3201,6 +3217,8 @@ class PagedSSDCacheManager(CacheManager):
                 for the same content hash. This is reserved for promoting a
                 non-sliceable prefix-cache placeholder into a valid boundary
                 snapshot; normal deduplicated saves must leave it False.
+            parent_hash: Chain hash of the preceding block, if any.
+            tail_terminal: True for a short terminal block, re-indexed by parent.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -3450,6 +3468,10 @@ class PagedSSDCacheManager(CacheManager):
                 "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
+            if parent_hash is not None:
+                metadata["parent_hash"] = parent_hash.hex()
+            if tail_terminal:
+                metadata["tail_terminal"] = "1"
 
             # Add cache type information if provided
             if layer_cache_types:
@@ -3508,6 +3530,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=cache_signature,
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=parent_hash,
+                tail_terminal=tail_terminal,
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -4193,6 +4217,14 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._pending_write_buffers:
                 return True
         return False
+
+    def iter_tail_blocks(self) -> list[tuple[bytes | None, bytes, int]]:
+        """Return (parent_hash, block_hash, token_count) for indexed tail blocks."""
+        return [
+            (meta.parent_hash, meta.block_hash, meta.token_count)
+            for meta in self._index.get_all_metadata()
+            if meta.tail_terminal and meta.token_count > 0
+        ]
 
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
         """
