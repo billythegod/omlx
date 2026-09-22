@@ -1639,6 +1639,7 @@ class SchedulerConfig:
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
+    paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
     # Store top-level ArraysCache recurrent state as SSD sidecars while the
@@ -9061,6 +9062,7 @@ class Scheduler:
                 draft_ssd = PagedSSDCacheManager(
                     cache_dir=Path(self.config.paged_ssd_cache_dir),
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
+                    auto_size=self.config.paged_ssd_cache_auto_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
                     hot_cache_write_through=self.config.hot_cache_write_through,
@@ -13759,6 +13761,7 @@ class Scheduler:
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
+                auto_size=self.config.paged_ssd_cache_auto_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_write_through=self.config.hot_cache_write_through,
@@ -13820,7 +13823,7 @@ class Scheduler:
                 logger.info(
                     f"paged SSD cache enabled: "
                     f"cache_dir={self.config.paged_ssd_cache_dir}, "
-                    f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
+                    f"max_size={self._format_bytes(self.paged_ssd_cache_manager.max_size)}, "
                     f"block_size={self.config.paged_cache_block_size} tokens"
                 )
             return True

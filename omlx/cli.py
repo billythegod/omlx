@@ -292,15 +292,21 @@ def serve_command(args):
         scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
         # Determine cache max size: CLI arg > settings (with auto resolution)
         if paged_ssd_cache_dir:
-            if args.paged_ssd_cache_max_size:
+            if (
+                args.paged_ssd_cache_max_size
+                and args.paged_ssd_cache_max_size.lower() != "auto"
+            ):
                 # CLI argument specified explicitly
                 cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
             else:
-                # Use settings value (handles "auto" -> 10% of SSD capacity)
+                # Resolve the initial automatic budget from disk space and existing cache.
                 cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
                     settings.base_path
                 )
             scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
+            scheduler_config.paged_ssd_cache_auto_size = (
+                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
+            ).lower() == "auto"
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
@@ -330,6 +336,8 @@ def serve_command(args):
             print("Mode: Multi-model serving (continuous batching + paged SSD cache)")
             # Format cache size for display
             cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
+            if scheduler_config.paged_ssd_cache_auto_size:
+                cache_max_size_display = f"auto, current limit {cache_max_size_display}"
             print(
                 f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})"
             )
