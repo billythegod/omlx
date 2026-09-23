@@ -422,6 +422,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_MLX_ACTIVE_MEMORY_SAMPLE_STALE_S = 2.0
+
+
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
 
@@ -444,6 +447,7 @@ class PrefillEvictionRequest:
     predicted_transient_bytes: int
     requested_tokens: int
     reason: str
+    stale_usage: bool = False
 
 
 class _PrefillEvictionNeeded(Exception):
@@ -1978,6 +1982,7 @@ class Scheduler:
         # executor thread. The background memory enforcer reads this cached
         # value during active decode instead of touching MLX/Metal directly.
         self._last_mlx_active_memory_bytes: int = 0
+        self._last_mlx_active_memory_at: float = 0.0
         # Component ceilings — propagated alongside the hard limit so the
         # rejection-path error message can identify which constraint is
         # binding and suggest the right remedy (close apps / raise tier /
@@ -4799,6 +4804,7 @@ class Scheduler:
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
             self._last_mlx_active_memory_bytes = active
+            self._last_mlx_active_memory_at = time.monotonic()
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):
             hot_cache_bytes = hot_cache_cpu_bytes()
@@ -10211,6 +10217,18 @@ class Scheduler:
             self._pending_async_removes or self._deferred_clear_at is not None
         )
 
+    def route_preflight_usage_is_stale(self) -> bool:
+        """Return whether the cached MLX sample predates this preflight.
+
+        A fully idle scheduler has no step boundary at which to refresh the
+        executor-owned sample. The timestamp lets route preflight distinguish
+        that case from genuinely resident memory before evicting or rejecting.
+        """
+        return (
+            time.monotonic() - self._last_mlx_active_memory_at
+            >= _MLX_ACTIVE_MEMORY_SAMPLE_STALE_S
+        )
+
     def refresh_route_preflight_usage(self) -> int:
         """Publish a fresh MLX memory sample for route-level retry.
 
@@ -10701,6 +10719,7 @@ class Scheduler:
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
         request_id = request_id or "preflight"
+        stale_usage = self.route_preflight_usage_is_stale()
 
         est = self._admission_estimate(
             num_prompt_tokens=num_prompt_tokens,
@@ -10721,6 +10740,7 @@ class Scheduler:
                 predicted_transient_bytes=int(est.kv_exact + est.transient),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
+                stale_usage=stale_usage,
             )
 
         safety_rejection = self._preflight_safety_rejection(
@@ -10740,6 +10760,7 @@ class Scheduler:
             ),
             requested_tokens=est.floor_chunk,
             reason="prefill_safety_cap",
+            stale_usage=stale_usage,
         )
 
     def _preflight_safety_rejection(
