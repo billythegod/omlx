@@ -35,10 +35,7 @@ SETTINGS_VERSION = 1
 # Keep API validation and runtime normalization on the same contract.
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
-# Model families whose loader keeps the speculative draft head resident while
-# the backbone streams, so Lightning MTP can coexist with expert offload.
-# DeepSeek V4.1 folds DSpark into the shared loop and preserves ``mtp.*``
-# weights; every other family still strips the draft head under offload.
+# These families keep the MTP head resident while backbone experts stream.
 MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41",)
 
 
@@ -58,9 +55,7 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
             "MoE expert offload cannot be combined with Lightning MTP, "
             "VLM MTP, or DFlash; disable speculative decoding first."
         )
-    # Lightning MTP is allowed only where the loader keeps the draft head
-    # resident. ``model_type`` is deferred when unknown so the settings
-    # dataclass round-trips before the checkpoint family is resolved.
+    # Settings can load before the checkpoint family is known.
     if settings.get("mtp_enabled") and model_type is not None:
         family = model_type.replace("-", "_").lower()
         if family not in MOE_OFFLOAD_MTP_MODEL_TYPES:

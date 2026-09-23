@@ -145,10 +145,6 @@ def test_speculative_offload_conflict(key):
 
 
 def test_lightning_mtp_offload_conflict_is_family_aware():
-    # Lightning MTP + offload is rejected for families whose loader cannot
-    # keep the draft head resident, allowed for DeepSeek V4.1, and deferred
-    # (not rejected) when the family is unknown so the settings dataclass
-    # round-trips before the load path resolves the checkpoint type.
     from omlx.model_settings import validate_moe_expert_offload
 
     settings = {"moe_expert_offload_enabled": True, "mtp_enabled": True}
@@ -729,10 +725,6 @@ def test_converted_draft_head_stays_resident_with_offload_and_mtp(
 
 
 def test_offloaded_dspark_verify_matches_resident(tmp_path, monkeypatch):
-    # Verify is authoritative. With the backbone streamed and the draft head
-    # resident, the DSpark path must still run: the resident draft head emits
-    # proposals, and the backbone verify hidden under a T=k+1 forward matches
-    # the fully-resident model within rounding tolerance.
     from omlx.patches import mlx_lm_mtp
     from omlx.patches.deepseek_v41 import dspark
 
@@ -843,8 +835,6 @@ def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
         vlm_mtp_enabled = False
         dflash_enabled = False
 
-    # V4.1 reaches past the gate (validation must not raise here); the patch
-    # application that follows is exercised by the dedicated loader tests.
     from omlx.model_settings import validate_moe_expert_offload
 
     validate_moe_expert_offload(
@@ -855,8 +845,6 @@ def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
         },
         model_type=_config_model_type(v41),
     )
-    # A non-allowlisted lightning family is rejected at load time, before any
-    # patch is applied.
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         maybe_apply_pre_load_patches(other, Settings())
 

@@ -99,10 +99,7 @@ class ExpertOffloadPlan:
         if self.converted is not None:
             for key in mapping:
                 if key.startswith("language_model.mtp."):
-                    # ``_entry`` registers the key for exclusion as a side
-                    # effect. When the draft head is resident we still want the
-                    # byte count for reporting, so read the header directly and
-                    # leave the key out of ``excluded_keys``.
+                    # _entry excludes the tensor from loading; resident draft weights must stay included.
                     if self.mtp_resident:
                         entry = self._header(self.mapping[key])[key]
                     else:

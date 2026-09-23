@@ -90,10 +90,7 @@ def load(
     if moe_expert_offload_resident_fraction is not None:
         from ..mlx_lm_mtp import is_mtp_active
 
-        # Offload strips the draft head unless DSpark is armed: the draft is
-        # small, fully resident, and its experts are verified by the streamed
-        # backbone. When speculation is off, retained draft weights need not
-        # consume RAM, so drop them exactly as before.
+        # Drop unused draft weights to keep the offload memory saving.
         if not is_mtp_active():
             config.preserve_mtp = False
     if ced_prefill:

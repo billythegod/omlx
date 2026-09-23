@@ -1918,6 +1918,8 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+        except ValueError:
+            raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
