@@ -2073,10 +2073,8 @@ def _v41_monitor():
 def test_v41_prefill_profile_registered():
     profile = make_prefill_memory_profile(_v41_config(), compute_dtype_size=2)
     assert profile is not None
-    # Resident KV is 4-bit packed (dim//2 + dim//16 bytes per latent) only on
-    # the source layers: kv sources at ratios [2,2,2,1] -> 144*3 + 288,
-    # index sources at ratios [2,2,2,1,1,1,1,1] -> 36*3 + 72*5.
-    per_token = (144 * 3 + 288) + (36 * 3 + 72 * 5)
+    # Four KV source layers store both latents and index keys at ratios 2, 2, 2, 1.
+    per_token = (144 * 3 + 288) + (34 * 3 + 68)
     assert profile.estimate_resident_kv_bytes(1000) == per_token * 1000
     short = profile.estimate_prefill_transient_bytes(2048, 2048)
     long_ctx = profile.estimate_prefill_transient_bytes(2048, 32768)

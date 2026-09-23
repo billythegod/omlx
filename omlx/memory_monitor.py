@@ -1620,27 +1620,10 @@ def _make_qwen4_exp_prefill_memory_profile(
 
 @dataclass(frozen=True)
 class _DeepSeekV41PrefillMemoryProfile:
-    """Prefill estimator for DeepSeek V4.1 (deepseek_v41): packed sparse MLA.
+    """Estimate packed sparse attention with one layer of transient buffers.
 
-    Every layer attends a 128-token sliding window plus ``index_topk``
-    4-bit packed latents through fused kernels (the native
-    ``deepseek_v41_packed_attention`` route or the Python
-    ``packed_sparse_attention`` Metal kernel), so the [heads, query, keys]
-    score surface is never materialized; the attention core is priced as a
-    conservative gather over the selected latents (the kernels tile below
-    it). The transient is one layer's worth — attention heads, the gather,
-    the indexer projection, the hc_mult hyper-connection streams and the
-    MoE routes — because layers run sequentially and the vendored loop
-    evals the stream at each layer boundary during prefill; pool churn
-    that eval cannot return is absorbed by the flat-overhead accounting,
-    not by a token-linear EWMA.
-
-    Resident KV is 4-bit packed (dim//2 + dim//16 bytes per latent incl.
-    the e4m3 group scales) and token-proportional only on the
-    ``kv_source_layers`` / ``index_source_layers`` producers, at the
-    stride of their compress ratio. The sliding-window rows are bounded
-    (``window_size`` per layer) and the indexer candidates are top-k
-    indices, so neither enters the per-token term.
+    Resident K/V uses 16-element scale groups; index keys use 32-element groups.
+    Only KV source layers store growing keys. Sliding windows remain bounded.
     """
 
     num_attention_heads: int
@@ -1737,13 +1720,8 @@ def _make_deepseek_v41_prefill_memory_profile(
     if isinstance(kv_sources, (str, bytes)) or isinstance(index_sources, (str, bytes)):
         return None
 
-    # pack_activation(bits=4, group_size=16): half a byte per element plus
-    # one e4m3 scale byte per 16-wide group.
-    def _packed_width(d: int) -> int:
-        return int(d) // 2 + int(d) // 16
-
-    kv_latent = _packed_width(head_dim)
-    index_latent = _packed_width(index_head_dim)
+    kv_latent = int(head_dim) // 2 + int(head_dim) // 16
+    index_latent = int(index_head_dim) // 2 + int(index_head_dim) // 32
     per_token = 0
     for layer_id in tuple(kv_sources):
         if not _pos_int(layer_id) and layer_id != 0:
@@ -1762,7 +1740,9 @@ def _make_deepseek_v41_prefill_memory_profile(
         ratio = compress_ratios[int(layer_id)]
         if not _pos_int(ratio):
             return None
-        per_token += index_latent // int(ratio)
+        # Other index layers reuse the keys stored by the KV source layer.
+        if layer_id in kv_sources:
+            per_token += index_latent // int(ratio)
 
     return _DeepSeekV41PrefillMemoryProfile(
         num_attention_heads=int(n_heads),

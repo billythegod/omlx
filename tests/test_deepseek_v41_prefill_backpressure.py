@@ -26,7 +26,7 @@ import types
 import mlx.core as mx
 
 import omlx.patches.deepseek_v41.language as v41_lang
-from omlx.memory_monitor import MemoryMonitor
+from omlx.memory_monitor import MemoryMonitor, make_prefill_memory_profile
 from omlx.patches.deepseek_v41 import apply_patch
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.scheduler import Scheduler
@@ -185,3 +185,20 @@ def test_set_model_info_wires_v41_profile_through_scheduler():
     assert ns.memory_monitor is monitor
     estimated = profile.estimate_resident_kv_bytes(8192)
     assert estimated > 0
+
+
+def test_v41_resident_estimate_matches_stored_cache_bytes():
+    from test_deepseek_v41 import load_reference_weights, tiny
+
+    config = tiny(index_head_dim=64)
+    model = v41_lang.LanguageModel(config)
+    load_reference_weights(model)
+    cache = model.make_cache()
+    tokens = mx.arange(16)[None, :]
+    output = model(tokens, cache=cache)
+    mx.eval(output, [item.state for item in cache])
+
+    profile = make_prefill_memory_profile(config, compute_dtype_size=4)
+    stored_bytes = sum(item[2].nbytes + item[3].nbytes for item in cache)
+    assert stored_bytes > 0
+    assert profile.estimate_resident_kv_bytes(tokens.shape[1]) == stored_bytes
