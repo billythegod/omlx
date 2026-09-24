@@ -13,14 +13,19 @@ cycles can therefore leave the process footprint elevated until restart.
 Reuse `release_qwen35_ane_prefill()` as the single release operation. It already
 handles ordinary and fused ANE state, latches the per-module fallback flags
 before dropping state, resets ANE status counters, and is idempotent. Call it
-after the engine has stopped and closed, but before the wrapper drops its model
-reference. This ordering prevents a live engine from observing a deliberately
-disabled ANE state while it is still serving teardown work.
+after in-flight work has drained, before dropping the remaining model reference.
+The text engine releases ANE state after core close. The VLM adapter releases it
+in its existing resource cleanup hook, after scheduler teardown and before the
+final memory reclaim.
 
 Apply the same ordering to both `BatchedEngine` and `VLMBatchedEngine`, because
 both load paths can enable Qwen ANE prefill. Failures remain contained like
 the existing optional ANE setup: teardown must continue to clear wrapper
 references even if the release helper is unavailable or raises.
+
+Tuning cancellation signals the calibration worker and waits for it to exit
+before unloading its model. Calibration checks cancellation between candidates
+and phases; an in-flight native compile or evaluation must finish first.
 
 ## Verification
 

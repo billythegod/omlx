@@ -2801,41 +2801,42 @@ class TestStopSafety:
         assert events == ["stop", "vision_cache", "inner_close"]
 
     @pytest.mark.asyncio
-    async def test_stop_releases_ane_state_before_dropping_vlm_model(self):
-        """VLM stop releases ANE banks while the model is still reachable."""
+    @pytest.mark.parametrize("release_fails", [False, True])
+    async def test_stop_releases_ane_through_adapter_close(self, release_fails):
+        from omlx.models.vlm import VLMModelAdapter
+
         engine = _make_loaded_engine()
         model = engine._vlm_model
-        engine._engine.stop = AsyncMock()
-        engine._engine.engine = MagicMock()
+        adapter = VLMModelAdapter(model)
+        engine._adapter = adapter
         events = []
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        inner = MagicMock()
+        engine._engine.engine = inner
 
-        def release_ane_state(value):
-            events.append((value is model, engine._vlm_model is model))
+        def close():
+            events.append("close")
+            assert engine._vlm_model is None
+            adapter.release_resources()
+
+        inner.close.side_effect = close
+
+        def release(value):
+            events.append("release")
+            assert value is model
+            assert adapter._vlm_model is model
+            if release_fails:
+                raise RuntimeError("native release unavailable")
             return 3, 6
 
         with patch(
             "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
-            side_effect=release_ane_state,
+            side_effect=release,
         ):
             await engine.stop()
 
-        assert events == [(True, True)]
-        assert engine._vlm_model is None
-
-    @pytest.mark.asyncio
-    async def test_stop_continues_when_ane_state_release_fails(self):
-        """A failed optional ANE release still clears VLM references."""
-        engine = _make_loaded_engine()
-        engine._engine.stop = AsyncMock()
-        engine._engine.engine = MagicMock()
-
-        with patch(
-            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
-            side_effect=RuntimeError("native release unavailable"),
-        ):
-            await engine.stop()
-
-        assert engine._vlm_model is None
+        assert events == ["stop", "close", "release"]
+        assert adapter._vlm_model is None
         assert engine._engine is None
 
     @pytest.mark.asyncio
