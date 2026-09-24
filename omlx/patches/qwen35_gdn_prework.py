@@ -26,6 +26,7 @@ stock path.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 import mlx.core as mx
@@ -468,6 +469,60 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
+def _qwen4_wide_projections_enabled() -> bool:
+    """Whether the fused Qwen4 decode prework accepts any canonical affine
+    allocation of the GDN projections instead of the shipped oQe recipe.
+
+    The eligibility predicate below is evaluated around projections that are
+    ordinary ``QuantizedLinear`` calls shared with the stock route, and the fused
+    kernels consume the resulting bf16 activations. The allocation therefore
+    cannot change what the kernels compute. It does change how those four
+    projections are executed: at B=1/T=1 the route calls
+    ``_target_verify_linears``, which for a homogeneous recipe concatenates the
+    packed weights into a single ``quantized_matmul`` and otherwise falls back to
+    four separate calls. Both were measured bit-identical to four independent
+    ``QuantizedLinear`` calls at every allocation the opt-in admits, so a recipe
+    change is a performance and memory effect, not a numerical one -- see
+    ``test_qwen4_decode_wide_projections_are_bit_exact_either_way``.
+    The ``(4|5|6, 64)``/``(5, 128)`` allow-list in
+    :func:`_qwen4_decode_static_eligible` was a converter allow-list, not a kernel
+    requirement, and it left the fused decode disengaged on checkpoints whose GDN
+    projections are allocated elsewhere --
+    8-bit/group-64 for the community Qwen3.8-Flash-Next exports, and a
+    5-bit/group-64 ``in_proj_*`` with a 4-bit/group-64 ``out_proj`` for the
+    27B Qwen3.5-lineage exports.
+
+    Opt in with ``OMLX_QWEN4_GDN_DECODE_WIDE_PROJ=1``. The default keeps the
+    historical oQe-only envelope; the opt-in arm still fails closed on shape,
+    dtype, ``mode`` and bias presence, so a non-canonical projection (a
+    reclassified subclass with extra state, a transposed layout, a recipe whose
+    scale packing differs) still cannot reach the kernel.
+    """
+    return os.environ.get("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+# Affine group sizes the quantizer implements (omlx/oq.py::_AFFINE_GROUP_SIZES)
+# and the affine widths it accepts. A projection outside these sets cannot have
+# come from the loader, so it fails closed rather than reaching the kernel.
+_ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
+_ALLOWED_GROUPS = frozenset({32, 64, 128})
+
+# Residual width of the shipped Qwen4 geometry, kept as a literal on purpose.
+# The base class does expose ``module.hidden_size``, so this could be derived --
+# but deriving it would let a wider checkpoint past *this* check while the other
+# two family pins still reject it (``canonical_projection``'s ``in_dim=2560``
+# default and the ``(1, 1, 2560)`` dynamic-gate shape), i.e. the same model would
+# fail for inconsistent-looking reasons. Pinning all three to the shipped width
+# keeps the rejection legible and keeps widening the family an explicit change;
+# ``test_qwen4_decode_wide_opt_in_stays_within_the_2560_family`` holds that line.
+_QWEN4_HIDDEN_SIZE = 2560
+
+
 def _qwen4_decode_static_eligible(module) -> bool:
     """Fail closed unless this is the shipped Qwen4 oQe decode geometry."""
 
@@ -504,15 +559,19 @@ def _qwen4_decode_static_eligible(module) -> bool:
 
     # The q4 prefill routing reclasses these projections to a QuantizedLinear
     # subclass; the fused decode reads their packed storage, not their forward.
-    def canonical_projection(linear, rows, signatures):
+    def canonical_projection(linear, rows, signatures, in_dim=2560):
         if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
             return False
         signature = (linear.bits, linear.group_size)
-        if signature not in signatures:
+        if signatures is not None and signature not in signatures:
+            return False
+        if signature[0] not in _ALLOWED_BITS or signature[1] not in _ALLOWED_GROUPS:
             return False
         bits, group_size = signature
-        packed_cols = 2560 * bits // 32
-        scale_cols = 2560 // group_size
+        if in_dim % group_size:
+            return False
+        packed_cols = in_dim * bits // 32
+        scale_cols = in_dim // group_size
         return (
             linear.weight.shape == (rows, packed_cols)
             and linear.weight.dtype == mx.uint32
@@ -527,11 +586,15 @@ def _qwen4_decode_static_eligible(module) -> bool:
     # The shipped oQe allocation is intentionally mixed per tensor.  This
     # kernel begins after those projections, so accept only the exact
     # canonical layouts emitted by the converter rather than demanding that
-    # all four happen to share layer 0's q6/g64 allocation.
+    # all four happen to share layer 0's q6/g64 allocation.  ``wide`` lifts the
+    # recipe allow-list only; every shape/dtype/bias check above still applies.
+    wide = _qwen4_wide_projections_enabled()
+    qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64)}
+    aux_signatures = None if wide else {(5, 128), (6, 64)}
     if not canonical_projection(
         module.in_proj_qkv,
         conv_dim,
-        {(4, 64), (5, 64), (6, 64)},
+        qkv_signatures,
     ):
         return False
     for linear, rows in (
@@ -539,23 +602,20 @@ def _qwen4_decode_static_eligible(module) -> bool:
         (module.in_proj_b, 48),
         (module.in_proj_a, 48),
     ):
-        if not canonical_projection(linear, rows, {(5, 128), (6, 64)}):
+        if not canonical_projection(linear, rows, aux_signatures):
             return False
 
     out = module.out_proj
-    return (
-        isinstance(out, nn.QuantizedLinear)
-        and out.bits == 5
-        and out.group_size == 128
-        and out.mode == "affine"
-        and out.weight.shape == (2560, 960)
-        and out.weight.dtype == mx.uint32
-        and out.scales.shape == (2560, 48)
-        and out.scales.dtype == mx.bfloat16
-        and out.biases is not None
-        and out.biases.shape == (2560, 48)
-        and out.biases.dtype == mx.bfloat16
-        and "bias" not in out
+    # out_proj sits after the fused norm/gate, so its allocation cannot reach
+    # the fused kernels at all; in the opt-in arm only the canonical-layout
+    # checks remain. Its input is the concatenated value stream, not the
+    # residual stream.
+    out_signatures = None if wide else {(5, 128)}
+    return canonical_projection(
+        out,
+        _QWEN4_HIDDEN_SIZE,
+        out_signatures,
+        in_dim=module.num_v_heads * module.head_v_dim,
     )
 
 
