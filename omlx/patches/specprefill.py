@@ -230,21 +230,11 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
 
 
 class IndeterminateCacheOffsetError(RuntimeError):
-    """A non-empty cache was supplied whose token position cannot be read.
-
-    Treating this as 0 would re-prefill a prompt on top of state that already
-    holds it, duplicating the prefix, so it is raised rather than guessed.
-    """
+    """A populated cache has no readable token position."""
 
 
 def _leaf_cache_offset(cache_entry: Any) -> int | None:
-    """Integer ``offset`` of *cache_entry*, descending into composite caches.
-
-    The first sub-cache that reports one answers. Every CacheList in the tree
-    puts a token-counting cache first; a composite led by a cache counting
-    something else, such as PoolingCache with its pooled rows, would need this
-    to choose rather than take the first.
-    """
+    """Read an integer token offset, descending into composite caches."""
     for sub in getattr(cache_entry, "caches", None) or ():
         offset = _leaf_cache_offset(sub)
         if offset is not None:
@@ -257,20 +247,7 @@ def _leaf_cache_offset(cache_entry: Any) -> int | None:
 
 
 def _cache_entry_is_bounded(cache_entry: Any) -> bool:
-    """Whether *cache_entry* keeps a bounded buffer, descending into composites.
-
-    A bounded cache -- RotatingKVCache and friends, which sparse_prefill
-    already recognizes by ``max_size`` -- counts tokens ever processed in
-    ``offset``, not tokens currently held. prefix_cache makes the same
-    distinction when it compares offsets across layers, for the same reason:
-    the two meanings coincide only until a sliding window has wrapped.
-
-    ``max_size`` is tested rather than the class name, because it is the
-    structural property that makes ``offset`` mean the other thing, and it
-    covers subclasses along with the bounded caches that
-    ``CacheTypeRegistry.is_rotating_family`` does not name, such as
-    DSparkContextCache.
-    """
+    """Detect bounded caches, including composite members."""
     subs = getattr(cache_entry, "caches", None)
     if isinstance(subs, (list, tuple)):
         return any(_cache_entry_is_bounded(sub) for sub in subs)
@@ -278,12 +255,7 @@ def _cache_entry_is_bounded(cache_entry: Any) -> bool:
 
 
 def _cache_entry_is_empty(cache_entry: Any) -> bool:
-    """Whether *cache_entry* holds no tokens, to tell empty from unreadable.
-
-    Only ever used to decide whether a missing offset is benign, so anything
-    it cannot establish counts as holding state: a probe that throws, or a
-    cache that offers none, is not evidence of emptiness.
-    """
+    """Require a successful empty() probe before treating a cache as empty."""
     empty = getattr(cache_entry, "empty", None)
     if not callable(empty):
         return False
@@ -294,22 +266,7 @@ def _cache_entry_is_empty(cache_entry: Any) -> bool:
 
 
 def _logical_cache_offset(model, cache: list[Any]) -> int:
-    """Tokens already held by *cache*, read from the layers that count them.
-
-    Recurrent layers (ArraysCache and friends) carry a fixed-size summary
-    rather than a growing sequence, so they expose no ``offset``. On a hybrid
-    model layer 0 is one of those, and reading ``cache[0].offset`` therefore
-    reports 0 for a fully restored cache. Ask the attention layers instead,
-    through the same mapping ``sparse_prefill`` uses.
-
-    Offset-bearing layers are cross-checked: they describe one sequence, so a
-    disagreement means at least one is wrong. The smallest wins, since
-    prefilling a token twice is recoverable and skipping one is not.
-
-    Raises:
-        IndeterminateCacheOffsetError: the cache holds state but no layer
-            reports a position.
-    """
+    """Read the sequence position from mapped attention caches."""
     held: list[int] = []
     bounded: list[int] = []
 
@@ -324,9 +281,7 @@ def _logical_cache_offset(model, cache: list[Any]) -> int:
         if 0 <= cache_idx < len(cache):
             _record(cache[cache_idx])
 
-    # Unbounded layers answer when there are any: their offset is the number
-    # of tokens held. A bounded-only model still gets an answer, since with
-    # nothing to compare against its offset is the position too.
+    # Prefer unbounded layer offsets; use bounded layers only when necessary.
     offsets = held or bounded
 
     if not offsets:
@@ -496,8 +451,7 @@ def _hold_value(value: Any, seen: set[int]) -> Any:
         return type(value)(_hold_value(v, seen) for v in value)
     if isinstance(value, dict):
         return {k: _hold_value(v, seen) for k, v in value.items()}
-    # Each nested object once: a reference cycle, or two paths to the same
-    # object, keep the reference rather than recursing again.
+    # Visit each nested object once to preserve aliases and avoid object cycles.
     if hasattr(value, "__dict__") and not callable(value) and id(value) not in seen:
         return _HeldObject(value, _hold_leaf_state(value, seen))
     return value
@@ -517,14 +471,7 @@ def _restore_value(held: Any) -> Any:
 
 
 def _hold_leaf_state(leaf: Any, seen: set[int] | None = None) -> dict[str, Any]:
-    """Copy of *leaf*'s attributes that survives later in-place updates.
-
-    Containers are rebuilt and arrays copied: ArraysCache writes into its
-    ``cache`` list, and RotatingKVCache slice-assigns into ``keys``, which
-    rebinds the array a held reference points at. Nested objects are held
-    the same way and restored in place, because a wrapper such as
-    SizedArraysCache keeps the state on the object it wraps.
-    """
+    """Copy mutable cache state, including nested wrapper objects."""
     seen = set() if seen is None else seen
     seen.add(id(leaf))
     return {k: _hold_value(v, seen) for k, v in vars(leaf).items()}
@@ -533,12 +480,7 @@ def _hold_leaf_state(leaf: Any, seen: set[int] | None = None) -> dict[str, Any]:
 def _undo_lookahead(
     leaves: list[Any], held_states: list[Any], pre_lookahead_offset: int
 ) -> None:
-    """Return *leaves* to their state before the lookahead decode.
-
-    Unbounded KV caches store keys/values as contiguous tensors, so slicing
-    back to ``pre_lookahead_offset`` removes the lookahead entries. Every
-    other leaf gets the attributes held by ``_hold_leaf_state`` back.
-    """
+    """Trim unbounded KV and restore the saved state of all other leaves."""
     for leaf, held in zip(leaves, held_states):
         if held is not None:
             vars(leaf).update({k: _restore_value(v) for k, v in held.items()})
@@ -711,12 +653,7 @@ def score_tokens(
     if existing_cache is not None:
         cache = existing_cache
         cached_len = _logical_cache_offset(model, cache)
-        # The lookahead starts from the logits at the last prompt position,
-        # which only a forward pass over that token yields. A cache that
-        # already holds it cannot give them back: feeding the token again
-        # attends to it twice and advances recurrent state past the prompt,
-        # and trimming afterwards restores neither the logits nor the state.
-        # The caller has to restore at most N-1 tokens.
+        # The final prompt token must run once to produce the lookahead logits.
         if cached_len >= n_prompt:
             raise ValueError(
                 f"existing_cache holds {cached_len} tokens but the prompt has "
@@ -748,21 +685,13 @@ def score_tokens(
             ),
         )
 
-    # Record cache offset before lookahead so we can trim afterwards.
-    # Lookahead decode appends n_lookahead+1 tokens to the cache which
-    # must NOT be persisted when the caller stores the cache to SSD.
+    # The returned cache must exclude lookahead tokens.
     try:
         pre_lookahead_offset = _logical_cache_offset(model, cache)
     except IndeterminateCacheOffsetError:
         pre_lookahead_offset = n_prompt
 
-    # The lookahead below advances every layer, and the cache returned here
-    # is the one the caller stores as this prompt's. Unbounded attention KV
-    # is sliced back afterwards. Every other leaf -- recurrent state such as
-    # ArraysCache, a bounded RotatingKVCache whose window has wrapped, a
-    # sub-cache of a CacheList -- cannot be, so its attributes are held here
-    # and put back on the same object, or it would describe the prompt plus
-    # the lookahead tokens.
+    # Recurrent state and wrapped rotating buffers cannot be trimmed like KV.
     leaves = _cache_leaves(cache)
     held_states = [
         None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)

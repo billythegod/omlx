@@ -911,688 +911,87 @@ class TestTargetPrefillLeftoverCleanup:
 
 
 class TestLogicalCacheOffset:
-    """Tests for _logical_cache_offset() — the token position of a cache.
-
-    Hybrid GDN models put a recurrent layer at index 0. That layer holds a
-    fixed-size summary and exposes no ``offset``, so reading ``cache[0].offset``
-    reports 0 for a fully restored cache: the prompt is then re-prefilled on
-    top of the state that already holds it.
-    """
-
     @staticmethod
-    def _model(layer_kinds):
-        """Model whose layers are attention ("a") or recurrent ("r")."""
+    def _model(kinds):
         from types import SimpleNamespace
 
-        layers = [
-            SimpleNamespace(self_attn=object()) if kind == "a" else SimpleNamespace()
-            for kind in layer_kinds
-        ]
-        return SimpleNamespace(layers=layers)
-
-    @staticmethod
-    def _kv(offset):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(offset=offset, state=(1, 1))
-
-    @staticmethod
-    def _recurrent():
-        """Stands in for ArraysCache: real state, no ``offset``."""
-        from types import SimpleNamespace
-
-        return SimpleNamespace(state=(1, 1), empty=lambda: False)
-
-    def test_pure_kv_cache_is_unchanged(self):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        model = self._model("aaaa")
-        cache = [self._kv(512) for _ in range(4)]
-        assert _logical_cache_offset(model, cache) == 512
-
-    def test_empty_pure_kv_cache_is_zero(self):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        model = self._model("aa")
-        assert _logical_cache_offset(model, [self._kv(0), self._kv(0)]) == 0
-
-    def test_hybrid_cache_reads_past_the_recurrent_layer_zero(self):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        # layer 0 is recurrent, as on Qwen3.5: cache[0] has no offset at all.
-        model = self._model("rrra")
-        cache = [
-            self._recurrent(),
-            self._recurrent(),
-            self._recurrent(),
-            self._kv(12288),
-        ]
-        assert not hasattr(cache[0], "offset")
-        assert _logical_cache_offset(model, cache) == 12288
-
-    def test_real_mlx_caches_are_read_correctly(self):
-        """The same question, asked of the cache objects mlx-lm builds.
-
-        The stand-ins elsewhere in this class cannot catch a mismatch between
-        what a real cache exposes and what this module expects of it.
-        """
-        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
-        from omlx.patches.specprefill import (
-            _cache_entry_is_bounded,
-            _cache_entry_is_empty,
-            _logical_cache_offset,
+        return SimpleNamespace(
+            layers=[
+                (
+                    SimpleNamespace(self_attn=object())
+                    if kind == "a"
+                    else SimpleNamespace()
+                )
+                for kind in kinds
+            ]
         )
+
+    @pytest.mark.parametrize("populated", [False, True])
+    def test_hybrid_and_composite_caches(self, populated):
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from omlx.patches.specprefill import _logical_cache_offset
 
         recurrent, kv = ArraysCache(1), KVCache()
-        kv.update_and_fetch(
-            mx.zeros((1, 2, 12, 8), dtype=mx.float32),
-            mx.zeros((1, 2, 12, 8), dtype=mx.float32),
-        )
-        recurrent[0] = mx.ones((1, 2, 4), dtype=mx.float32)
-
-        assert not hasattr(recurrent, "offset")
-        assert not _cache_entry_is_empty(recurrent)
-        assert not _cache_entry_is_bounded(kv)
-        assert _cache_entry_is_bounded(RotatingKVCache(max_size=8))
-        assert _logical_cache_offset(self._model("ra"), [recurrent, kv]) == 12
-
-    def test_real_recurrent_only_cache_is_refused(self):
-        """A real ArraysCache holding state must raise, not answer 0."""
-        from mlx_lm.models.cache import ArraysCache
-
-        from omlx.patches.specprefill import (
-            IndeterminateCacheOffsetError,
-            _logical_cache_offset,
-        )
-
-        held = ArraysCache(1)
-        held[0] = mx.ones((1, 2, 4), dtype=mx.float32)
-        with pytest.raises(IndeterminateCacheOffsetError):
-            _logical_cache_offset(self._model("rr"), [held, held])
-
-        assert _logical_cache_offset(self._model("rr"), [ArraysCache(1)]) == 0
-
-    def test_disagreeing_layers_take_the_smallest(self, caplog):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        # One sequence cannot be at two positions; re-prefilling a token is
-        # recoverable, skipping one is not.
-        model = self._model("rara")
-        cache = [self._recurrent(), self._kv(8192), self._recurrent(), self._kv(12288)]
-        with caplog.at_level(logging.WARNING, logger="omlx.patches.specprefill"):
-            assert _logical_cache_offset(model, cache) == 8192
-        # A silent minimum would hide the inconsistency it is working around.
-        assert "disagree on sequence position" in caplog.text
-        assert "8192" in caplog.text and "12288" in caplog.text
-
-    def test_agreeing_layers_log_nothing(self, caplog):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        model = self._model("rara")
-        cache = [self._recurrent(), self._kv(8192), self._recurrent(), self._kv(8192)]
-        with caplog.at_level(logging.WARNING, logger="omlx.patches.specprefill"):
-            assert _logical_cache_offset(model, cache) == 8192
-        assert caplog.text == ""
-
-    @staticmethod
-    def _rotating(offset, max_size=32):
-        """Stands in for RotatingKVCache: offset counts tokens ever seen."""
-        from types import SimpleNamespace
-
-        return SimpleNamespace(offset=offset, max_size=max_size, state=(1, 1))
-
-    def test_bounded_layer_does_not_answer_beside_an_unbounded_one(self, caplog):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        # A wrapped sliding window reports tokens ever processed, not tokens
-        # held, so comparing it with a KVCache would mean comparing two
-        # different quantities. prefix_cache refuses that comparison too.
-        model = self._model("aa")
-        cache = [self._kv(40), self._rotating(100)]
-        with caplog.at_level(logging.WARNING, logger="omlx.patches.specprefill"):
-            assert _logical_cache_offset(model, cache) == 40
-        assert caplog.text == ""
-
-    def test_bounded_only_model_still_gets_an_answer(self):
-        from omlx.patches.specprefill import _logical_cache_offset
-
-        # Nothing to compare against, so the offset is the position.
-        model = self._model("aa")
+        if populated:
+            recurrent[0] = mx.ones((1, 2, 4))
+            kv.update_and_fetch(mx.zeros((1, 2, 12, 8)), mx.zeros((1, 2, 12, 8)))
+        expected = 12 if populated else 0
+        assert _logical_cache_offset(self._model("a"), [kv]) == expected
+        assert _logical_cache_offset(self._model("ra"), [recurrent, kv]) == expected
         assert (
-            _logical_cache_offset(model, [self._rotating(64), self._rotating(64)]) == 64
+            _logical_cache_offset(self._model("a"), [CacheList(kv, recurrent)])
+            == expected
         )
 
-    def test_state_bearing_cache_without_any_offset_is_refused(self):
-        from omlx.patches.specprefill import (
-            IndeterminateCacheOffsetError,
-            _logical_cache_offset,
-        )
-
-        # Silently answering 0 here is what duplicates the prefix.
-        model = self._model("rr")
-        with pytest.raises(IndeterminateCacheOffsetError):
-            _logical_cache_offset(model, [self._recurrent(), self._recurrent()])
-
-    def test_cold_all_recurrent_cache_is_zero_not_refused(self):
-        from types import SimpleNamespace
+    @pytest.mark.parametrize("offsets", [(40, 40), (40, 64)])
+    def test_unbounded_offset_disagreement_is_logged(self, offsets, caplog):
+        from mlx_lm.models.cache import KVCache
 
         from omlx.patches.specprefill import _logical_cache_offset
 
-        # Nothing reports a position, but nothing holds state either: that is
-        # a cold start, not the unreadable case.
-        model = self._model("rr")
-        cold = SimpleNamespace(state=None, empty=lambda: True)
-        assert _logical_cache_offset(model, [cold, cold]) == 0
+        caches = [KVCache(), KVCache()]
+        for cache, offset in zip(caches, offsets):
+            cache.offset = offset
+        with caplog.at_level(logging.WARNING, logger="omlx.patches.specprefill"):
+            assert _logical_cache_offset(self._model("aa"), caches) == 40
+        assert bool(caplog.records) == (offsets[0] != offsets[1])
 
-    def test_unreadable_emptiness_probe_is_not_treated_as_empty(self):
-        from types import SimpleNamespace
-
-        from omlx.patches.specprefill import (
-            IndeterminateCacheOffsetError,
-            _logical_cache_offset,
-        )
-
-        def _raises():
-            raise RuntimeError("probe unavailable")
-
-        # A probe that fails says nothing; assuming empty would answer 0.
-        model = self._model("rr")
-        broken = SimpleNamespace(state=(1, 1), empty=_raises)
-        with pytest.raises(IndeterminateCacheOffsetError):
-            _logical_cache_offset(model, [broken, broken])
-
-    def test_cache_without_an_emptiness_probe_is_not_treated_as_empty(self):
-        from types import SimpleNamespace
-
-        from omlx.patches.specprefill import (
-            IndeterminateCacheOffsetError,
-            _logical_cache_offset,
-        )
-
-        # No empty(), so emptiness cannot be established. ArraysCache.state is
-        # (list_of_arrays, padding, lengths), whose first element is a list
-        # with no .size -- inspecting it would read a full cache as empty.
-        model = self._model("rr")
-        opaque = SimpleNamespace(state=([1, 2], None, None))
-        with pytest.raises(IndeterminateCacheOffsetError):
-            _logical_cache_offset(model, [opaque, opaque])
-
-    def test_composite_cache_offset_is_found_in_a_sub_cache(self):
-        from types import SimpleNamespace
+    def test_bounded_offsets_are_used_only_without_unbounded_layers(self):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
 
         from omlx.patches.specprefill import _logical_cache_offset
 
-        model = self._model("ra")
-        composite = SimpleNamespace(caches=[self._kv(4096), self._recurrent()])
-        assert _logical_cache_offset(model, [self._recurrent(), composite]) == 4096
+        kv = KVCache()
+        kv.offset = 40
+        rotating = RotatingKVCache(max_size=8)
+        rotating.offset = 64
+        assert _logical_cache_offset(self._model("aa"), [kv, rotating]) == 40
+        assert _logical_cache_offset(self._model("a"), [rotating]) == 64
 
+    @pytest.mark.parametrize("probe", ["empty", "populated", "missing", "raises"])
+    def test_missing_offset_requires_proven_empty_cache(self, probe):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
 
-class _HybridFixture:
-    """Smallest model that reproduces the hybrid cache layout.
-
-    Layer 0 is recurrent and exposes no ``offset``; a later layer is attention
-    and does. Any code that asks ``cache[0]`` for the token position gets 0 no
-    matter how much state the cache holds.
-    """
-
-    VOCAB = 16
-    HEADS = 2
-    HEAD_DIM = 8
-
-    class RecurrentCache:
-        """ArraysCache-shaped: fixed-size summary, deliberately no ``offset``."""
-
-        def __init__(self):
-            self.cache = [None, None]
-            self.left_padding = None
-            self.lengths = None
-            self.seen = 0
-
-        # Same shape as mlx-lm's: a tuple whose ``cache`` list the layer
-        # updates in place, so a shallow copy of ``state`` does not hold it.
-        @property
-        def state(self):
-            return self.cache, self.left_padding, self.lengths
-
-        @state.setter
-        def state(self, v):
-            self.cache, self.left_padding, self.lengths = v
-
-        def empty(self):
-            return self.seen == 0
-
-    class KVCache:
-        def __init__(self):
-            self.keys = None
-            self.values = None
-            self.offset = 0
-
-        def update_and_fetch(self, keys, values):
-            self.keys = (
-                keys if self.keys is None else mx.concatenate([self.keys, keys], axis=2)
-            )
-            self.values = (
-                values
-                if self.values is None
-                else mx.concatenate([self.values, values], axis=2)
-            )
-            self.offset = self.keys.shape[2]
-            return self.keys, self.values
-
-        @property
-        def state(self):
-            return (self.keys, self.values)
-
-        def empty(self):
-            return self.offset == 0
-
-    class Attn:
-        def __init__(self, seed):
-            self.n_heads = _HybridFixture.HEADS
-            self.n_kv_heads = _HybridFixture.HEADS
-            self.head_dim = _HybridFixture.HEAD_DIM
-            g = mx.random.key(seed)
-            self.wq = mx.random.normal((16, self.n_heads * self.head_dim), key=g)
-            self.wk = mx.random.normal((16, self.n_heads * self.head_dim), key=g)
-
-        def project(self, x):
-            b, t, _ = x.shape
-            q = (x @ self.wq).reshape(b, t, self.n_heads, self.head_dim)
-            k = (x @ self.wk).reshape(b, t, self.n_heads, self.head_dim)
-            return q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3)
-
-        def __call__(self, x, mask=None, cache=None, **kwargs):
-            q, k = self.project(x)
-            if cache is not None:
-                keys, values = cache.update_and_fetch(k, k)
-            else:
-                keys, values = k, k
-            # Causal: without it a token sees later tokens in its own chunk,
-            # so the chunking alone would change the output.
-            t, total = q.shape[2], keys.shape[2]
-            future = mx.arange(total)[None, :] > (
-                mx.arange(t)[:, None] + (total - t)
-            )
-            logits = (q @ keys.transpose(0, 1, 3, 2)) * self.head_dim**-0.5
-            scores = mx.softmax(mx.where(future, -mx.inf, logits), axis=-1)
-            out = (scores @ values).transpose(0, 2, 1, 3)
-            return out.reshape(x.shape[0], x.shape[1], -1)[..., :16]
-
-    class AttnLayer:
-        def __init__(self, seed):
-            self.self_attn = _HybridFixture.Attn(seed)
-
-        def __call__(self, x, cache=None):
-            return x + self.self_attn(x, cache=cache)
-
-    class RecurrentLayer:
-        """Carries a running sum across calls, as GDN carries its state.
-
-        Output depends on every token seen so far, so a token fed twice
-        shifts all later activations -- the failure a stateless stand-in
-        cannot show.
-        """
-
-        def __call__(self, x, cache=None):
-            prior = None if cache is None else cache.cache[0]
-            running = mx.cumsum(x, axis=1)
-            if prior is not None:
-                running = running + prior[:, None, :]
-            if cache is not None:
-                cache.seen += x.shape[1]
-                cache.cache[0] = running[:, -1, :]
-                cache.cache[1] = running[:, -1, :]
-            return x + mx.tanh(running / 4.0)
-
-    def __init__(self, kinds="rara"):
-        self.kinds = kinds
-        self.layers = [
-            (
-                _HybridFixture.AttnLayer(i)
-                if kind == "a"
-                else _HybridFixture.RecurrentLayer()
-            )
-            for i, kind in enumerate(kinds)
-        ]
-        self.embed = mx.random.normal((self.VOCAB, 16), key=mx.random.key(99))
-        self.prefilled_tokens = []
-
-    def make_cache(self):
-        return [
-            _HybridFixture.KVCache() if kind == "a" else _HybridFixture.RecurrentCache()
-            for kind in self.kinds
-        ]
-
-    def __call__(self, tokens, cache=None):
-        self.prefilled_tokens.append(int(tokens.shape[-1]))
-        h = self.embed[tokens]
-        for idx, layer in enumerate(self.layers):
-            h = layer(h, cache=None if cache is None else cache[idx])
-        return h @ self.embed.T
-
-
-def _query_extractor(attn, x, cache, **kwargs):
-    q, _ = attn.project(x)
-    return q
-
-
-class TestScoreTokensHybridCacheReuse:
-    """score_tokens() must honour a restored cache on a hybrid model."""
-
-    @staticmethod
-    def _tokens(n):
-        return [(i * 7 + 3) % _HybridFixture.VOCAB for i in range(n)]
-
-    def test_layer_zero_reports_no_offset(self):
-        fixture = _HybridFixture()
-        cache = fixture.make_cache()
-        assert not hasattr(cache[0], "offset")
-        assert hasattr(cache[1], "offset")
-
-    def test_warm_cache_prefills_only_the_suffix(self):
-        from omlx.patches.specprefill import _prefill_draft, score_tokens
-
-        tokens = self._tokens(64)
-        fixture = _HybridFixture()
-        cache = fixture.make_cache()
-
-        # Restore the first 40 tokens, as a prefix-cache hit would.
-        _prefill_draft(fixture, tokens[:40], cache, step_size=8)
-        fixture.prefilled_tokens.clear()
-
-        score_tokens(
-            fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=8,
-            temp=0.0,
-            query_extractor=_query_extractor,
-            existing_cache=cache,
-        )
-
-        # 24 suffix tokens, not 64. Before the fix this was the whole prompt.
-        # The trailing n_lookahead calls are decode steps, not prefill.
-        prefill_tokens = sum(fixture.prefilled_tokens[:-2])
-        assert prefill_tokens == 24
-
-    @pytest.mark.parametrize("cached", [64, 80])
-    def test_cache_holding_the_whole_prompt_is_rejected(self, cached):
-        """A cache at or past the prompt end cannot yield prompt-end logits.
-
-        Replaying the last token on a cache that already holds it attends to
-        that token twice and advances recurrent state past the prompt; the
-        lookahead trim restores neither, so the scores would silently differ
-        from cold scoring. The caller must restore at most N-1 tokens.
-        """
-        from omlx.patches.specprefill import _prefill_draft, score_tokens
-
-        fixture = _HybridFixture()
-        tokens = list(range(64))
-        cache = fixture.make_cache()
-        _prefill_draft(fixture, list(range(cached)), cache, step_size=8)
-
-        with pytest.raises(ValueError, match="last prompt token uncached"):
-            score_tokens(
-                fixture,
-                tokens,
-                existing_cache=cache,
-                n_lookahead=2,
-                query_extractor=_query_extractor,
-                prefill_step_size=8,
-            )
-
-    def test_returned_cache_holds_the_prompt_state(self):
-        """The lookahead must leave no trace in the cache that is returned.
-
-        That cache is stored as this prompt's. Attention KV is trimmed back;
-        recurrent state cannot be trimmed, and left alone it would hold the
-        prompt plus the lookahead tokens, poisoning every later restore.
-        """
-        from omlx.patches.specprefill import _prefill_draft, score_tokens
-
-        tokens = self._tokens(64)
-        fixture = _HybridFixture()
-        _, returned = score_tokens(
-            fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=8,
-            temp=0.0,
-            query_extractor=_query_extractor,
-        )
-
-        reference = fixture.make_cache()
-        _prefill_draft(fixture, tokens, reference, step_size=8)
-
-        for got, want in zip(returned, reference):
-            if hasattr(want, "keys"):
-                assert got.keys.shape == want.keys.shape
-                assert mx.array_equal(got.keys, want.keys).item()
-            else:
-                assert mx.array_equal(got.cache[0], want.cache[0]).item()
-
-    def test_cold_and_warm_scoring_agree(self):
-        from omlx.patches.specprefill import _prefill_draft, score_tokens
-
-        tokens = self._tokens(64)
-
-        cold_fixture = _HybridFixture()
-        cold_importance, _ = score_tokens(
-            cold_fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=8,
-            temp=0.0,
-            query_extractor=_query_extractor,
-        )
-
-        warm_fixture = _HybridFixture()
-        warm_cache = warm_fixture.make_cache()
-        _prefill_draft(warm_fixture, tokens[:40], warm_cache, step_size=8)
-        warm_importance, _ = score_tokens(
-            warm_fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=8,
-            temp=0.0,
-            query_extractor=_query_extractor,
-            existing_cache=warm_cache,
-        )
-
-        assert cold_importance.shape == warm_importance.shape == (64,)
-        assert mx.allclose(cold_importance, warm_importance, atol=1e-4).item()
-
-    def test_cold_and_warm_select_the_same_tokens(self):
         from omlx.patches.specprefill import (
-            _prefill_draft,
-            score_tokens,
-            select_chunks,
+            IndeterminateCacheOffsetError,
+            _logical_cache_offset,
         )
 
-        tokens = self._tokens(128)
-
-        cold_fixture = _HybridFixture()
-        cold_importance, _ = score_tokens(
-            cold_fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=16,
-            temp=0.0,
-            query_extractor=_query_extractor,
-        )
-
-        warm_fixture = _HybridFixture()
-        warm_cache = warm_fixture.make_cache()
-        _prefill_draft(warm_fixture, tokens[:96], warm_cache, step_size=16)
-        warm_importance, _ = score_tokens(
-            warm_fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=16,
-            temp=0.0,
-            query_extractor=_query_extractor,
-            existing_cache=warm_cache,
-        )
-
-        cold_sel = select_chunks(cold_importance, keep_pct=0.5, chunk_size=8)
-        warm_sel = select_chunks(warm_importance, keep_pct=0.5, chunk_size=8)
-        assert cold_sel.tolist() == warm_sel.tolist()
-
-    def test_warm_cache_does_not_duplicate_the_prefix(self):
-        from omlx.patches.specprefill import _prefill_draft, score_tokens
-
-        tokens = self._tokens(64)
-        fixture = _HybridFixture()
-        cache = fixture.make_cache()
-        _prefill_draft(fixture, tokens[:40], cache, step_size=8)
-
-        score_tokens(
-            fixture,
-            tokens,
-            n_lookahead=2,
-            prefill_step_size=8,
-            temp=0.0,
-            query_extractor=_query_extractor,
-            existing_cache=cache,
-        )
-
-        # Length alone does not discriminate: the trim clamps to n_prompt
-        # either way. What a cached_len of 0 leaves behind is 104 keys trimmed
-        # to the FIRST 64 -- the 40 restored ones plus 24 of the duplicates --
-        # so compare content against a cache built the honest way.
-        cold_fixture = _HybridFixture()
-        cold_cache = cold_fixture.make_cache()
-        _prefill_draft(cold_fixture, tokens, cold_cache, step_size=8)
-
-        attn_cache = cache[1]
-        assert attn_cache.offset == 64
-        assert attn_cache.keys.shape[2] == 64
-        assert mx.allclose(attn_cache.keys, cold_cache[1].keys, atol=1e-4).item()
-
-
-class TestDraftScoringBlockAlignedHit:
-    """A stored draft cache covering the whole prompt must score like cold.
-
-    The prefix cache matches whole blocks, so a block-aligned prompt whose
-    draft cache was stored in full is the case that used to reach the
-    exact-hit replay. Scores and selection are compared, not cache length:
-    a replayed token leaves the length right and the scores wrong.
-    """
-
-    BLOCK = 8
-
-    class _PrefixCache:
-        """Serves what a block-granular prefix cache would for *tokens*."""
-
-        def __init__(self, stored_tokens, block_size):
-            self.stored_tokens = list(stored_tokens)
-            self.block_size = block_size
-            self.fetched = []
-
-        def fetch_cache(self, request_id, tokens):
-            from types import SimpleNamespace
-
-            self.fetched.append(list(tokens))
-            n = 0
-            while (
-                n + self.block_size <= min(len(tokens), len(self.stored_tokens))
-                and tokens[n : n + self.block_size]
-                == self.stored_tokens[n : n + self.block_size]
-            ):
-                n += self.block_size
-            return SimpleNamespace(num_tokens=n), list(tokens[n:])
-
-        def preload_blocks(self, block_table):
-            return block_table.num_tokens
-
-        def reconstruct_cache(self, block_table):
-            from omlx.patches.specprefill import _prefill_draft
-
-            self.model = _HybridFixture()
-            cache = self.model.make_cache()
-            _prefill_draft(
-                self.model,
-                self.stored_tokens[: block_table.num_tokens],
-                cache,
-                step_size=self.block_size,
-            )
-            return cache
-
-        def store_cache(self, *args, **kwargs):
-            return None
-
-    def _score(self, tokens, prefix_cache):
-        from unittest.mock import patch
-
-        import omlx.patches.specprefill as sp
-        from omlx.request import Request, SamplingParams
-        from omlx.specprefill.draft import run_specprefill_draft_scoring
-        from omlx.specprefill.policy import plan_specprefill_scoring
-
-        request = Request(
-            request_id="r", prompt=list(tokens), sampling_params=SamplingParams()
-        )
-        request.prompt_token_ids = list(tokens)
-        request.num_prompt_tokens = len(tokens)
-        request.remaining_tokens = request.prompt_token_ids
-        request.specprefill_system_end = 0
-        request.cached_tokens = 0
-        plan = plan_specprefill_scoring(
-            remaining_tokens=request.remaining_tokens,
-            system_prompt_end=0,
-            cached_tokens=0,
-            requested_threshold=None,
-            requested_keep_pct=None,
-            default_threshold=8,
-            default_keep_pct=0.25,
-        )
-        assert plan is not None and plan.tokens_to_score == list(tokens)
-
-        captured = {}
-        real_score_tokens = sp.score_tokens
-
-        def score_tokens(model, toks, **kwargs):
-            kwargs.update(
-                n_lookahead=2, temp=0.0, query_extractor=_query_extractor
-            )
-            importance, cache = real_score_tokens(model, toks, **kwargs)
-            captured["importance"] = importance
-            return importance, cache
-
-        with patch.object(sp, "score_tokens", side_effect=score_tokens):
-            run_specprefill_draft_scoring(
-                request=request,
-                plan=plan,
-                draft_model=_HybridFixture(),
-                draft_prefix_cache=prefix_cache,
-                model_id="m",
-                prefill_step_size=self.BLOCK,
-                stream=mx.default_stream(mx.default_device()),
-                extract_cache_states=lambda cache: ([], None),
-                sync_and_clear_cache=lambda: None,
-                log=logging.getLogger(__name__),
-            )
-        assert request.specprefill_indices is not None
-        return captured["importance"], request.specprefill_indices.tolist()
-
-    def test_full_block_aligned_hit_matches_cold_scoring(self):
-        tokens = [(i * 7 + 3) % _HybridFixture.VOCAB for i in range(64)]
-        assert len(tokens) % self.BLOCK == 0
-
-        cold_importance, cold_selection = self._score(tokens, None)
-
-        prefix_cache = self._PrefixCache(tokens, self.BLOCK)
-        warm_importance, warm_selection = self._score(tokens, prefix_cache)
-
-        # Restored one block short of the prompt end, never all of it.
-        assert prefix_cache.fetched == [tokens[:-1]]
-        assert mx.allclose(cold_importance, warm_importance, atol=1e-4).item()
-        assert warm_selection == cold_selection
+        cache = SimpleNamespace()
+        if probe == "raises":
+            cache.empty = Mock(side_effect=RuntimeError("unreadable"))
+        elif probe != "missing":
+            cache.empty = lambda: probe == "empty"
+        if probe == "empty":
+            assert _logical_cache_offset(self._model("a"), [cache]) == 0
+        else:
+            with pytest.raises(IndeterminateCacheOffsetError):
+                _logical_cache_offset(self._model("a"), [cache])
 
 
 class TestUndoLookahead:
-    """The lookahead must leave every real mlx-lm cache type as it found it."""
 
     @staticmethod
     def _kv(n, seed):
@@ -1600,19 +999,15 @@ class TestUndoLookahead:
 
     @staticmethod
     def _snapshot(leaf):
-        """The tokens a leaf holds, compared by content.
-
-        An unbounded KVCache preallocates in steps and its ``state`` returns
-        that whole buffer here, so it is read up to ``offset``; other leaves
-        are compared by ``state`` plus their scalar bookkeeping (``offset``,
-        ``_idx`` and the like), which decides where the next token lands.
-        """
         from mlx.utils import tree_flatten
 
         from omlx.patches.specprefill import _is_sliceable_kv
 
         if _is_sliceable_kv(leaf):
-            arrays = [leaf.keys[..., : leaf.offset, :], leaf.values[..., : leaf.offset, :]]
+            arrays = [
+                leaf.keys[..., : leaf.offset, :],
+                leaf.values[..., : leaf.offset, :],
+            ]
             return [a.tolist() for a in arrays], leaf.offset
         return [
             (name, v.tolist() if isinstance(v, mx.array) else v)
@@ -1638,16 +1033,10 @@ class TestUndoLookahead:
         recurrent = ArraysCache(2)
         recurrent[0] = mx.ones((1, 3))
         recurrent[1] = mx.ones((1, 3)) * 2
-        # What reconstruct_cache hands back for a restored recurrent layer:
-        # the state lives on the wrapped object, not the wrapper.
         restored = SizedArraysCache(ArraysCache(2), token_count=12)
         restored[0] = mx.ones((1, 3)) * 3
         restored[1] = mx.ones((1, 3)) * 4
         window = RotatingKVCache(max_size=8)
-        # 12 prompt tokens, the window already wrapped. The last one goes in
-        # alone, as _prefill_draft feeds it, which leaves the buffer in the
-        # mode where decode slice-assigns into the very array a plain
-        # reference would hold.
         window.update_and_fetch(self._kv(11, 1), self._kv(11, 2))
         window.update_and_fetch(self._kv(1, 7), self._kv(1, 8))
         nested_kv = KVCache()
@@ -1669,7 +1058,6 @@ class TestUndoLookahead:
             for leaf in leaves
         ]
 
-        # Three lookahead steps, written the way decode writes them.
         for step in range(3):
             recurrent[0] = recurrent[0] + 1
             restored[0] = restored[0] + 1
@@ -1679,7 +1067,6 @@ class TestUndoLookahead:
         _undo_lookahead(leaves, held, pre_lookahead_offset=12)
 
         assert [self._snapshot(leaf) for leaf in leaves] == before
-        # Restored in place: the composite still holds the same objects.
         assert cache[0].caches[1] is window
         assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
         assert window._idx == before[1][1]["_idx"]

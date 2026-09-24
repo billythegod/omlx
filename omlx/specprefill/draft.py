@@ -42,9 +42,7 @@ class DraftPrefixCache(Protocol):
 ExtractCacheStates = Callable[[list[Any]], tuple[list[dict[str, Any]], Any | None]]
 SyncAndClearCache = Callable[[], None]
 
-# Mirrors Scheduler._KNOWN_SLICEABLE_CACHE_TYPES. Importing it would make
-# omlx.scheduler -> omlx.specprefill.draft -> omlx.scheduler circular, and the
-# set is a property of the cache types rather than of the scheduler.
+# Keep in sync with Scheduler._KNOWN_SLICEABLE_CACHE_TYPES; importing it creates a cycle.
 _SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
@@ -63,22 +61,10 @@ _SLICEABLE_CACHE_TYPES = frozenset(
 def _last_reachable_boundary(
     cached_len: int, n_to_score: int, step: int, block_size: int
 ) -> int | None:
-    """Largest block boundary below ``n_to_score`` the draft prefill reports.
+    """Find the last prefill block boundary before the prompt end.
 
-    State for a boundary exists only while the prefill stands on it, so the
-    one worth publishing has to be known before scoring starts. This walks
-    ``_prefill_draft``'s chunk loop rather than approximating it: the last
-    chunk is truncated to leave a token for the call that produces the
-    logits, so the positions are not simply multiples of ``step``. That
-    schedule is pinned by ``test_prefill_draft_schedule_is_exactly_this``.
-
-    ``n_to_score`` itself is reported too, after that final call, but it is
-    never the answer. The draft lookup asks for all but the last token, so a
-    boundary at the prompt end can serve only a longer prompt, never this
-    prompt scored again; the boundary below it serves both.
-
-    ``None`` when no reported position is block-aligned, past ``cached_len``
-    and below ``n_to_score``: nothing new to publish.
+    Match _prefill_draft chunking, including its final one-token logits call.
+    Return None if no new aligned boundary is reached.
     """
     if block_size <= 0 or step <= 0:
         return None
@@ -122,36 +108,27 @@ def run_specprefill_draft_scoring(
         draft_cached_tokens = 0
         if draft_prefix_cache is not None:
             try:
-                # Look up without the last token: score_tokens needs a
-                # forward pass over it for the lookahead logits, and a cache
-                # that already holds it cannot provide one. A hit cannot
-                # exceed the tokens queried, so it stops short of the end.
+                # Leave the final token uncached to compute prompt-end logits without replay.
                 block_table, _draft_remaining = draft_prefix_cache.fetch_cache(
                     request.request_id, tokens_to_score[:-1]
                 )
                 if block_table and block_table.num_tokens > 0:
                     draft_prefix_cache.preload_blocks(block_table)
-                    # Bound straight to draft_cache: a second local would keep
-                    # the restored KV alive past the clear below, which is the
-                    # one point that returns those buffers.
+                    # Avoid an alias that would retain restored KV through sync_and_clear_cache().
                     draft_cache = draft_prefix_cache.reconstruct_cache(block_table)
                     if draft_cache:
                         draft_cached_tokens = block_table.num_tokens
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache fetch failed: {error}")
 
-        # score_tokens hands its own cache back only after scoring, which is
-        # too late to read state at a boundary. A fresh cache prefills the
-        # whole prompt either way.
+        # Allocate here so the progress callback can capture state during prefill.
         if draft_cache is None and draft_prefix_cache is not None:
             try:
                 draft_cache = make_prompt_cache(draft_model)
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache preallocation failed: {error}")
 
-        # Keyed by absolute token count, as Scheduler passes them for the
-        # target model. Without them every stored block keeps a placeholder
-        # for each recurrent layer and no prefix is restorable.
+        # Recurrent checkpoints are keyed by absolute token count.
         boundary_snapshots: dict[int, list[Any]] = {}
         snapshot_block_size = (
             draft_prefix_cache.block_size if draft_prefix_cache is not None else 0
@@ -160,12 +137,7 @@ def run_specprefill_draft_scoring(
         started = False
 
         def capture_boundary(processed: int) -> None:
-            # One boundary, chosen on the first report: extracting at every
-            # block boundary and keeping the last costs a full extraction per
-            # block for nothing. The first report is the position the prefill
-            # actually starts from, which is what the boundary has to be
-            # aligned against -- deriving it from the expected cached length
-            # instead would silently never fire if the two disagreed.
+            # Choose one boundary from the actual starting position to avoid repeated extraction.
             nonlocal target_boundary, started
             if not started:
                 started = True
@@ -179,14 +151,7 @@ def run_specprefill_draft_scoring(
                 or processed in boundary_snapshots
             ):
                 return
-            # store_cache re-slices these from the live cache; carrying them
-            # would pin the whole growing KV. None marks them skipped.
-            #
-            # A draft with no sliceable layer at all would leave every entry
-            # populated, which prefix_cache reads as a complete snapshot and
-            # uses to suppress its continuity check from this boundary on.
-            # No such draft model is supported today; if one appears, this is
-            # where it has to be handled.
+            # store_cache slices live KV; excluding it here avoids retaining the growing buffer.
             snapshot_cache = [
                 None if type(layer).__name__ in _SLICEABLE_CACHE_TYPES else layer
                 for layer in draft_cache
@@ -216,8 +181,7 @@ def run_specprefill_draft_scoring(
         def report_score_progress(
             processed: int, total: int, phase: str
         ) -> None:
-            # Only the prefill phase: the cache holds exactly ``processed``
-            # tokens here, and later phases append lookahead tokens.
+            # Capture before lookahead advances the cache beyond the prompt.
             if phase == "scoring":
                 capture_boundary(processed)
             tracker.update(
@@ -310,11 +274,7 @@ def run_specprefill_draft_scoring(
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache store failed: {error}")
 
-        # Drain the stream before releasing Metal buffers to avoid #557.
-        # Nothing may still name the draft cache or state pulled out of it:
-        # draft_cache aliases used_cache, the snapshots and the extracted
-        # payload hold its arrays, and this call is the only point that
-        # returns those buffers.
+        # Drop all draft-state references before draining and clearing Metal buffers (#557).
         del used_cache
         draft_cache = None
         extracted_cache = None
