@@ -4038,10 +4038,8 @@ def _build_model_sanitizer(
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
     For LLM models, uses mlx-lm's model class.
-    When text_only is True, always uses the LLM path even for VLM
-    architectures so that mlx_lm_mtp patches (which handle MTP sanitize
-    for both dense and MoE) are used instead of the VLM path whose
-    _Proxy-based sanitize drops the MTP head.
+    Text-only conversion normally uses mlx-lm for MTP sanitization.
+    GLM-5.3 requires mlx-vlm even when vision weights are excluded.
 
     Returns:
         A function that takes a dict of weights and returns sanitized weights,
@@ -4060,7 +4058,7 @@ def _build_model_sanitizer(
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
-    ) and not (text_only or mlx_lm_text_only)
+    ) and not (mlx_lm_text_only or (text_only and model_type != "glm5_next"))
 
     # Serving normally registers oMLX's vendored Qwen4 implementation before
     # mlx-vlm class lookup. Quantization does not pass through that loader.
@@ -4119,6 +4117,10 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_glm5_next_compat_patch()
+                    if preserve_mtp:
+                        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+                        glm5_next_vlm_runtime.apply()
             except Exception as patch_err:
                 logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
@@ -6469,9 +6471,10 @@ def quantize_oq_streaming(
         model_path=source,
         preserve_mtp=preserve_mtp,
     )
-    if sanitize_fn is None and _stream_source_model_type(config) == "qwen4_exp":
+    source_model_type = _stream_source_model_type(config)
+    if sanitize_fn is None and source_model_type in {"qwen4_exp", "glm5_next"}:
         raise RuntimeError(
-            "no model sanitizer for qwen4_exp: refusing to quantize on raw "
+            f"no model sanitizer for {source_model_type}: refusing to quantize on raw "
             "checkpoint keys (the recipe's tensor rules would not match)"
         )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
