@@ -4481,6 +4481,15 @@ class VLMBatchedEngine(BaseEngine):
         if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
         text_messages, images, _ = extract_images_from_messages(media_messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,

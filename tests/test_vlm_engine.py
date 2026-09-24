@@ -3192,6 +3192,34 @@ class TestCaptureVLMPositionState:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize(
+    "vision_config, with_image", [(None, True), (None, False), ({}, True)]
+)
+async def test_preflight_gemma4_image_support(model_type, vision_config, with_image):
+    from omlx.exceptions import InvalidRequestError
+
+    engine = _make_loaded_engine(model_type=model_type)
+    engine._vlm_model.config.vision_config = vision_config
+    engine._apply_chat_template = MagicMock(return_value="test")
+    engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+    engine._preflight_or_raise_with_eviction = AsyncMock()
+    content = [_image_part(16, 16)] if with_image else "Hello"
+    messages = [{"role": "user", "content": content}]
+
+    if vision_config is None and with_image:
+        with pytest.raises(InvalidRequestError, match="does not support image") as exc:
+            await engine.preflight_chat(messages)
+        assert exc.value.field == "messages"
+        engine._apply_chat_template.assert_not_called()
+        engine._preflight_or_raise_with_eviction.assert_not_called()
+    else:
+        await engine.preflight_chat(messages)
+        engine._preflight_or_raise_with_eviction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
 @pytest.mark.parametrize("side_limit, expected_tokens", [(2048, 3072), (0, 11750)])
 async def test_preflight_uses_processed_image_dimensions(
     monkeypatch, side_limit, expected_tokens

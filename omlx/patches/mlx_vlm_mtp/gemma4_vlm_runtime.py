@@ -187,8 +187,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         if attach:
             drafter_config = Gemma4AssistantConfig.from_dict(asst_cfg)
             self.mtp = Gemma4AssistantDraftModel(drafter_config)
-            # Bound at the first draft: a bind here pins the float embed_tokens
-            # that nn.quantize() replaces, and materialize_lazy_state builds it.
+            # Defer binding until quantization replaces the initial embedding.
         if self._omlx_mtp_decode_enabled:
             # The chain cycle applies the backbone's final RMSNorm to the
             # verify hidden rows (HEAD_HIDDEN_POST_NORM) — exactly the
@@ -282,8 +281,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         """
         del mtp_cache, logits_keep  # stateless head; output is 1 position
         drafter = self.mtp
-        # Bind on first use and whenever embed_tokens is swapped; a stale
-        # module drafts through random-init weights (~10% accept).
+        # Rebind if quantization replaced the backbone embedding.
         if drafter._input_embed is not self.model.embed_tokens:
             drafter.bind(self)
         shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
@@ -294,8 +292,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             )
 
         h = hidden_states[:, -1:, :]
-        # Compared as a string: `mx.array.dtype` builds a fresh Dtype per
-        # access, and `None != a_dtype` raises out of nanobind.
+        # Compare strings because MLX dtype comparison with None raises TypeError.
         want_dtype = str(h.dtype)
         if getattr(drafter, "_omlx_head_dtype", None) != want_dtype:
             _align_drafter_dtype(drafter, h.dtype)

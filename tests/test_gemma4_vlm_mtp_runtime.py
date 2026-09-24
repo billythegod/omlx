@@ -225,8 +225,6 @@ def test_mtp_forward_uses_plain_int_offset_and_batch_idx():
 
 
 def test_mtp_forward_rebinds_stale_input_embed():
-    # The head binds at its first draft, after nn.quantize() has swapped
-    # embed_tokens; mtp_forward must bind so it never embeds through a stale module.
     lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=3)])
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 3, 8)), mx.zeros((1, 1, 3, 8)))

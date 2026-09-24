@@ -1536,7 +1536,7 @@ def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
     model_type = str(config.get("model_type") or "").lower().replace("-", "_")
     if model_type not in ("gemma4", "gemma4_unified"):
         return False
-    if _has_vision_subconfig(config):
+    if _has_vision_subconfig(config) or config.get("audio_config") is not None:
         return False
     return not _has_merged_mtp_head(config)
 
@@ -1610,8 +1610,7 @@ def _register_model(
         except Exception:
             pass
 
-        # Engine, not identity: the model is still text-only and is reported
-        # that way, it is only served by the engine that can drive its head.
+        # Keep text-only capability metadata when selecting the VLM MTP engine.
         if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
             engine_type = "vlm"
             logger.info(
@@ -1620,8 +1619,7 @@ def _register_model(
                 model_id,
             )
         elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
-            # `supports_images` is `model_type == "vlm"`, so moving only the
-            # engine would leave a text-only checkpoint advertising images.
+            # Integrations use model_type to advertise image support.
             engine_type = "batched"
             model_type = "llm"
             text_only_size = 0
