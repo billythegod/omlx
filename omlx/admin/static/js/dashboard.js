@@ -6603,6 +6603,19 @@
                 return model?.model_type || '';
             },
 
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
+            },
+
             oqLevelLabel(level) {
                 return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },

@@ -168,6 +168,20 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
+def _validate_v41_oq_settings(oq_level, dtype="bfloat16", group_size=64):
+    if oq_level not in (3, 4):
+        raise ValueError(
+            f"DeepSeek V4.1 does not support oQ{oq_level:g}/oQ{oq_level:g}e. "
+            "Choose oQ3/oQ3e or oQ4/oQ4e. oQ4 preserves the original "
+            "FP4/FP8 projection precision and quantizes Engram tables to 4 bits."
+        )
+    if dtype != "bfloat16" or group_size != 64:
+        raise ValueError(
+            "DeepSeek V4.1 requires dtype='bfloat16' and group_size=64 "
+            "for oQ export."
+        )
+
+
 def _canonical_output_dtype(dtype: str) -> str:
     """Name the dtype oQ will actually store, mirroring ``target_dtype``.
 
@@ -3329,8 +3343,7 @@ def estimate_bpw_and_size(
     if config.get("model_type") == "deepseek_v41":
         from .patches.deepseek_v41.oq import source_budget
 
-        if oq_level not in (3, 4) or group_size != 64:
-            raise ValueError("V4.1 supports oQ3/oQ4 with group size 64")
+        _validate_v41_oq_settings(oq_level, group_size=group_size)
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
