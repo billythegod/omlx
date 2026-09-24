@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -6048,6 +6049,43 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
     }
 
 
+def _scan_offline_gdn_sidecars(
+    cache_dir: Path, *, clear: bool = False
+) -> tuple[int, int]:
+    count = total_bytes = 0
+    try:
+        root_fd = os.open(
+            cache_dir / "_gdn_sidecars", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
+        return count, total_bytes
+    except OSError as exc:
+        logger.warning("Could not open GDN sidecar directory: %s", exc)
+        return count, total_bytes
+
+    try:
+        # Keep deletion relative to open directories, even if a parent is replaced.
+        for _, _, files, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            for name in files:
+                if not name.endswith(".safetensors"):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    if clear:
+                        os.unlink(name, dir_fd=directory_fd)
+                    count += 1
+                    total_bytes += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not process GDN sidecar %s: %s", name, exc)
+    finally:
+        os.close(root_fd)
+    return count, total_bytes
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -6372,8 +6410,9 @@ def _build_runtime_cache_observability(
                     for f in subdir_path.glob("*.safetensors"):
                         num_files += 1
                         total_bytes += f.stat().st_size
-            payload["total_num_files"] = num_files
-            payload["total_size_bytes"] = total_bytes
+            sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
+            payload["total_num_files"] = num_files + sidecar_count
+            payload["total_size_bytes"] = total_bytes + sidecar_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
@@ -6947,6 +6986,8 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                                 total_deleted += 1
                             except OSError:
                                 pass
+                sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
+                total_deleted += sidecar_count
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
