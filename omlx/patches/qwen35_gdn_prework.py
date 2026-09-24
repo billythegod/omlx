@@ -26,7 +26,6 @@ stock path.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 
 import mlx.core as mx
@@ -469,62 +468,23 @@ def _qwen4_decode_recurrence(q, k, v, g, beta, state):
     return gated_delta_kernel(q, k, v, g, beta, state, None)
 
 
-def _qwen4_wide_projections_enabled() -> bool:
-    """Whether the fused Qwen4 decode prework accepts any canonical affine
-    allocation of the GDN projections instead of the shipped oQe recipe.
-
-    The eligibility predicate below is evaluated around projections that are
-    ordinary ``QuantizedLinear`` calls shared with the stock route, and the fused
-    kernels consume the resulting bf16 activations. The allocation therefore
-    cannot change what the kernels compute. It does change how those four
-    projections are executed: at B=1/T=1 the route calls
-    ``_target_verify_linears``, which for a homogeneous recipe concatenates the
-    packed weights into a single ``quantized_matmul`` and otherwise falls back to
-    four separate calls. Both were measured bit-identical to four independent
-    ``QuantizedLinear`` calls at every allocation the opt-in admits, so a recipe
-    change is a performance and memory effect, not a numerical one -- see
-    ``test_qwen4_decode_wide_projections_are_bit_exact_either_way``.
-    The ``(4|5|6, 64)``/``(5, 128)`` allow-list in
-    :func:`_qwen4_decode_static_eligible` was a converter allow-list, not a kernel
-    requirement, and it left the fused decode disengaged on checkpoints whose GDN
-    projections are allocated elsewhere --
-    8-bit/group-64 for the community Qwen3.8-Flash-Next exports, and a
-    5-bit/group-64 ``in_proj_*`` with a 4-bit/group-64 ``out_proj`` for the
-    27B Qwen3.5-lineage exports.
-
-    Opt in with ``OMLX_QWEN4_GDN_DECODE_WIDE_PROJ=1``. The default keeps the
-    historical oQe-only envelope; the opt-in arm still fails closed on shape,
-    dtype, ``mode`` and bias presence, so a non-canonical projection (a
-    reclassified subclass with extra state, a transposed layout, a recipe whose
-    scale packing differs) still cannot reach the kernel.
-    """
-    return os.environ.get("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def configure_qwen4_decode(model, *, wide_projections: bool) -> None:
+    """Capture the decode setting per layer when the model is loaded."""
+    for module in model.modules():
+        if (
+            type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+            and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        ):
+            module._omlx_qwen4_wide_projections = wide_projections
 
 
-# Affine group sizes the quantizer implements (omlx/oq.py::_AFFINE_GROUP_SIZES)
-# and the affine widths it accepts. A projection outside these sets cannot have
-# come from the loader, so it fails closed rather than reaching the kernel.
 _ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
 _ALLOWED_GROUPS = frozenset({32, 64, 128})
-
-# Residual width of the shipped Qwen4 geometry, kept as a literal on purpose.
-# The base class does expose ``module.hidden_size``, so this could be derived --
-# but deriving it would let a wider checkpoint past *this* check while the other
-# two family pins still reject it (``canonical_projection``'s ``in_dim=2560``
-# default and the ``(1, 1, 2560)`` dynamic-gate shape), i.e. the same model would
-# fail for inconsistent-looking reasons. Pinning all three to the shipped width
-# keeps the rejection legible and keeps widening the family an explicit change;
-# ``test_qwen4_decode_wide_opt_in_stays_within_the_2560_family`` holds that line.
 _QWEN4_HIDDEN_SIZE = 2560
 
 
 def _qwen4_decode_static_eligible(module) -> bool:
-    """Fail closed unless this is the shipped Qwen4 oQe decode geometry."""
+    """Require the supported Qwen4 geometry and canonical affine storage."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
@@ -588,7 +548,7 @@ def _qwen4_decode_static_eligible(module) -> bool:
     # canonical layouts emitted by the converter rather than demanding that
     # all four happen to share layer 0's q6/g64 allocation.  ``wide`` lifts the
     # recipe allow-list only; every shape/dtype/bias check above still applies.
-    wide = _qwen4_wide_projections_enabled()
+    wide = getattr(module, "_omlx_qwen4_wide_projections", False)
     qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64)}
     aux_signatures = None if wide else {(5, 128), (6, 64)}
     if not canonical_projection(

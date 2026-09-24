@@ -2328,8 +2328,13 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..patches.qwen35_gdn_prework import (
                 apply_qwen35_gdn_prework_patch,
+                configure_qwen4_decode,
             )
 
+            configure_qwen4_decode(
+                self._vlm_model,
+                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+            )
             apply_qwen35_gdn_prework_patch()
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)

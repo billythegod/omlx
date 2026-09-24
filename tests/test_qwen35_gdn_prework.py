@@ -486,24 +486,14 @@ def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
     ],
 )
 def test_qwen4_decode_static_gate_community_allocations_are_opt_in(
-    monkeypatch, signatures, out_proj
+    signatures, out_proj
 ):
-    """The fused decode kernels never read the projections' packed storage.
-
-    They run after the four ``in_proj_*`` calls and after ``out_proj`` is the
-    only thing left on the stock route, so a checkpoint's bit allocation cannot
-    change what the kernels compute. The oQe allow-list was a converter
-    allow-list; the opt-in keeps every canonical-layout check but stops
-    demanding a specific recipe, which is what left community exports on the
-    unfused route.
-    """
     module = _canonical_qwen4_decode_module(signatures)
     module.out_proj = _fake_quantized_linear(6144, 2560, *out_proj)
 
-    monkeypatch.delenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", raising=False)
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    module._omlx_qwen4_wide_projections = True
     assert prework_mod._qwen4_decode_static_eligible(module)
 
     # still fail-closed on the canonical-layout checks, not just the recipe
@@ -515,16 +505,16 @@ def test_qwen4_decode_static_gate_community_allocations_are_opt_in(
     "attribute,value",
     [
         ("mode", "mxfp4"),
-        ("group_size", 96),          # not a group size the quantizer implements
-        ("group_size", 16),          # nvfp4-only: mx.quantize rejects it
-        ("group_size", 256),         # ditto: affine tops out at 128
-        ("bits", 7),                 # not an affine width we have been shown
+        ("group_size", 96),  # not a group size the quantizer implements
+        ("group_size", 16),  # nvfp4-only: mx.quantize rejects it
+        ("group_size", 256),  # ditto: affine tops out at 128
+        ("bits", 7),  # not an affine width we have been shown
     ],
 )
-def test_qwen4_decode_static_gate_fails_closed_on_opt_in(monkeypatch, attribute, value):
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+def test_qwen4_decode_static_gate_fails_closed_on_opt_in(attribute, value):
     module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    module._omlx_qwen4_wide_projections = True
     assert prework_mod._qwen4_decode_static_eligible(module)
 
     setattr(module.in_proj_a, attribute, value)
@@ -532,25 +522,6 @@ def test_qwen4_decode_static_gate_fails_closed_on_opt_in(monkeypatch, attribute,
 
 
 def test_qwen4_decode_wide_projections_are_bit_exact_either_way():
-    """The opt-in changes how the four in-projections execute, not what they give.
-
-    At B=1/T=1 the fused decode route obtains ``mixed_qkv, z, b, a`` from
-    ``_target_verify_linears``. For a homogeneous recipe that helper concatenates
-    the packed ``uint32`` weights and issues one ``quantized_matmul``; for a mixed
-    allocation it returns ``None`` and the route falls back to four separate
-    ``QuantizedLinear`` calls. Both outcomes are asserted here against four
-    independent calls, at every allocation the opt-in can admit, because the
-    concat path is the one place this route does read packed weight storage.
-
-    Scope note: this asserts the helper as imported from
-    ``mlx_vlm.speculative.ops.linear``. The MTP runtime
-    (``mlx_vlm_mtp/qwen35_verify_linear``) replaces the module attribute with a
-    wrapper, but its predicate only diverts ``shape[0] > 1`` or an armed
-    ``shape[1] > 1``, so a ``(1, 1, hidden)`` decode call falls through to
-    ``original_linears`` -- which is the helper asserted here. Checked directly
-    with the wrapper applied: max|delta| 0.0 against the original at
-    ``(1, 1, 2560)``.
-    """
     from mlx_vlm.speculative.ops.linear import (
         _decode_quantized_linears_fused,
         _target_verify_linears,
@@ -559,10 +530,10 @@ def test_qwen4_decode_wide_projections_are_bit_exact_either_way():
     hidden = 2560
     rows = (C, HV * DV, HV, HV)
     recipes = [
-        ((8, 64), (8, 64), (8, 64), (8, 64)),   # community opt8
-        ((5, 64), (5, 64), (5, 64), (5, 64)),   # 27B Qwen3.5-lineage
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # community opt8
+        ((5, 64), (5, 64), (5, 64), (5, 64)),  # 27B Qwen3.5-lineage
         ((6, 128), (6, 128), (6, 128), (6, 128)),
-        ((2, 32), (2, 32), (2, 32), (2, 32)),   # smallest admitted affine pair
+        ((2, 32), (2, 32), (2, 32), (2, 32)),  # smallest admitted affine pair
         ((4, 64), (6, 64), (3, 64), (2, 128)),  # mixed: no concat, must fall back
     ]
     mx.random.seed(7)
@@ -594,13 +565,6 @@ def test_qwen4_decode_wide_projections_are_bit_exact_either_way():
 
 
 def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
-    """The opt-in set must not drift past what the affine quantizer emits.
-
-    A recipe outside these sets cannot be produced by ``mx.quantize``, so
-    admitting it would only widen the surface the fused kernel has never been
-    shown against. Pinned to ``oq._AFFINE_GROUP_SIZES`` so a loader change that
-    adds a group size fails this test rather than silently narrowing coverage.
-    """
     from omlx import oq
 
     assert prework_mod._ALLOWED_GROUPS == frozenset(oq._AFFINE_GROUP_SIZES)
@@ -611,23 +575,10 @@ def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
 
 
 @pytest.mark.parametrize("hidden_size", [5120, 4096, 2048])
-def test_qwen4_decode_wide_opt_in_stays_within_the_2560_family(
-    monkeypatch, hidden_size
-):
-    """The opt-in widens the *recipe* list only; it does not widen model width.
-
-    Three literals keep this route tied to the hidden-2560 family, and all three
-    are upstream's, not this patch's: ``canonical_projection``'s ``in_dim=2560``
-    default for the four ``in_proj_*``, ``_QWEN4_HIDDEN_SIZE`` as ``out_proj``'
-    rows, and the ``(1, 1, 2560)`` input shape in
-    ``_qwen4_decode_dynamic_eligible``. A wider checkpoint (a 5120-hidden
-    Qwen3.5-lineage export, say) fails on geometry alone even with a recipe the
-    opt-in admits. Asserting that here keeps generalising the family an explicit,
-    separately-tested change instead of an accident of this flag.
-    """
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+def test_qwen4_decode_wide_opt_in_stays_within_the_2560_family(hidden_size):
     module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    module._omlx_qwen4_wide_projections = True
     assert prework_mod._qwen4_decode_static_eligible(module)
 
     def widen(linear):
@@ -636,20 +587,22 @@ def test_qwen4_decode_wide_opt_in_stays_within_the_2560_family(
 
     for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"):
         wider = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+        wider._omlx_qwen4_wide_projections = True
         wider.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
         setattr(wider, name, widen(getattr(wider, name)))
         assert not prework_mod._qwen4_decode_static_eligible(wider), name
 
     # ...and a wider out_proj row count (hidden_size instead of 2560) also fails.
     wider = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+    wider._omlx_qwen4_wide_projections = True
     wider.out_proj = _fake_quantized_linear(6144, hidden_size, 8, 64)
     assert not prework_mod._qwen4_decode_static_eligible(wider)
 
 
-def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias():
     module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    module._omlx_qwen4_wide_projections = True
     assert prework_mod._qwen4_decode_static_eligible(module)
 
     module.out_proj.biases = mx.zeros_like(module.out_proj.biases).astype(mx.float32)
@@ -876,3 +829,29 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
     assert all(
         mx.array_equal(a, b).item() for a, b in zip(cache.state, reference_cache.state)
     )
+
+
+def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
+    from omlx.scheduler import SchedulerConfig
+
+    module = _canonical_qwen4_decode_module(((8, 64),) * 4)
+    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    model = SimpleNamespace(modules=lambda: [module])
+    config = SchedulerConfig(qwen4_gdn_decode_wide_proj=True)
+    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+
+    prework_mod.configure_qwen4_decode(
+        model, wide_projections=config.qwen4_gdn_decode_wide_proj
+    )
+    config.qwen4_gdn_decode_wide_proj = False
+    assert prework_mod._qwen4_decode_static_eligible(module)
+
+    reloaded = _canonical_qwen4_decode_module(((8, 64),) * 4)
+    reloaded.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    prework_mod.configure_qwen4_decode(
+        SimpleNamespace(modules=lambda: [reloaded]),
+        wide_projections=config.qwen4_gdn_decode_wide_proj,
+    )
+    assert not prework_mod._qwen4_decode_static_eligible(reloaded)
+    assert prework_mod._qwen4_decode_static_eligible(module)
