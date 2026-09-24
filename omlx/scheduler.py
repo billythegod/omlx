@@ -2823,7 +2823,7 @@ class Scheduler:
             self.config.paged_cache_block_size = target_block_size
 
     def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for Qwen hybrid architectures."""
+        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -2843,13 +2843,21 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            if is_qwen35 or is_qwen4:
+            # Wider GLM chunks require the native sparse MLA path.
+            is_glm5_next = model_type.startswith("glm5_next")
+            if is_glm5_next:
+                from .custom_kernels.glm_moe_dsa import fast
+
+                if not fast.is_native_available() or not fast.has_symbol(
+                    "glm_dsa_sparse_mla_attention"
+                ):
+                    return 0
+            if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
                 if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Qwen4 needs its sparse native path before wider chunks
-                    # are safe. NAX/M5 stays at 2048 for both model families.
+                    # Keep the default chunk size on NAX hosts.
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
