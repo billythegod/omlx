@@ -439,19 +439,24 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
 
 
 @pytest.mark.asyncio
-async def test_mtp_draft_tokens_is_persisted_not_dropped():
+@pytest.mark.parametrize("depth", [3, 4, 5, 6, 8])
+async def test_mtp_draft_tokens_is_persisted_not_dropped(depth):
     """#2823: mtp_adaptive_max_depth used to be silently discarded by PUT."""
     pool, _ = _failed_pool()
-    settings = ModelSettings(mtp_adaptive_max_depth=None)
+    settings = ModelSettings(mtp_adaptive_max_depth=None, mtp_fixed_depth=2)
 
     result = await _update_settings(
         pool,
         settings,
-        admin_routes.ModelSettingsRequest(mtp_adaptive_max_depth=8),
+        admin_routes.ModelSettingsRequest(
+            mtp_adaptive_max_depth=depth, mtp_fixed_depth=None
+        ),
     )
 
-    assert settings.mtp_adaptive_max_depth == 8
-    assert result["settings"]["mtp_adaptive_max_depth"] == 8
+    assert settings.mtp_adaptive_max_depth == depth
+    assert result["settings"]["mtp_adaptive_max_depth"] == depth
+
+    assert settings.mtp_fixed_depth is None
 
 
 @pytest.mark.asyncio

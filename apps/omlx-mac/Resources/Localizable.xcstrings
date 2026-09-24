@@ -20195,19 +20195,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Draft Depth"
+            "value" : "Adaptive max depth"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Глубина черновика"
+            "value" : "Adaptive max depth"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "草稿深度"
+            "value" : "Adaptive max depth"
           }
         }
       }
@@ -20219,67 +20219,67 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Adaptive adjusts the draft depth each step. Depth N always drafts N tokens."
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Адаптивный режим подбирает глубину на каждом шаге. Глубина N всегда создаёт N черновых токенов."
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自适应会在每一步自动调整草稿深度。深度 N 始终草拟 N 个 Token。"
+            "value" : "Automatically adjusts the draft depth up to the selected maximum."
           }
         }
       }
     },
     "settings.acceleration.mtp.depth.adaptive" : {
-      "comment" : "Lightning MTP depth option: adjust the draft depth each step",
+      "comment" : "Default Lightning MTP adaptive maximum draft depth",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Adaptive"
+            "value" : "3 tokens (Default)"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Адаптивно"
+            "value" : "3 tokens (Default)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自适应"
+            "value" : "3 tokens (Default)"
           }
         }
       }
     },
     "settings.acceleration.mtp.depth.option" : {
-      "comment" : "Lightning MTP depth option; placeholder is the fixed draft token count",
+      "comment" : "Lightning MTP depth option; placeholder is the maximum draft token count",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Depth %lld"
+            "value" : "%lld tokens"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Глубина %lld"
+            "value" : "%lld tokens"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "深度 %lld"
+            "value" : "%lld tokens"
           }
         }
       }
@@ -21989,7 +21989,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自适应"
+            "value" : "3 tokens (Default)"
           }
         }
       }

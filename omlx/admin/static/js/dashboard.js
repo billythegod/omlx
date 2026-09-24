@@ -71,6 +71,7 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_adaptive_max_depth',
         'mtp_fixed_depth',
         'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
@@ -1948,7 +1949,8 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
-                    mtp_fixed_depth: s.mtp_fixed_depth ? String(s.mtp_fixed_depth) : '',
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -3007,10 +3009,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                mtp_fixed_depth: this.modelSettings.mtp_enabled
-                                    && this.modelSettings.mtp_fixed_depth
-                                    ? parseInt(this.modelSettings.mtp_fixed_depth)
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
                                     : null,
+                                mtp_fixed_depth: null,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -3076,6 +3078,7 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
                                     mtp_fixed_depth: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
@@ -3337,7 +3340,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
-                        this.modelSettings.mtp_fixed_depth = '';
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
