@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the head_dim=256 long-context prefill SDPA patch.
-
-Covers (without needing the full Qwen3.6 model):
-  - the forced native kernel matches default MLX SDPA numerically
-    (square causal, chunked-prefill non-square causal, and decode shapes);
-  - the route gate engages only for head_dim=256 / qL>1 / causal / long kv;
-  - the patched SDPA passes through unchanged for non-256 / decode / short kv;
-  - the memory-monitor estimator switches head_dim=256 prefill to O(L) once
-    registered, and stays O(L^2) otherwise;
-  - memory-aware routing (issue #2204): with a headroom provider registered
-    the route prefers the faster unfused fallback whenever its transient
-    fits, and falls back to forced fused without headroom info.
-"""
+"""SDPA256 bounded routing, numerical fallback, and memory registration tests."""
 
 import logging
 import math
@@ -458,8 +446,7 @@ def test_estimator_keeps_registered_route_thresholds_independent():
 
 
 def test_unfused_call_bytes_shared_with_guard_estimator():
-    """The route gate and the guard must price the unfused path identically:
-    the guard's unfused branch is the shared module function."""
+    """The guard must include the score matrix and FP32 output allocation."""
     from omlx import memory_monitor as mm
 
     monitor = mm.MemoryMonitor.__new__(mm.MemoryMonitor)
@@ -474,25 +461,7 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     )
 
 
-# --- memory-aware routing (issue #2204) -----------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# --- bounded routing overrides -------------------------------------------
 
 
 def test_parse_force_tiled_env(monkeypatch):
@@ -529,12 +498,6 @@ def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
 # --- bounded-route engagement logging (issue #2283) ------------------------
 
 
-
-
-
-
-
-
 def test_tiled_route_logs_forced_env(_sdpa256_reset, caplog, monkeypatch):
     sdpa256 = _sdpa256_reset
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
@@ -544,14 +507,6 @@ def test_tiled_route_logs_forced_env(_sdpa256_reset, caplog, monkeypatch):
     records = _tiled_log_records(caplog)
     assert len(records) == 1
     assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
-
-
-
-
-
-
-
-
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----

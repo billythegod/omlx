@@ -3,8 +3,8 @@
 
 MLX 0.32.2 ships a fused full-attention kernel for head dimensions 192 and 256,
 but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
-That default materializes the full ``[n_q, query_len, kv_len]`` score matrix —
-O(L^2) in context length — and can still exceed oMLX's memory-guard ceiling.
+That default materializes the full ``[n_q, query_len, kv_len]`` score matrix,
+quadratic in context length, and can still exceed oMLX's memory-guard ceiling.
 
 Qualifying calls use the bounded route. Metal uses native fused attention for supported FP16/BF16 calls, while FP32 and array masks use array tiling.
 The native FP32 full-attention kernel exceeds 32 KiB of threadgroup memory.
@@ -72,38 +72,15 @@ def _parse_force_tiled_env() -> bool | None:
     return None
 
 
-def _tiled_route_required(queries, keys) -> bool:
-    """Take the memory-bounded route for every qualifying call (True = force).
-
-    This is #2025's original contract. head-dim-256 multi-token prefill has no
-    fused MLX kernel, so the stock fallback materializes the whole
-    ``[n_q, query_len, kv_len]`` fp32 score matrix. For the shapes
-    ``_should_route`` admits, the bounded native fused kernel runs instead and
-    peak prefill memory stays O(L).
-
-    #2204 made this conditional on live guard headroom, to keep the faster
-    unfused path wherever its matrix fits. Deciding per call from live process
-    memory made the choice depend on process history: the same request saw
-    headroom differ by gigabytes between otherwise identical processes
-    (resident pages of the mmap'd weights, a previous request's pooled
-    buffers), switched routes at a different kv_len, and — because the two
-    routes are different floating-point reductions — produced different
-    temperature-0 output. The prefill memory estimator was not made
-    conditional alongside it: ``memory_monitor`` prices a registered head dim
-    as O(L) for every shape the route covers, so a chunk could be admitted on
-    the bounded route's transient and then run the unfused one.
-
-    Deciding from the call shape alone keeps the route identical in every
-    process and keeps the estimator's assumption true by construction.
-    """
+def _tiled_route_required() -> bool:
+    """Use the bounded route unless the environment override disables it."""
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
         return _FORCE_TILED
     _note_tiled_route(
         "long-context",
-        "head_dim 256 has no fused kernel for multi-token prefill, so the "
-        "stock fallback would materialize the full fp32 score matrix",
+        "bounded attention keeps execution consistent with prefill memory pricing",
     )
     return True
 
@@ -280,7 +257,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         n_kv = keys.shape[-3]
         if n_kv <= 0 or n_q % n_kv != 0:
             return False
-        return _tiled_route_required(queries, keys)
+        return _tiled_route_required()
     except Exception:
         return False
 

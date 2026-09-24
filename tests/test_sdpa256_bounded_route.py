@@ -1,20 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qualifying head-dim-256 prefill always takes the memory-bounded route.
-
-This is issue #2025's contract: head_dim 256 has no fused MLX kernel for
-multi-token prefill, so the stock fallback materializes the whole
-``[n_q, query_len, kv_len]`` fp32 score matrix. #2204 made the route
-conditional on live guard headroom to recover the unfused path's speed where
-that matrix fits, which made the route — and therefore temperature-0 output,
-since the two routes are different floating-point reductions — depend on live
-process memory. It also left ``memory_monitor``'s prefill estimate pricing
-every registered head dim as O(L), so a chunk could be admitted on the bounded
-route's transient and then run the unfused one.
-
-These tests drive the production route gate and the production estimator.
-Geometry and ceilings are parameters, never constants of a particular model or
-machine.
-"""
+"""Verify bounded SDPA256 routing and matching prefill memory estimates."""
 
 import logging
 
@@ -81,71 +66,14 @@ def test_route_is_identical_across_repeated_calls():
     including after other shapes have gone through the gate."""
     answers = []
     for _ in range(3):
-        answers.append(sdpa256._tiled_route_required(*_qk(4096, 28672)))
-        sdpa256._tiled_route_required(*_qk(2048, 262144))
+        answers.append(
+            sdpa256._should_route(*_qk(4096, 28672), None, "causal", None)
+        )
+        sdpa256._should_route(*_qk(2048, 262144), None, "causal", None)
     assert answers == [True, True, True]
 
 
 # --- 2/3. no live-memory input, no process-history input -------------------
-
-
-def _code_without_docstrings(src: str) -> str:
-    import ast
-
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if isinstance(
-            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            doc = ast.get_docstring(node, clean=False)
-            if doc and node.body and isinstance(node.body[0], ast.Expr):
-                node.body.pop(0)
-    return ast.unparse(tree)
-
-
-def test_route_module_reads_no_process_memory():
-    """A reproducible route cannot consult live usage.
-
-    ``headroom`` is the only name that discriminates: the previous
-    implementation reached process memory through a bound ``provider()``
-    callable, so scanning for ``get_active_memory`` and friends would match
-    nothing on either side. On the parent this fails on
-    ``set_unfused_headroom_provider`` / ``_HEADROOM_PROVIDER_LOCAL``.
-
-    Docstrings are stripped so the rationale above may discuss headroom;
-    ``ast.unparse`` drops comments too, so a re-introduction documented only
-    in a comment would not be caught here — the sweep in
-    ``test_scheduler_no_longer_exposes_a_route_headroom_provider`` and the
-    behavioural pin above are what cover that.
-    """
-    with open(sdpa256.__file__) as handle:
-        code = _code_without_docstrings(handle.read())
-    assert "headroom" not in code, "routing module still reads guard headroom"
-
-
-def test_ample_headroom_no_longer_unlocks_the_unfused_path():
-    """Pin the behaviour change, not just the new default.
-
-    Previously the route asked a scheduler-supplied headroom value and kept
-    the unfused path whenever the score matrix fit under it. A provider
-    reporting far more headroom than the matrix needs used to flip the route
-    to unfused; it must not now. On a tree that still has that API this test
-    fails, which is what separates it from a restatement of the default.
-    """
-    binder = getattr(sdpa256, "set_unfused_headroom_provider", None)
-    owner = None
-    if binder is not None:  # pragma: no cover - only reachable pre-change
-
-        class _AmpleHeadroom:
-            def headroom(self, *_args):
-                return 1 << 60
-
-        owner = _AmpleHeadroom()
-        binder(owner.headroom)
-    try:
-        assert sdpa256._should_route(*_qk(2048, 16384), None, "causal", None) is True
-    finally:
-        del owner
 
 
 def test_scheduler_no_longer_exposes_a_route_headroom_provider():
@@ -176,7 +104,7 @@ def test_estimator_prices_the_route_that_will_run():
     assert sdpa256._register_bounded_route(sdpa256._SDPA256_MIN_KV_LEN)
     monitor = _monitor()
     q_len, kv_len = 4096, 28672
-    assert sdpa256._tiled_route_required(*_qk(q_len, kv_len)) is True
+    assert sdpa256._should_route(*_qk(q_len, kv_len), None, "causal", None) is True
     charged = monitor.estimate_chunk_transient_bytes(q_len, kv_len)
     unfused = estimate_unfused_sdpa_call_bytes(
         N_Q, q_len, kv_len, HEAD_DIM, mm.SDPA256_UNFUSED_SCORE_DTYPE_SIZE
@@ -234,7 +162,7 @@ def test_route_is_bounded_with_an_empty_registry():
     """Registration is the estimator's business. A route that depended on it
     could be talked out of the safe path by a failed registration."""
     assert not mm._SDPA_TILED_PREFILL_HEAD_DIMS
-    assert sdpa256._tiled_route_required(*_qk(4096, 28672)) is True
+    assert sdpa256._tiled_route_required() is True
 
 
 def test_route_survives_a_broken_memory_monitor(monkeypatch):
@@ -246,7 +174,7 @@ def test_route_survives_a_broken_memory_monitor(monkeypatch):
     monkeypatch.setattr(mm, "register_tiled_prefill_head_dim", boom)
     assert sdpa256._register_bounded_route(8192) is False
     assert not mm._SDPA_TILED_PREFILL_HEAD_DIMS
-    assert sdpa256._tiled_route_required(*_qk(4096, 28672)) is True
+    assert sdpa256._tiled_route_required() is True
 
 
 def test_unknown_model_geometry_does_not_unlock_the_unfused_path():
@@ -254,7 +182,7 @@ def test_unknown_model_geometry_does_not_unlock_the_unfused_path():
     cannot move it."""
     monitor = MemoryMonitor(max_kv_cache_memory=GIB)  # no set_model_info
     assert monitor.has_model_info() is False
-    assert sdpa256._tiled_route_required(*_qk(4096, 28672)) is True
+    assert sdpa256._tiled_route_required() is True
 
 
 def test_non_qualifying_shapes_keep_the_stock_path():
@@ -292,6 +220,6 @@ def test_opting_out_withdraws_the_o_l_admission_promise():
 def test_bounded_route_logs_once_not_per_call(caplog):
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
         for _ in range(5):
-            sdpa256._tiled_route_required(*_qk(4096, 65536))
+            sdpa256._tiled_route_required()
     notices = [r for r in caplog.records if "memory-bounded path" in r.getMessage()]
     assert len(notices) == 1
