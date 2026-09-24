@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The ordinary FP16 route must engage only for its tested cache/shape ABI."""
+"""The ordinary FP16/BF16 route must engage only for its tested cache/shape ABI."""
 
 from __future__ import annotations
 
@@ -26,32 +26,40 @@ def restore_hooks(monkeypatch):
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
     monkeypatch.setattr(prework, "_PATCHED", False)
-    monkeypatch.setattr(prework, "_QWEN35_FP16_DECODE_ENGAGED_LOGGED", False)
-    monkeypatch.setattr(prework, "get_mlx_device_name", lambda: "Apple M1 Max")
-    monkeypatch.delenv("OMLX_QWEN35_FP16_GDN_DECODE", raising=False)
+    monkeypatch.setattr(prework, "_QWEN35_DECODE_ENGAGED_LOGGED", False)
 
 
-def _module():
+def _module(dtype=mx.float16, hidden_size=2048, num_k_heads=16, num_v_heads=32):
     # Keep the real GDN class, convolution, normalization and recurrence,
-    # with cheap deterministic projections instead of 33M random weights.
+    # with cheap deterministic projections instead of large random weights.
     module = language.Qwen3_5GatedDeltaNet.__new__(language.Qwen3_5GatedDeltaNet)
     nn.Module.__init__(module)
-    module.hidden_size = 2048
-    module.num_k_heads, module.num_v_heads = 16, 32
+    module.hidden_size = hidden_size
+    module.num_k_heads, module.num_v_heads = num_k_heads, num_v_heads
     module.head_k_dim = module.head_v_dim = 128
-    module.key_dim, module.value_dim, module.conv_dim = 2048, 4096, 8192
+    module.key_dim, module.value_dim = num_k_heads * 128, num_v_heads * 128
+    module.conv_dim = 2 * module.key_dim + module.value_dim
     module.conv_kernel_size = 4
-    module.conv1d = nn.Conv1d(8192, 8192, 4, groups=8192, bias=False)
-    module.conv1d.weight = (mx.random.normal((8192, 4, 1)) * 0.2).astype(mx.float16)
-    module.A_log = mx.zeros((32,), dtype=mx.float16)
-    module.dt_bias = mx.ones((32,), dtype=mx.float16)
+    module.conv1d = nn.Conv1d(
+        module.conv_dim, module.conv_dim, 4, groups=module.conv_dim, bias=False
+    )
+    module.conv1d.weight = (mx.random.normal((module.conv_dim, 4, 1)) * 0.2).astype(
+        dtype
+    )
+    module.A_log = mx.zeros((num_v_heads,), dtype=dtype)
+    module.dt_bias = mx.ones((num_v_heads,), dtype=dtype)
     module.norm = language.Qwen3_5RMSNormGated(128, eps=1e-6)
-    module.norm.weight = (1 + 0.1 * mx.random.normal((128,))).astype(mx.float16)
-    module.in_proj_qkv = lambda x: mx.tile(x, (1, 1, 4))
-    module.in_proj_z = lambda x: mx.tile(x, (1, 1, 2))
-    module.in_proj_b = lambda x: x[..., :32] * 0.2
-    module.in_proj_a = lambda x: x[..., 32:64] * 0.2
-    module.out_proj = lambda x: x.reshape(*x.shape[:2], 2, 2048).sum(axis=-2)
+    module.norm.weight = (1 + 0.1 * mx.random.normal((128,))).astype(dtype)
+    conv_dim, value_dim = module.conv_dim, module.value_dim
+    module.in_proj_qkv = lambda x: mx.tile(
+        x, (1, 1, (conv_dim + hidden_size - 1) // hidden_size)
+    )[..., :conv_dim]
+    module.in_proj_z = lambda x: mx.tile(
+        x, (1, 1, (value_dim + hidden_size - 1) // hidden_size)
+    )[..., :value_dim]
+    module.in_proj_b = lambda x: x[..., :num_v_heads] * 0.2
+    module.in_proj_a = lambda x: x[..., num_v_heads : 2 * num_v_heads] * 0.2
+    module.out_proj = lambda x: x[..., :hidden_size]
     module.eval()
     return module
 
@@ -84,14 +92,15 @@ def _assert_equal(actual, expected):
         assert mx.all(mx.isfinite(a)).item()
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, 0.001, 0.1, 1.0, 5.0, 16.0])
 @pytest.mark.parametrize("strided", [False, True])
-def test_fp16_prework_matches_current_decode_convolution(scale, strided):
+def test_prework_matches_current_decode_convolution(scale, strided, dtype):
     mx.random.seed(71)
-    module = _module()
+    module = _module(dtype)
     width = 8192 * (2 if strided else 1)
-    qkv = (mx.random.normal((1, 1, width)) * scale).astype(mx.float16)
-    state = (mx.random.normal((1, 3, width)) * scale).astype(mx.float16)
+    qkv = (mx.random.normal((1, 1, width)) * scale).astype(dtype)
+    state = (mx.random.normal((1, 3, width)) * scale).astype(dtype)
     if strided:
         qkv, state = qkv[..., ::2], state[..., ::2]
     conv_input = mx.concatenate([state, qkv], axis=1)
@@ -103,8 +112,8 @@ def test_fp16_prework_matches_current_decode_convolution(scale, strided):
         qkv,
         state,
         module.conv1d.weight,
-        mx.array(128**-1, dtype=mx.float16),
-        mx.array(128**-0.5, dtype=mx.float16),
+        mx.array(128**-1, dtype=dtype),
+        mx.array(128**-0.5, dtype=dtype),
         16,
         32,
         128,
@@ -113,9 +122,16 @@ def test_fp16_prework_matches_current_decode_convolution(scale, strided):
     _assert_equal(actual, expected)
 
 
-def test_fp16_decode_matches_stock_over_prefill_decode_and_restored_cache(monkeypatch):
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "hidden_size,num_k_heads,num_v_heads",
+    [(2048, 16, 32), (5120, 16, 48), (1024, 8, 16)],
+)
+def test_decode_matches_stock_over_prefill_decode_and_restored_cache(
+    monkeypatch, dtype, hidden_size, num_k_heads, num_v_heads
+):
     mx.random.seed(117)
-    module = _module()
+    module = _module(dtype, hidden_size, num_k_heads, num_v_heads)
     stock = type(module).__call__
     expected_cache, actual_cache = ArraysCache(2), ArraysCache(2)
     assert prework.apply_qwen35_gdn_prework_patch()
@@ -129,7 +145,7 @@ def test_fp16_decode_matches_stock_over_prefill_decode_and_restored_cache(monkey
 
     monkeypatch.setattr(actual_cache, "advance", record_advance)
     for length in [8] + [1] * 16 + [3, 1]:
-        inputs = mx.random.normal((1, length, 2048)).astype(mx.float16)
+        inputs = mx.random.normal((1, length, hidden_size)).astype(dtype)
         expected = stock(module, inputs, cache=expected_cache)
         actual = module(inputs, cache=actual_cache)
         _assert_equal((actual, *actual_cache.state), (expected, *expected_cache.state))
@@ -140,7 +156,7 @@ def test_fp16_decode_matches_stock_over_prefill_decode_and_restored_cache(monkey
     expected_cache = copy.deepcopy(expected_cache)
     restored = ArraysCache(2)
     restored.state = copy.deepcopy(actual_cache.state)
-    inputs = mx.random.normal((1, 1, 2048)).astype(mx.float16)
+    inputs = mx.random.normal((1, 1, hidden_size)).astype(dtype)
     actual = module(inputs, cache=restored)
     expected = stock(module, inputs, cache=expected_cache)
     _assert_equal((actual, *restored.state), (expected, *expected_cache.state))
@@ -176,7 +192,7 @@ def test_fp16_decode_matches_stock_over_prefill_decode_and_restored_cache(monkey
         "cpu",
     ],
 )
-def test_fp16_decode_falls_back_before_cache_mutation(monkeypatch, case):
+def test_decode_falls_back_before_cache_mutation(monkeypatch, case):
     module, cache = _module(), _cache()
     inputs, mask = mx.zeros((1, 1, 2048), dtype=mx.float16), None
     if case == "batch":
@@ -244,53 +260,9 @@ def test_fp16_decode_falls_back_before_cache_mutation(monkeypatch, case):
 
 
 @pytest.mark.parametrize(
-    "device",
-    [
-        None,
-        "Apple M1",
-        "Apple M1 Pro",
-        "Apple M1 Ultra",
-        "Apple M2 Max",
-        "Apple M3 Max",
-        "Apple M4",
-        "Apple M5",
-        "Unknown",
-    ],
-)
-def test_fp16_decode_keeps_stock_on_unvalidated_hardware(monkeypatch, device):
-    monkeypatch.setattr(prework, "get_mlx_device_name", lambda: device)
-    module = _module()
-    monkeypatch.setattr(
-        language.Qwen3_5GatedDeltaNet, "__call__", lambda *a, **k: "stock"
-    )
-    assert prework.apply_qwen35_gdn_prework_patch()
-    calls = _record_kernel(monkeypatch)
-    assert module(mx.zeros((1, 1, 2048), dtype=mx.float16), cache=_cache()) == "stock"
-    assert calls == []
-
-
-def test_fp16_decode_is_automatic_and_probes_hardware_only_at_install(monkeypatch):
-    probes = []
-
-    def device():
-        probes.append(True)
-        return "Apple M1 Max"
-
-    monkeypatch.setattr(prework, "get_mlx_device_name", device)
-    module, cache = _module(), _cache()
-    assert prework.apply_qwen35_gdn_prework_patch()
-    calls = _record_kernel(monkeypatch)
-    for _ in range(3):
-        result = module(mx.zeros((1, 1, 2048), dtype=mx.float16), cache=cache)
-        mx.eval(result, cache.state)
-    assert len(calls) == 3
-    assert probes == [True]
-
-
-@pytest.mark.parametrize(
     "kwargs", [{"gdn_sink": []}, {"target_verify": True}, {"extra": 1}]
 )
-def test_fp16_decode_forwards_runtime_extensions(monkeypatch, kwargs):
+def test_decode_forwards_runtime_extensions(monkeypatch, kwargs):
     module, cache = _module(), _cache()
     seen = []
 
@@ -308,7 +280,7 @@ def test_fp16_decode_forwards_runtime_extensions(monkeypatch, kwargs):
     assert seen == [kwargs] and calls == []
 
 
-def test_fp16_decode_does_not_commit_or_retry_after_fused_failure(monkeypatch):
+def test_decode_does_not_commit_or_retry_after_fused_failure(monkeypatch):
     module, cache = _module(), _cache()
     before = tuple(cache.state)
     assert prework.apply_qwen35_gdn_prework_patch()
@@ -324,7 +296,7 @@ def test_fp16_decode_does_not_commit_or_retry_after_fused_failure(monkeypatch):
     assert all(a is b for a, b in zip(before, cache.state))
 
 
-def test_fp16_speculation_keeps_stock_history_and_commit(monkeypatch):
+def test_decode_speculation_keeps_stock_history_and_commit(monkeypatch):
     module = _module()
     stock = type(module).__call__
     cache = _cache()

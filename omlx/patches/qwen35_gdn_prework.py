@@ -19,8 +19,8 @@ multiply's rounding — the composed chain's two casts.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
-On the validated Apple M1 Max, this kernel also runs automatically
-for ordinary FP16 B1/T1 decode with the Qwen3.5/3.6 35B-A3B geometry. Gates,
+This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
+through Qwen3_5GatedDeltaNet on Metal. Gates,
 recurrence, final norm and projections remain unchanged. Other Qwen3.5
 decode shapes and prefill keep the stock path. Qwen4 has its separate
 BF16 decode prework and norm-gate kernels below.
@@ -34,8 +34,6 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 
-from omlx.utils.hardware import get_mlx_device_name
-
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -44,7 +42,7 @@ _KERNEL = None
 _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
-_QWEN35_FP16_DECODE_ENGAGED_LOGGED = False
+_QWEN35_DECODE_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -618,8 +616,8 @@ def _qwen4_decode_dynamic_eligible(
     )
 
 
-def _qwen35_fp16_decode_eligible(module, inputs, mask, cache) -> bool:
-    """Limit ordinary FP16 decode to the validated 35B-A3B geometry."""
+def _qwen35_decode_eligible(module, inputs, mask, cache) -> bool:
+    """Check the fused kernel shape, precision and cache requirements."""
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
 
@@ -627,8 +625,8 @@ def _qwen35_fp16_decode_eligible(module, inputs, mask, cache) -> bool:
         type(module) is not Qwen3_5GatedDeltaNet
         or module.training
         or not isinstance(inputs, mx.array)
-        or inputs.shape != (1, 1, 2048)
-        or inputs.dtype != mx.float16
+        or inputs.shape != (1, 1, module.hidden_size)
+        or inputs.dtype not in (mx.float16, mx.bfloat16)
         or mx.default_device() != mx.gpu
         or mask is not None
         or type(cache) is not ArraysCache
@@ -636,23 +634,20 @@ def _qwen35_fp16_decode_eligible(module, inputs, mask, cache) -> bool:
         or cache.is_speculating
         or cache.lengths is not None
         or cache.left_padding is not None
-        or module.hidden_size != 2048
-        or module.num_k_heads != 16
-        or module.num_v_heads != 32
         or module.head_k_dim != 128
         or module.head_v_dim != 128
         or module.conv_kernel_size != 4
-        or module.conv1d.weight.shape != (8192, 4, 1)
-        or module.conv1d.weight.dtype != mx.float16
+        or module.conv1d.weight.shape != (module.conv_dim, 4, 1)
+        or module.conv1d.weight.dtype != inputs.dtype
         or getattr(module.conv1d, "bias", None) is not None
     ):
         return False
     return (
         isinstance(cache[0], mx.array)
-        and cache[0].shape == (1, 3, 8192)
-        and cache[0].dtype == mx.float16
+        and cache[0].shape == (1, 3, module.conv_dim)
+        and cache[0].dtype == inputs.dtype
         and isinstance(cache[1], mx.array)
-        and cache[1].shape == (1, 32, 128, 128)
+        and cache[1].shape == (1, module.num_v_heads, 128, 128)
         and cache[1].dtype == mx.float32
     )
 
@@ -693,37 +688,38 @@ def apply_qwen35_gdn_prework_patch() -> bool:
     cls = q35.Qwen3_5GatedDeltaNet
     original = cls.__call__
     original_verify = Qwen3_5BatchInvariantForward._gated_delta
-    # Select once at installation, not per layer/token. Broader chip support
-    # needs whole-server measurements; other Apple GPUs keep stock FP16 decode.
-    # The existing Qwen4 and speculative routes are independent of this gate.
-    fp16_decode = get_mlx_device_name() == "Apple M1 Max"
-    if fp16_decode:
-        q_scale_fp16 = mx.array(128**-1, dtype=mx.float16)
-        k_scale_fp16 = mx.array(128**-0.5, dtype=mx.float16)
+    scales = {
+        dtype: (mx.array(128**-1, dtype=dtype), mx.array(128**-0.5, dtype=dtype))
+        for dtype in (mx.float16, mx.bfloat16)
+    }
 
     def decode(self, inputs, mask=None, cache=None, **kwargs):
         # Runtime extensions (for example capture/verification keywords)
         # must keep their original implementation and cache semantics.
         if kwargs:
             return original(self, inputs, mask=mask, cache=cache, **kwargs)
-        if fp16_decode and _qwen35_fp16_decode_eligible(self, inputs, mask, cache):
+        if _qwen35_decode_eligible(self, inputs, mask, cache):
             mixed_qkv = self.in_proj_qkv(inputs)
-            # Custom projection precision must not reach a kernel whose
-            # convolution state and weights have the FP16 ABI.
-            if mixed_qkv.dtype != mx.float16 or mixed_qkv.shape != (1, 1, 8192):
+            # The kernel reads projections, convolution weights and state as one dtype.
+            if mixed_qkv.dtype != inputs.dtype or mixed_qkv.shape != (
+                1,
+                1,
+                self.conv_dim,
+            ):
                 return original(self, inputs, mask=mask, cache=cache)
-            z = self.in_proj_z(inputs).reshape(1, 1, 32, 128)
+            z = self.in_proj_z(inputs).reshape(1, 1, self.num_v_heads, self.head_v_dim)
             b, a = self._project_gates(inputs)
+            q_scale, k_scale = scales[inputs.dtype]
             q, k, v, conv_state = gdn_prework_fused(
                 mixed_qkv,
                 cache[0],
                 self.conv1d.weight,
-                q_scale_fp16,
-                k_scale_fp16,
-                16,
-                32,
-                128,
-                128,
+                q_scale,
+                k_scale,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
             )
             # An ordinary ArraysCache has no speculative history to record.
             # Compute both next states first, then commit them together;
@@ -745,10 +741,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             cache.advance(1)
             q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
-            global _QWEN35_FP16_DECODE_ENGAGED_LOGGED
-            if not _QWEN35_FP16_DECODE_ENGAGED_LOGGED:
-                _QWEN35_FP16_DECODE_ENGAGED_LOGGED = True
-                logger.info("Qwen3.5 FP16 B1/T1 fused GDN prework engaged")
+            global _QWEN35_DECODE_ENGAGED_LOGGED
+            if not _QWEN35_DECODE_ENGAGED_LOGGED:
+                _QWEN35_DECODE_ENGAGED_LOGGED = True
+                logger.info("Qwen B1/T1 fused GDN prework engaged")
             return result
 
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
