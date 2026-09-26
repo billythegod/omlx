@@ -17,11 +17,13 @@ The next verify launch detects that pending replay and applies it in
 registers before its own block, so the replay costs no extra launch or state
 read. Any other reader of the slot evaluates the lazy replay normally.
 
-The arithmetic matches the stock chain bit for bit: the per-row reduction
-order of ``gated_delta_update``, the bf16 rounding points of ``compute_g``
-and ``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. Compiled MLX graphs
-use precise transcendentals while custom kernels default to fast math, so the
-helpers call ``metal::precise`` explicitly.
+The arithmetic follows the stock chain: the per-row reduction order of
+``gated_delta_update``, the bf16 or fp16 rounding points of ``compute_g`` and
+``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. Compiled MLX graphs use
+precise transcendentals while custom kernels default to fast math, so the
+helpers call ``metal::precise`` explicitly. The result is bit-exact on M3 and
+later GPUs. On M1/M2 MLX's own softplus rounds very small values differently,
+so the decay of such rows can differ by one ulp.
 """
 
 from __future__ import annotations
@@ -73,6 +75,49 @@ inline float gdn_beta(InT x) {
     InT e = static_cast<InT>(metal::precise::exp(static_cast<float>(ax)));
     auto y = 1 / (1 + e);
     InT r = (x < 0) ? y : 1 - y;
+    return static_cast<float>(r);
+}
+
+// MLX's half softplus and sigmoid round every half op, which fast math would
+// fuse away here, so each step runs in float and rounds to half explicitly.
+inline half gdn_h(float x) {
+    return static_cast<half>(x);
+}
+
+inline float gdn_decay(half a, half dt, float neg_a) {
+    half s = gdn_h(static_cast<float>(a) + static_cast<float>(dt));
+    half hi = s > half(0) ? s : half(0);
+    half lo = s > half(0) ? half(0) : s;
+    half sp;
+    if (metal::isnan(s)) {
+        sp = s;
+    } else if (lo == -metal::numeric_limits<half>::infinity()
+               || hi == metal::numeric_limits<half>::infinity()) {
+        sp = hi;
+    } else {
+        half d = gdn_h(static_cast<float>(lo) - static_cast<float>(hi));
+        float e = static_cast<float>(gdn_h(metal::precise::exp(static_cast<float>(d))));
+        // MLX's float log1p on the half exp; the sum rounds once.
+        float xp1 = 1.0f + e;
+        float l1p;
+        if (xp1 == metal::numeric_limits<float>::max()) {
+            l1p = metal::numeric_limits<float>::max();
+        } else if (xp1 == 1.0f) {
+            l1p = e;
+        } else {
+            l1p = e * metal::precise::divide(metal::precise::log(xp1), xp1 - 1.0f);
+        }
+        sp = gdn_h(static_cast<float>(hi) + l1p);
+    }
+    return metal::precise::exp(neg_a * static_cast<float>(sp));
+}
+
+inline float gdn_beta(half x) {
+    half ax = metal::abs(x);
+    half e = gdn_h(metal::precise::exp(static_cast<float>(ax)));
+    half d = gdn_h(1.0f + static_cast<float>(e));
+    half y = gdn_h(metal::precise::divide(1.0f, static_cast<float>(d)));
+    half r = (x < half(0)) ? y : gdn_h(1.0f - static_cast<float>(y));
     return static_cast<float>(r);
 }
 """
@@ -241,7 +286,7 @@ def _geometry(layer, batch):
 
 
 def fused_eligible(layer, q, cache, length) -> bool:
-    """One block covering the whole speculative window, stock norm, bf16."""
+    """One block covering the whole speculative window, stock norm, bf16/fp16."""
     transaction = getattr(cache, "_speculation", None)
     state = cache[1]
     return (
@@ -250,13 +295,13 @@ def fused_eligible(layer, q, cache, length) -> bool:
         and transaction["length"] == length
         and 1 not in transaction["records"]
         and isinstance(layer.norm, _NORM_CLASS)
-        and q.dtype == mx.bfloat16
+        and q.dtype in (mx.bfloat16, mx.float16)
         and layer.head_k_dim == 128
         and layer.head_v_dim == 128
         and layer.num_v_heads % layer.num_k_heads == 0
-        and layer.A_log.dtype == mx.bfloat16
-        and layer.dt_bias.dtype == mx.bfloat16
-        and layer.norm.weight.dtype == mx.bfloat16
+        and layer.A_log.dtype == q.dtype
+        and layer.dt_bias.dtype == q.dtype
+        and layer.norm.weight.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
         and length <= 32
     )
@@ -269,7 +314,7 @@ def replay_state(layer, base, rows, keep):
     (state,) = _kernel(False, True)(
         inputs=[base, layer.A_log, layer.dt_bias, pk, pv, pa, pb, keep],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", pk.dtype),
             ("Hk", geo["Hk"]),
             ("Hv", geo["Hv"]),
             ("Dk", geo["Dk"]),
@@ -303,7 +348,7 @@ def verify_block(layer, cache, q, k, v, a, b, z):
     z = z.reshape(batch, length, geo["Hv"], geo["Dv"])
     inputs = [state, layer.A_log, layer.dt_bias]
     template = [
-        ("InT", mx.bfloat16),
+        ("InT", q.dtype),
         ("Hk", geo["Hk"]),
         ("Hv", geo["Hv"]),
         ("Dk", geo["Dk"]),
@@ -311,7 +356,7 @@ def verify_block(layer, cache, q, k, v, a, b, z):
         ("T", length),
     ]
     output_shapes = [(batch, length, geo["Hv"], geo["Dv"])]
-    output_dtypes = [mx.bfloat16]
+    output_dtypes = [q.dtype]
     if replay:
         _, base, rows, keep = pending
         inputs = [base, layer.A_log, layer.dt_bias, *rows, keep]
@@ -331,11 +376,11 @@ def verify_block(layer, cache, q, k, v, a, b, z):
     width = geo["Hv"] * geo["Dv"]
     out, sums = _norm_gate_kernel(layer.norm.eps)(
         inputs=[outs[0], z, layer.norm.weight],
-        template=[("InT", mx.bfloat16)],
+        template=[("InT", q.dtype)],
         grid=(32, rows_total, 1),
         threadgroup=(32, 8, 1),
         output_shapes=[(batch, length, width), (batch * length, width // 64)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[q.dtype, mx.float32],
     )
     qwen35_verify_qmm.register_group_sums(out, sums)
     start = outs[1] if replay else state

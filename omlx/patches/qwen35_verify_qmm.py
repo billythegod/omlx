@@ -13,7 +13,7 @@
 # integration — thread-local armed routing through ``nn.QuantizedLinear``,
 # the hybrid dispatch, and the row/N-floor gating — is original to oMLX.
 #
-# The ``sg8`` kernels' bf16 ``0x4300 | q`` weight operand and per-group input
+# The ``sg8`` kernels' ``128 + q`` weight operand bits and per-group input
 # sum correction are adapted from Splash
 # (runtime/metal/kernels/decode/linear_q4_sgmatrix.metal, Apache-2.0,
 # https://github.com/incoai/splash).
@@ -540,19 +540,34 @@ def _build_mma_kernel(
 
 
 # ---------------------------------------------------------------------------
-# sg8 kernel - up to eight rows on exact bf16 (128 + q) simdgroup operands.
+# sg8 kernel - up to eight rows on exact (128 + q) simdgroup operands.
 # ---------------------------------------------------------------------------
 
 
 # One simdgroup computes C^T = W X^T for CT x 8 columns and all rows. A lane
 # (fm, fn) owns W[n0 + fm][k + fn, k + fn + 1] (one byte of a 4-bit word), so
-# the MLX layout feeds the matrix operand directly. The bf16 bits 0x4300 | q
-# encode 128 + q exactly; each group then folds
+# the MLX layout feeds the matrix operand directly. The operand bits encode
+# 128 + q exactly; each group then folds
 # s * (acc - 128 * sum(x)) + b * sum(x) into the fp32 output. The two-matrix
 # form reads gate and up weights in one pass and writes silu(gate) * up.
 
 
-def _sg8_source(mats: int) -> str:
+def _operand_bits(pair: str, half: bool) -> str:
+    """Bits of 128 + q for a code pair holding one code per 16 bits.
+
+    bf16 is 0x4300 | q. fp16 has a 10-bit mantissa, so at exponent 7 one code
+    step is 8 ulp: 0x5800 | q << 3.
+    """
+    if half:
+        return f"(({pair}) << 3) | 0x58005800u"
+    return f"{pair} | 0x43004300u"
+
+
+def _sg8_source(mats: int, half: bool = False) -> str:
+    pair4 = _operand_bits("((wds[0] >> (4 * j)) & 0x000F000Fu)", half)
+    pair5 = _operand_bits(
+        "((wds[0] >> (5 * j)) & 0x1Fu) | (((wds[1] >> (5 * j)) & 0x1Fu) << 16)", half
+    )
     names = [("w_q", "scales", "biases"), ("w_q2", "scales2", "biases2")][:mats]
     decl = "\n".join(
         f"    float2 out{m}[CT];\n"
@@ -616,7 +631,7 @@ def _sg8_source(mats: int) -> str:
     bool r0 = int(fn) < M;
     bool r1 = int(fn) + 1 < M;
     // Step j of a 32-wide k block: A columns 2i and 2i + 1 are values j and
-    // j + 4 of the lane's eight packed values i * 8 .. i * 8 + 7, so both bf16
+    // j + 4 of the lane's eight packed values i * 8 .. i * 8 + 7, so both
     // operands come from one shift and mask. Its x values over j are adjacent.
     uint kx = (fm >> 1) * 8 + (fm & 1u) * 4;
     // Lanes past the last row read row M - 1 and never store, so the hot
@@ -638,9 +653,8 @@ def _sg8_source(mats: int) -> str:
     }};
     auto operand_pair = [&](thread uint* wds, int j) {{
         if (BITS == 4)
-            return ((wds[0] >> (4 * j)) & 0x000F000Fu) | 0x43004300u;
-        return ((wds[0] >> (5 * j)) & 0x1Fu) | (((wds[1] >> (5 * j)) & 0x1Fu) << 16)
-            | 0x43004300u;
+            return {pair4};
+        return {pair5};
     }};
 {decl}
     for (int g = g_begin; g < g_begin + PER; ++g) {{
@@ -712,20 +726,22 @@ def _with_group_sums(source: str) -> str:
     )
 
 
-def _build_sg8_kernel(mats: int = 1, sums: bool = False):
+def _build_sg8_kernel(mats: int = 1, sums: bool = False, half: bool = False):
     import mlx.core as mx
 
-    key = ("sg8", mats, sums)
+    key = ("sg8", mats, sums, half)
     if key not in _KERNEL_CACHE:
         inputs = ["x", "w_q", "scales", "biases"]
         if mats == 2:
             inputs += ["w_q2", "scales2", "biases2"]
-        source = _sg8_source(mats)
+        source = _sg8_source(mats, half)
         if sums:
             inputs.append("xs")
             source = _with_group_sums(source)
         _KERNEL_CACHE[key] = mx.fast.metal_kernel(
-            name=f"omlx_vk_sg8_m{mats}" + ("_xs" if sums else ""),
+            name=f"omlx_vk_sg8_m{mats}"
+            + ("_xs" if sums else "")
+            + ("_fp16" if half else ""),
             input_names=inputs,
             output_names=["y"],
             source=source,
@@ -752,8 +768,7 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
     return (
         int(bits) in (4, 5)
         and int(group_size) in (32, 64, 128)
-        # 0x4300 | q is the bf16 encoding of 128 + q.
-        and dtype == mx.bfloat16
+        and dtype in (mx.bfloat16, mx.float16)
         # Two or three rows stay on split-K, which is faster there in context.
         and _SG8_MIN_ROWS <= int(M) <= 8
         and int(K) % (int(group_size) * nsg) == 0
@@ -763,6 +778,8 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
 
 
 def _sg8_call(x2, mats, weights, *, group_size: int, bits: int, sums=None):
+    import mlx.core as mx
+
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(weights[0].shape[0])
@@ -770,7 +787,8 @@ def _sg8_call(x2, mats, weights, *, group_size: int, bits: int, sums=None):
     if sums is not None and int(group_size) != _SUM_GROUP:
         sums = None
     extra = [] if sums is None else [sums]
-    (y,) = _build_sg8_kernel(mats, sums is not None)(
+    half = x2.dtype == mx.float16
+    (y,) = _build_sg8_kernel(mats, sums is not None, half)(
         inputs=[x2, *weights, *extra],
         template=[
             ("T", x2.dtype),
@@ -1008,12 +1026,16 @@ def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bo
 _QL_PATCHED = False
 
 
-def _sg8_group_source(ns: tuple, bits: tuple) -> str:
+def _sg8_group_source(ns: tuple, bits: tuple, half: bool = False) -> str:
     """One launch for projections sharing x; matrix i owns tiles [E_{i-1}, E_i).
 
     Matrices may mix 4- and 5-bit storage; the branch is uniform per
     threadgroup.
     """
+    pair4 = _operand_bits("((w0 >> (4 * j)) & 0x000F000Fu)", half)
+    pair5 = _operand_bits(
+        "((w0 >> (5 * j)) & 0x1Fu) | (((w1 >> (5 * j)) & 0x1Fu) << 16)", half
+    )
     select, end = [], 0
     for i, (n, b) in enumerate(zip(ns, bits)):
         start, end = end, end + n // 8
@@ -1083,8 +1105,8 @@ def _sg8_group_source(ns: tuple, bits: tuple) -> str:
                 T xb = vb[j];
                 xsum += float2(float(xa), float(xb));
                 uint pair = wbits == 4
-                    ? ((w0 >> (4 * j)) & 0x000F000Fu) | 0x43004300u
-                    : ((w0 >> (5 * j)) & 0x1Fu) | (((w1 >> (5 * j)) & 0x1Fu) << 16) | 0x43004300u;
+                    ? {pair4}
+                    : {pair5};
                 simdgroup_matrix<T, 8, 8> a, b;
                 a.thread_elements()[0] = as_type<T>(ushort(pair));
                 a.thread_elements()[1] = as_type<T>(ushort(pair >> 16));
@@ -1122,7 +1144,10 @@ def sg8_group_eligible(linears, x) -> bool:
     import mlx.nn as nn
 
     if not (
-        _is_armed() and len(linears) > 1 and x.ndim == 3 and x.dtype == mx.bfloat16
+        _is_armed()
+        and len(linears) > 1
+        and x.ndim == 3
+        and x.dtype in (mx.bfloat16, mx.float16)
     ):
         return False
     rows = x.shape[0] * x.shape[1]
@@ -1158,19 +1183,21 @@ def vk_group_sg8(x2, linears, sums=None):
     bits = tuple(int(linear.bits) for linear in linears)
     if sums is not None and int(linears[0].group_size) != _SUM_GROUP:
         sums = None
-    key = ("sg8_group", ns, bits, sums is not None)
+    half = x2.dtype == mx.float16
+    key = ("sg8_group", ns, bits, sums is not None, half)
     if key not in _KERNEL_CACHE:
         inputs = ["x"]
         for i in range(len(ns)):
             inputs += [f"w{i}", f"s{i}", f"b{i}"]
-        source = _sg8_group_source(ns, bits)
+        source = _sg8_group_source(ns, bits, half)
         if sums is not None:
             inputs.append("xs")
             source = _with_group_sums(source)
         _KERNEL_CACHE[key] = mx.fast.metal_kernel(
             name="omlx_vk_sg8_group_"
             + "_".join(f"{n}q{b}" for n, b in zip(ns, bits))
-            + ("_xs" if sums is not None else ""),
+            + ("_xs" if sums is not None else "")
+            + ("_fp16" if half else ""),
             input_names=inputs,
             output_names=[f"y{i}" for i in range(len(ns))],
             source=source,
@@ -1355,7 +1382,7 @@ def _add_rms_eligible(a, b, norm) -> bool:
 
     return (
         type(norm) is nn.RMSNorm
-        and a.dtype == mx.bfloat16
+        and a.dtype in (mx.bfloat16, mx.float16)
         and b.dtype == a.dtype
         and a.shape == b.shape
         and norm.weight.dtype == a.dtype

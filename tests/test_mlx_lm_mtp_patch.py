@@ -5090,10 +5090,10 @@ def _nax_available() -> bool:
         return False
 
 
-def _quantized_linear(n, k, bits, seed):
+def _quantized_linear(n, k, bits, seed, dtype=mx.bfloat16):
     mx.random.seed(seed)
     layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=bits)
-    weight = (mx.random.normal((n, k)) * 0.02).astype(mx.bfloat16)
+    weight = (mx.random.normal((n, k)) * 0.02).astype(dtype)
     layer.weight, layer.scales, layer.biases = mx.quantize(
         weight, group_size=64, bits=bits
     )
@@ -5218,16 +5218,17 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
     assert mx.abs(out - expected).max().item() <= tolerance
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [4, 5])
 @pytest.mark.parametrize("rows", [4, 7, 8])
-def test_sg8_kernels_match_quantized_matmul(bits, rows):
+def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
     """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
     from omlx.patches import qwen35_verify_qmm as vq
 
-    x = (mx.random.normal((rows, 1024)) * 0.5).astype(mx.bfloat16)
+    x = (mx.random.normal((rows, 1024)) * 0.5).astype(dtype)
     # Producer-written per-64 sums replace the in-kernel accumulation.
     for sums in (None, x.astype(mx.float32).reshape(rows, 16, 64).sum(axis=-1)):
-        layer = _quantized_linear(1024, 1024, bits, 11)
+        layer = _quantized_linear(1024, 1024, bits, 11, dtype)
         out = vq.vk_qmm_sg8(
             x,
             layer.weight,
@@ -5239,27 +5240,28 @@ def test_sg8_kernels_match_quantized_matmul(bits, rows):
         )
         assert _close(out, _reference(layer, x))
 
-        gate = _quantized_linear(2048, 1024, bits, 12)
-        up = _quantized_linear(2048, 1024, bits, 13)
-        g = _reference(gate, x).astype(mx.bfloat16).astype(mx.float32)
-        u = _reference(up, x).astype(mx.bfloat16).astype(mx.float32)
+        gate = _quantized_linear(2048, 1024, bits, 12, dtype)
+        up = _quantized_linear(2048, 1024, bits, 13, dtype)
+        g = _reference(gate, x).astype(dtype).astype(mx.float32)
+        u = _reference(up, x).astype(dtype).astype(mx.float32)
         swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
         assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
 
         # Mixed 4/5-bit projections of one input share a launch.
-        group = [layer, _quantized_linear(512, 1024, 9 - bits, 14), gate]
+        group = [layer, _quantized_linear(512, 1024, 9 - bits, 14, dtype), gate]
         for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):
             assert _close(got, _reference(linear, x))
 
 
-def test_add_rms_norm_is_bitwise_add_then_rms_norm():
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_add_rms_norm_is_bitwise_add_then_rms_norm(dtype):
     from omlx.patches import qwen35_verify_qmm as vq
 
     mx.random.seed(3)
-    a = (mx.random.normal((2, 8, 5120)) * 3).astype(mx.bfloat16)
-    b = (mx.random.normal((2, 8, 5120)) * 40).astype(mx.bfloat16)
+    a = (mx.random.normal((2, 8, 5120)) * 3).astype(dtype)
+    b = (mx.random.normal((2, 8, 5120)) * 40).astype(dtype)
     norm = nn.RMSNorm(5120, eps=1e-6)
-    norm.weight = mx.random.uniform(shape=(5120,)).astype(mx.bfloat16)
+    norm.weight = mx.random.uniform(shape=(5120,)).astype(dtype)
     assert vq._add_rms_eligible(a, b, norm)
     total, normed, sums = vq.add_rms_norm(a, b, norm)
     assert mx.array_equal(total, a + b).item()

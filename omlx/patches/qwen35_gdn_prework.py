@@ -988,15 +988,15 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache.is_speculating
             and 2 <= length <= 9
             and mask is None
-            and inputs.dtype == mx.bfloat16
+            and inputs.dtype in (mx.bfloat16, mx.float16)
             and layer.conv_kernel_size == 4
             and layer.head_k_dim == 128
             and layer.head_v_dim == 128
             and cache.lengths is None
             and cache[0] is not None
             and cache[0].shape[0] == inputs.shape[0]
-            and cache[0].dtype == mx.bfloat16
-            and layer.conv1d.weight.dtype == mx.bfloat16
+            and cache[0].dtype == inputs.dtype
+            and layer.conv1d.weight.dtype == inputs.dtype
             and getattr(layer.conv1d, "bias", None) is None
         ):
             global _VERIFY_REJECT_DIAG
@@ -1010,7 +1010,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                         ("speculating", cache.is_speculating),
                         ("length", 2 <= length <= 9),
                         ("mask", mask is None),
-                        ("inputs_bf16", inputs.dtype == mx.bfloat16),
+                        ("inputs_dtype", inputs.dtype in (mx.bfloat16, mx.float16)),
                         ("conv_kernel", layer.conv_kernel_size == 4),
                         ("dk128", layer.head_k_dim == 128),
                         ("dv128", layer.head_v_dim == 128),
@@ -1019,11 +1019,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                             "c0",
                             cache[0] is not None
                             and cache[0].shape[0] == inputs.shape[0]
-                            and cache[0].dtype == mx.bfloat16,
+                            and cache[0].dtype == inputs.dtype,
                         ),
                         (
                             "conv_w",
-                            layer.conv1d.weight.dtype == mx.bfloat16
+                            layer.conv1d.weight.dtype == inputs.dtype
                             and getattr(layer.conv1d, "bias", None) is None,
                         ),
                     )
@@ -1043,11 +1043,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         )
         inv = layer.head_k_dim**-0.5
         if l2_norm:
-            q_scale = mx.array(inv, dtype=mx.bfloat16)
-            k_scale = mx.array(1.0, dtype=mx.bfloat16)
+            q_scale = mx.array(inv, dtype=inputs.dtype)
+            k_scale = mx.array(1.0, dtype=inputs.dtype)
         else:
-            q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
-            k_scale = mx.array(inv, dtype=mx.bfloat16)
+            q_scale = mx.array(inv * inv, dtype=inputs.dtype)
+            k_scale = mx.array(inv, dtype=inputs.dtype)
         q, k, v, conv_state = gdn_prework_fused(
             mixed_qkv,
             cache[0],
