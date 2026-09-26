@@ -3430,14 +3430,18 @@ async def update_model_settings(
     )
     auto_unloaded = False
     auto_reloaded = False
+    reload_deferred = False
     if requires_reload:
         was_pinned = entry.is_pinned
         try:
             logger.info(
                 f"Settings changed for loaded model {model_id}, auto-unloading."
             )
-            await engine_pool._unload_engine(model_id)
-            auto_unloaded = True
+            # Busy engines (requests, benchmark runs) unload after they drain.
+            auto_unloaded = await engine_pool.request_unload(
+                model_id, reason="settings changed", abort_active=False
+            )
+            reload_deferred = not auto_unloaded
         except Exception as e:
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
@@ -3457,6 +3461,7 @@ async def update_model_settings(
         "requires_reload": requires_reload,
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
+        "reload_deferred": reload_deferred,
     }
 
 
@@ -4035,6 +4040,7 @@ async def _apply_settings_snapshot(
             "requires_reload": False,
             "auto_unloaded": False,
             "auto_reloaded": False,
+            "reload_deferred": False,
         }
     if reset:
         # Metadata the PUT contract does not carry.
@@ -8195,8 +8201,11 @@ async def stream_accuracy_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8504,8 +8513,11 @@ async def stream_context_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8748,8 +8760,11 @@ async def stream_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])

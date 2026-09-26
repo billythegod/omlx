@@ -2787,7 +2787,9 @@ class VLMBatchedEngine(BaseEngine):
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
-        # pass has already run.
+        # pass has already run. Mark unloaded first: the scheduler is no longer
+        # reachable once _engine is cleared.
+        self._loaded = False
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -2812,7 +2814,6 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        self._loaded = False
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

@@ -51,7 +51,12 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
-from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_discovery import (
+    VLM_NATIVE_TEXT_MODEL_TYPES,
+    discover_models,
+    format_size,
+    is_realtime_stt_model,
+)
 from .model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
@@ -195,6 +200,18 @@ def _settled_phys_footprint() -> int:
     """phys_footprint minus freed Metal buffers the kernel still charges."""
     mlx_bytes = int(mx.get_active_memory()) + int(mx.get_cache_memory())
     return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
+
+
+def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
+    while exc is not None:
+        text = str(exc)
+        if (
+            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
+            or "Insufficient Memory" in text
+        ):
+            return True
+        exc = exc.__cause__
+    return False
 
 
 @dataclass
@@ -1566,6 +1583,21 @@ class EnginePool:
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
 
+    @staticmethod
+    def _has_mlx_lm_path(entry: EngineEntry) -> bool:
+        """False for text families that only mlx-vlm implements."""
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        return model_type not in VLM_NATIVE_TEXT_MODEL_TYPES
+
+    def _force_lm_replaces_engine(self, model_id: str) -> bool:
+        """True when ``get_engine(force_lm=True)`` would reload a resident VLM."""
+        entry = self._entries.get(model_id)
+        return (
+            entry is not None
+            and isinstance(entry.engine, VLMBatchedEngine)
+            and self._has_mlx_lm_path(entry)
+        )
+
     def _entry_has_scheduler_work(self, entry: EngineEntry) -> bool:
         """Return True until deferred aborts have actually left the scheduler."""
         scheduler = self._resolve_scheduler_from_engine(entry.engine)
@@ -1678,6 +1710,7 @@ class EnginePool:
             or entry.engine is None
             or not entry.pending_unload_reason
             or entry.is_loading
+            or model_id in self._unloading_models
             or (entry.is_pinned and not entry.pending_unload_allow_pinned)
             or not self._entry_is_quiescent(entry)
         ):
@@ -1744,12 +1777,14 @@ class EnginePool:
         model_id: str,
         *,
         reason: str = "manual unload",
+        abort_active: bool = True,
     ) -> bool:
         """Unload now when idle, otherwise abort and unload after quiescence.
 
         Returns True when the engine was unloaded before this call returned and
         False when teardown was queued. New acquisitions are rejected while the
         pending marker is installed, so the engine can drain deterministically.
+        With ``abort_active=False`` in-flight work and leases finish first.
         """
         async with self._lock:
             entry = self._entries.get(model_id)
@@ -1767,11 +1802,11 @@ class EnginePool:
             self._mark_pending_unload_locked(
                 model_id,
                 reason,
-                abort_requested=True,
+                abort_requested=abort_active,
                 allow_pinned=True,
             )
             abort_all = getattr(entry.engine, "abort_all_requests", None)
-            if callable(abort_all):
+            if abort_active and callable(abort_all):
                 try:
                     await abort_all(
                         reason=(
@@ -1887,6 +1922,10 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        entry = self._entries.get(model_id)
+        if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
+            # The VLM engine is the only text engine for these families.
+            force_lm = False
         ready = self._acquire_loaded_engine(
             model_id, force_lm, _lease, runtime_settings
         )
@@ -3351,7 +3390,7 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm":
+                elif entry.engine_type == "vlm" and self._has_mlx_lm_path(entry):
                     # VLM loading failed -- fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
@@ -3599,6 +3638,25 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if (
+                not entry.abort_loading
+                and not entry_detached
+                and _is_metal_out_of_memory(exc)
+            ):
+                # Depends on what else is resident, so do not cache it: a retry
+                # after memory is freed can succeed with the same files.
+                logger.exception(
+                    "Model load for '%s' ran out of Metal memory", model_id
+                )
+                raise InsufficientMemoryError(
+                    required=resident_size,
+                    current=pre_load_memory,
+                    message=(
+                        f"Model '{model_id}' ran out of GPU memory while "
+                        f"loading: {exc}. Free memory (for example, unload "
+                        "another model) and retry."
+                    ),
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(
