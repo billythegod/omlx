@@ -1260,6 +1260,7 @@ def qwen35_oq_a8_qmm_t(
     act_mode: int = 0,
     variant: int = 800,
     *,
+    packed: bool = False,
     stream=None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
@@ -1274,6 +1275,7 @@ def qwen35_oq_a8_qmm_t(
         bits,
         act_mode,
         variant,
+        packed=packed,
         **_native_stream_kwargs(stream),
     )
 

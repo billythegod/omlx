@@ -114,7 +114,8 @@ std::vector<mx::array> qwen35_oq_a8_quantize(
 
 // INT8 x INT8 -> INT32 GEMM against packed affine Q4/Q5 weights, with the
 // affine correction applied at every GS64 boundary. Output dtype follows
-// `scales`.
+// `scales`. `packed` reads Q4 weights and metadata in the PackedLinear tile
+// layout instead of row-major weights and [K/64, N] metadata.
 mx::array qwen35_oq_a8_qmm_t(
     const mx::array& qa,
     const mx::array& sa,
@@ -125,6 +126,7 @@ mx::array qwen35_oq_a8_qmm_t(
     int bits,
     int act_mode = 0,
     int variant = 800,
+    bool packed = false,
     mx::StreamOrDevice s = {});
 
 // Test helper: unpack Q4/Q5 codes to INT8 [N, group_count * 64]. Production
