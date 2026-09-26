@@ -2,8 +2,10 @@
 """Fail-closed validation of the model stage loaded by a cluster rank."""
 
 import contextlib
+import inspect
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,7 +15,9 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+import mlx_lm.server as mlx_server
 import pytest
+from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START
 
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
@@ -399,6 +403,33 @@ def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
     assert server.pipeline is True
 
     assert _server_arguments(args, tensor_parallel_size=2).pipeline is False
+
+
+def test_server_arguments_cover_every_cli_arg_mlx_lm_server_reads():
+    # A missing attribute kills the rank's generation thread on its first
+    # request, long after the model loaded.
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "org/model",
+            "--backend",
+            "ring",
+            "--port",
+            "32000",
+            "--deployment-id",
+            "dep",
+            "--plan-hash",
+            "a" * 64,
+            "--plan",
+            "{}",
+        ]
+    )
+    server = _server_arguments(args)
+    read = set(re.findall(r"cli_args\.(\w+)", inspect.getsource(mlx_server)))
+
+    assert read - set(vars(server)) == set()
+    assert server.kv_bits is None
+    assert server.quantized_kv_start == DEFAULT_QUANTIZED_KV_START
 
 
 # ---------------------------------------------------------------------------

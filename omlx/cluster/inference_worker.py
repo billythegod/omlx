@@ -469,6 +469,11 @@ def _server_arguments(
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_kv_size=args.max_kv_size,
+        # MLX-LM CLI defaults. kv_bits=None keeps KV quantization off and
+        # the generator batchable.
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=5000,
     )
 
 
