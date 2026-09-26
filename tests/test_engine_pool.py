@@ -4436,6 +4436,34 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
 
+    @pytest.mark.asyncio
+    async def test_dynamic_ceiling_is_reread_before_refusing(
+        self, small_mock_model_dir
+    ):
+        """Right after an unload the freed pages are not yet on the free
+        list, so the first dynamic read is low; the load must not fail."""
+        pool = self._pool_with_enforcer(
+            small_mock_model_dir,
+            static=12_000,
+            dynamic=700,
+            metal_cap=12_000,
+            tier="aggressive",
+        )
+        reads = iter([700, 700])
+        pool._get_final_ceiling = lambda: next(reads, 12_000)
+
+        class _Admitted(Exception):
+            pass
+
+        with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch.object(pool, "_load_engine", AsyncMock(side_effect=_Admitted)),
+            pytest.raises(_Admitted),
+        ):
+            await pool.get_engine("model-a")
+
 
 @pytest.mark.parametrize(
     "ple_enabled,ceiling,expected,forced",

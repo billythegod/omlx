@@ -186,6 +186,11 @@ def _qwen35_cpu_share_estimated_bytes(
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
 
 
+# Re-reads of a dynamic-bound ceiling before a load is refused (1s in total).
+_ADMISSION_CEILING_RECHECKS = 4
+_ADMISSION_CEILING_RECHECK_S = 0.25
+
+
 def _settled_phys_footprint() -> int:
     """phys_footprint minus freed Metal buffers the kernel still charges."""
     mlx_bytes = int(mx.get_active_memory()) + int(mx.get_cache_memory())
@@ -768,6 +773,24 @@ class EnginePool:
             return int(cb())
         except Exception:  # noqa: BLE001
             return 0
+
+    def _dynamic_ceiling_binds(self) -> bool:
+        """Whether the free-memory-derived ceiling is the binding component."""
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        getter = getattr(enforcer, "get_ceiling_breakdown", None)
+        if not callable(getter):
+            return False
+        if getattr(enforcer, "memory_guard_tier", "") == "custom":
+            return False
+        try:
+            breakdown = getter()
+            dynamic = int(breakdown["dynamic"])
+            others = [
+                int(breakdown[k]) for k in ("static", "metal_cap") if breakdown[k] > 0
+            ]
+        except Exception:  # noqa: BLE001
+            return False
+        return 0 < dynamic < min(others, default=dynamic + 1)
 
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
@@ -2000,6 +2023,7 @@ class EnginePool:
                 soft_target = self._admission_soft_target()
                 evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
+                ceiling_rechecks = 0
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -2090,6 +2114,23 @@ class EnginePool:
                             f"evict; the system may swap heavily."
                         )
                         break
+
+                    if (
+                        ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                        and self._dynamic_ceiling_binds()
+                    ):
+                        # Pages of a model unloaded just before this load
+                        # reach the free list up to ~0.2s after the process
+                        # footprint drops, so the dynamic ceiling can read
+                        # low for that long. Re-read it before refusing.
+                        ceiling_rechecks += 1
+                        await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
+                        ceiling = max(ceiling, self._current_ceiling())
+                        soft_target = max(soft_target, self._admission_soft_target())
+                        evict_target = (
+                            min(soft_target, ceiling) if soft_target > 0 else ceiling
+                        )
+                        continue
 
                     # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
