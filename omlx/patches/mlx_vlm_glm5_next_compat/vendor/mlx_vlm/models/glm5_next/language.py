@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -14,6 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, CacheList, KVCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from mlx_lm.models.mla import MultiLinear
+from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
@@ -30,11 +30,6 @@ from .linear import fused_quantized_matmul, linear_forward
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
-
-# Prefill rows whose DSA selection is provably the full causal prefix skip
-# the indexer top-k and run dense causal SDPA (see _dense_prefix_rows).
-_DENSE_PREFIX_BYPASS = os.environ.get("OMLX_GLM53_DENSE_PREFIX", "1") != "0"
-_KDA_PREFILL_FUSED = os.environ.get("OMLX_GLM53_KDA_PREFILL_FUSED", "1") != "0"
 
 
 def _cache_parts(cache):
@@ -228,14 +223,8 @@ class Glm5NextLinearAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        if _KDA_PREFILL_FUSED and B == 1 and mask is None and S >= 64:
-            from omlx.patches.glm53_kda_prework import (
-                glm53_kda_prefill,
-                glm53_kda_prefill_eligible,
-            )
-
-            if glm53_kda_prefill_eligible(self, inputs, mask, cache):
-                return glm53_kda_prefill(self, inputs, cache)
+        if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
+            return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]
@@ -616,23 +605,25 @@ class Glm5NextSparseAttention(nn.Module):
         return min(length, max(0, boundary - past_len)), past_len
 
     def _dense_flat(self, q, kv_latent, mask, rows, past_len):
-        """Dense causal attention over the first ``rows`` rows, in latent space.
+        """Dense causal attention over the first ``rows`` rows.
 
-        The NoPE MLA ties q/k through ``embed_q``, so the latent-space dot
-        reproduces the per-head scores with one KV head instead of expanding
-        every cached key and value into all heads.
+        Uses the expanded per-head K/V of the short-context path. The fused
+        SDPA kernel has no 512-wide head, so latent-space SDPA would
+        materialize the full score matrix.
         """
-        q_rows = self.embed_q(q[:, :, :rows])
-        k_rows = kv_latent[:, :, : past_len + rows]
-        if k_rows.dtype != q_rows.dtype:
-            k_rows = k_rows.astype(q_rows.dtype)
+        kv_rows = kv_latent[:, :, : past_len + rows]
+        k = self.embed_q(kv_rows, transpose=False)
+        v = self.unembed_out(kv_rows)
+        q_rows = q[:, :, :rows]
+        if k.dtype != q_rows.dtype:
+            k = k.astype(q_rows.dtype)
+            v = v.astype(q_rows.dtype)
         dense_mask = (
             "causal" if mask is None else mask[..., :rows, : past_len + rows]
         )
         out = mx.fast.scaled_dot_product_attention(
-            q_rows, k_rows, k_rows, scale=self.scale, mask=dense_mask
+            q_rows, k, v, scale=self.scale, mask=dense_mask
         )
-        out = self.unembed_out(out)
         return out.transpose(0, 2, 1, 3).reshape(q.shape[0], rows, -1)
 
     def _finish(self, flat, out_dense):
@@ -647,7 +638,7 @@ class Glm5NextSparseAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         length = x.shape[1]
-        if _DENSE_PREFIX_BYPASS and length > 8:
+        if length > 8:
             dense_rows, past_len = self._dense_prefix_rows(length, mask, cache)
             if dense_rows:
                 return self._forward(x, mask, cache, dense_rows, past_len)
@@ -691,7 +682,7 @@ class Glm5NextSparseAttention(nn.Module):
         out_dense = None
         if dense_rows and topk_indices is not None:
             # The leading rows' selection was the causal prefix: dense SDPA over
-            # the latent prefix, with the indexer scoring only the tail rows.
+            # the prefix, with the indexer scoring only the tail rows.
             # When the indexer bypasses selection for the whole forward, keep
             # the pre-existing all-rows path and drop the dense split entirely.
             out_dense = self._dense_flat(q, kv_latent, mask, dense_rows, past_len)

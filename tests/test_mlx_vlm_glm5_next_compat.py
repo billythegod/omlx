@@ -930,6 +930,9 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     monkeypatch.setattr(lang, "sparse_mla_attention", spy_sma)
     monkeypatch.setattr(lang, "exact_block_token_attention", spy_eba)
     monkeypatch.setattr(lang, "q8_vup_flat", lambda *a, **k: None)
+    # Keep every row on the mocked native routes; the dense prefix would add
+    # a real FP32 attention pass over 2051 rows.
+    monkeypatch.setattr(attn, "_dense_prefix_rows", lambda *args: (0, 0))
 
     x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
@@ -1125,11 +1128,12 @@ def test_dense_prefix_bypass_matches_reference(monkeypatch):
     prompt = mx.arange(13, dtype=mx.int32)[None] + 1
     attention = model.model.layers[1].self_attn
 
-    monkeypatch.setattr(language, "_DENSE_PREFIX_BYPASS", False)
+    dense_prefix_rows = attention._dense_prefix_rows
+    monkeypatch.setattr(attention, "_dense_prefix_rows", lambda *args: (0, 0))
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
 
-    monkeypatch.setattr(language, "_DENSE_PREFIX_BYPASS", True)
+    monkeypatch.setattr(attention, "_dense_prefix_rows", dense_prefix_rows)
     engaged = []
     original_dense = attention._dense_flat
 
@@ -1336,17 +1340,17 @@ def _kda_model(seed: int):
 def test_kda_fused_prefill_matches_stock(monkeypatch):
     from omlx.patches import glm53_kda_prework as kda
 
-    model, language = _kda_model(77)
+    model = _kda_model(77)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
     mx.eval(reference)
     ref_conv = [cache[0] for cache in reference_cache]
     ref_state = [cache[1] for cache in reference_cache]
 
-    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", True)
+    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -1430,7 +1434,9 @@ def test_kda_prefill_eligibility_gating(monkeypatch):
     fused_cache = model.make_cache()[0]
     out_fused = glm53_kda_prefill(layer, inputs, fused_cache)
     stock_cache = model.make_cache()[0]
-    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    monkeypatch.setattr(
+        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
+    )
     out_stock = layer(inputs, None, stock_cache)
     mx.eval(out_fused, out_stock)
     assert mx.allclose(out_fused, out_stock, atol=3e-4, rtol=3e-4).item()
@@ -1454,11 +1460,11 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
     model = _kda_model(80)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", False)
+    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
 
-    monkeypatch.setattr(language, "_KDA_PREFILL_FUSED", True)
+    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
     engaged = []
     original = kda.glm53_kda_prefill
 
