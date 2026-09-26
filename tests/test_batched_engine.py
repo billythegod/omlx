@@ -1094,7 +1094,6 @@ class TestBatchedEngineMoeOffloadWiring:
 
     Admission prices the draft head as resident when MTP is on, so the wrapper
     must keep it resident on this path too (the VLM engine already does).
-    Test adapted from @sje397's #3946.
     """
 
     @pytest.mark.asyncio

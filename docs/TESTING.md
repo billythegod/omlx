@@ -120,7 +120,8 @@ save/reopen payload and speculative-decoding toggle exclusion.
 
 `tests/test_moe_expert_offload.py` also exercises Qwen4-Exp MoE routing with
 512 experts, top-k 10, 64 resident slots, shared experts, and repeated
-evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
+evictions, plus the resident Lightning MTP head (`mtp.*`) and its admission
+pricing. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
 
