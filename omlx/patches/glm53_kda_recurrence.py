@@ -21,7 +21,7 @@ over the 8 segments. That is ``gated_delta_kernel``'s per-step math with a
 different fp32 summation order of the two dots, and the same order in both
 kernels, so they are bit-identical to each other.
 
-* Per-core (default): the H*128 value rows are split into one contiguous
+* Per-core (default on NAX hosts): the H*128 value rows are split into one contiguous
   range per GPU core (~102 rows on an 80-core M5 Ultra), so every core runs
   one threadgroup with the same amount of work; a range may cross a head
   boundary, and its threadgroup then stages k, q, gate and beta for both
@@ -31,9 +31,10 @@ kernels, so they are bit-identical to each other.
   reduce-scatter with the same pairing tree, so bit-identical) after the next
   step's decay and k.S FMAs.
 * Blocked (``RecurrenceConfig``): 64 value rows per threadgroup, two rows per
-  8 lanes, two threadgroups per head, 16-token blocks. Also the fallback when
-  the GPU core count is unknown, a core would get more than 128 rows, or the
-  dtype is not 16-bit.
+  8 lanes, two threadgroups per head, 16-token blocks. The default on hosts
+  without NAX (per-core measured ~1.5x slower on an 80-core M3 Ultra), and
+  the fallback when the GPU core count is unknown, a core would get more
+  than 128 rows, or the dtype is not 16-bit.
 
 ``OMLX_GLM53_KDA_RECURRENCE=blocked`` selects the blocked kernel.
 """
@@ -47,6 +48,8 @@ import subprocess
 from typing import NamedTuple, Optional, Tuple
 
 import mlx.core as mx
+
+from omlx.custom_kernels.nax import is_nax_available
 
 
 class RecurrenceConfig(NamedTuple):
@@ -731,7 +734,7 @@ def kda_recurrence(
     [B, H, 128, 128] fp32. Returns y [B, T, H, 128] (q.dtype) and the fp32
     state, like ``gated_delta_update(..., lower_bound=lower_bound)``.
 
-    ``config``: None (per-core kernel when covered, else blocked), a
+    ``config``: None (per-core on NAX hosts when covered, else blocked), a
     ``PerCoreConfig`` or a ``RecurrenceConfig`` (blocked kernel).
     """
     Dk, Dv = q.shape[-1], v.shape[-1]
@@ -739,7 +742,7 @@ def kda_recurrence(
         raise ValueError("kda_recurrence needs 128-wide heads")
     if isinstance(config, RecurrenceConfig):
         return _blocked(q, k, v, a, beta, a_log, dt_bias, lower_bound, state, config)
-    if config is None and _IMPL == "blocked":
+    if config is None and not _PERCORE_DEFAULT:
         return _blocked(q, k, v, a, beta, a_log, dt_bias, lower_bound, state, DEFAULT_CONFIG)
     out = _percore(
         q, k, v, a, beta, a_log, dt_bias, lower_bound, state, config or PerCoreConfig()
@@ -749,8 +752,11 @@ def kda_recurrence(
     return out
 
 
-_IMPL = os.environ.get("OMLX_GLM53_KDA_RECURRENCE", "percore")
-if _IMPL != "blocked":
+_PERCORE_DEFAULT = (
+    os.environ.get("OMLX_GLM53_KDA_RECURRENCE", "percore") != "blocked"
+    and is_nax_available()
+)
+if _PERCORE_DEFAULT:
     # Resolve the core count (~20 ms ioreg call) at import, i.e. at model
     # load, rather than inside the first prefill.
     gpu_core_count()

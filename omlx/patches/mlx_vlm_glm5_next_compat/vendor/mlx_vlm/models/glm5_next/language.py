@@ -43,14 +43,8 @@ logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
 
 
-def _dense_row_blocks() -> int:
-    """Causal row blocks of the dense-prefix attention (1 = one call)."""
-    import os
-
-    return max(1, int(os.environ.get("OMLX_GLM5_DENSE_ROW_BLOCKS", "8") or 1))
-
-
-_DENSE_ROW_BLOCKS = _dense_row_blocks()
+# Causal row blocks of the dense-prefix attention (1 = one call).
+_DENSE_ROW_BLOCKS = 8
 
 
 def _cache_parts(cache):

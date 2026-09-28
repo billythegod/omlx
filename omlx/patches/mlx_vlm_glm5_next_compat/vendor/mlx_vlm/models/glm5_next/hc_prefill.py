@@ -26,7 +26,8 @@ arithmetic of mlx-vlm's short-block ``exact_hc_expand`` (one fp32 8x8
 simdgroup product per column tile, then a separately rounded
 ``post * branch`` product and one add) and writes bf16 once.
 
-Both fail closed (return None) and the caller keeps the canonical path.
+Both fail closed (return None, and stay off after the first failure) and the
+caller keeps the canonical path.
 Disable with OMLX_GLM_HC_PREFILL=0.
 """
 
@@ -55,7 +56,6 @@ _ROWS = 16
 _THREADS = 1024
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
-_FAILURE_LOGGED = False
 
 _HEADER = r"""
 #include <metal_simdgroup>
@@ -398,9 +398,10 @@ def pre_compatible(connection, x) -> bool:
 
 
 def _report_failure(exc):
-    global _FAILURE_LOGGED
-    if not _FAILURE_LOGGED:
-        _FAILURE_LOGGED = True
+    # Latch off: a persistent failure would otherwise rebuild and sync per call.
+    global _DISABLED
+    if not _DISABLED:
+        _DISABLED = True
         logger.warning(
             "GLM fused prefill hyper-connection kernels failed closed; using "
             "the canonical path: %s",

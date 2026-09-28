@@ -540,45 +540,6 @@ class _CacheFreshnessWait:
     deadline_s: float
 
 
-# GLM-5.3 prefill chunk on NAX (M5) hosts that run the DSA sparse attention
-# on the tensor units: its cost per query no longer depends on the chunk, so
-# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra,
-# stock mlx: 4096 is +3-6% over 2048, 8192 another +2-6% at 16k-64k prompts
-# for ~2 GB more peak memory). Hosts below 128 GB keep 4096-token chunks.
-_GLM5_NAX_PREFILL_STEP = 8192
-_GLM5_NAX_PREFILL_STEP_SMALL_HOST = 4096
-
-
-def _glm5_next_nax_prefill_step() -> int:
-    """Prefill floor for GLM-5.3 on NAX hosts (0 keeps the default step).
-
-    Needs the tensor-unit sparse MLA path; the paged-cache block follows the
-    floor, so larger blocks also make prefix-cache reuse coarser.
-    OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step, e.g.
-    4096 for finer prefix-cache blocks and a lower activation peak).
-    """
-    raw = os.environ.get("OMLX_GLM5_PREFILL_STEP", "").strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            logger.warning("Ignoring invalid OMLX_GLM5_PREFILL_STEP=%r", raw)
-    try:
-        from .custom_kernels.nax import is_nax_available
-        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
-        from .settings import get_system_memory
-    except ImportError:
-        return 0
-    if not (is_nax_available() and nax_sparse_mla_available()):
-        return 0
-    memory = get_system_memory()
-    if memory >= 128 * 1024**3:
-        return _GLM5_NAX_PREFILL_STEP
-    if memory >= 64 * 1024**3:
-        return _GLM5_NAX_PREFILL_STEP_SMALL_HOST
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Monkey-patch GenerationBatch._step to feed grammar processors the token
 # that was sampled from their bitmask.  In the pipelined _step(), logits
@@ -2965,15 +2926,21 @@ class Scheduler:
                     "glm_dsa_sparse_mla_attention"
                 ):
                     return 0
-                glm_step = _glm5_next_nax_prefill_step()
-                if glm_step:
-                    return glm_step
             if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
+                from .patches.glm_moe_dsa.sparse_mla_nax import (
+                    nax_sparse_mla_available,
+                )
                 from .settings import get_system_memory
 
-                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Keep the default chunk size on NAX hosts.
+                if get_system_memory() < 64 * 1024**3:
+                    return 0
+                if not is_nax_available():
+                    return 4096
+                # NAX hosts keep the default chunk, except GLM-5.3 with the
+                # tensor-unit sparse MLA: its attention cost per query does not
+                # depend on the chunk, so a wider chunk feeds the MoE more rows.
+                if is_glm5_next and nax_sparse_mla_available():
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)

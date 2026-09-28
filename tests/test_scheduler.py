@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import sys
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -4152,36 +4153,14 @@ class TestSchedulerArraysCacheBlockAlignment:
             scheduler.shutdown()
 
     @pytest.mark.parametrize(
-        ("nax_sparse_mla", "env", "memory_gb", "expected"),
-        [
-            (True, None, 256, 8192),
-            (True, None, 96, 4096),
-            (True, None, 48, 0),
-            (False, None, 256, 0),
-            (True, "0", 256, 0),
-            (True, "4096", 256, 4096),
-            (False, "8192", 256, 8192),
-        ],
+        ("nax_sparse_mla", "memory_gb", "expected"),
+        [(True, 256, 4096), (True, 96, 4096), (True, 48, 0), (False, 256, 0)],
     )
     def test_glm5_next_nax_host_prefill_step(
-        self,
-        mock_tokenizer,
-        tmp_path,
-        monkeypatch,
-        nax_sparse_mla,
-        env,
-        memory_gb,
-        expected,
+        self, mock_tokenizer, tmp_path, nax_sparse_mla, memory_gb, expected
     ):
-        """On NAX hosts GLM-5.3 takes 8192-token chunks (and blocks) when the
-        tensor-unit sparse MLA path is available (4096 below 128 GB);
-        OMLX_GLM5_PREFILL_STEP overrides the step (0 keeps the default)."""
-        import sys
-
-        if env is None:
-            monkeypatch.delenv("OMLX_GLM5_PREFILL_STEP", raising=False)
-        else:
-            monkeypatch.setenv("OMLX_GLM5_PREFILL_STEP", env)
+        """On NAX hosts GLM-5.3 takes 4096-token chunks (and blocks) when the
+        tensor-unit sparse MLA path is available."""
         fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
         with (
             patch.dict(
