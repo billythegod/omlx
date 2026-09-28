@@ -10,6 +10,7 @@ import time
 import weakref
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock, RLock
@@ -1090,6 +1091,18 @@ _EAGER_DISPATCH_EVERY = _eager_dispatch_every()
 _EAGER_DISPATCH_WARMUP = 6
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
 _GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
+# Row-exact Lightning MTP verify rows on the masked QSA arm score and select
+# blocks and run SDPA per row with the serial decode kernels
+# (OMLX_QWEN4_QSA_MASKED_VERIFY=0 keeps the multi-row mask and MLX SDPA).
+_MASKED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_MASKED_VERIFY")
+# Lightning MTP one-row windows (the activation step, depth-0 cycles) have no
+# draft to reject, so they run the serial decode step itself rather than a
+# verify forward (OMLX_QWEN4_MTP_ONE_ROW_DECODE=0 keeps the verify forward).
+_ONE_ROW_MTP_DECODE_DISABLED = not env_enabled("OMLX_QWEN4_MTP_ONE_ROW_DECODE")
+# Set while such a step runs: a verify forward never feeds prompt priming.
+_MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
+    "omlx_qwen4_mtp_one_row_step", default=False
+)
 # Attention/indexer norms keep their FP32 1 + weight scale between calls
 # (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
 _NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
@@ -1329,7 +1342,6 @@ class Qwen4ExpQSAIndexer(nn.Module):
             return None
 
         query = self._apply_rope(query, position_ids)
-        complete_key_len = max_complete_blocks * self.compress_ratio
         if cache is not None and hasattr(cache, "pooled_indexer_keys"):
             pooled_keys = cache.pooled_indexer_keys(
                 self.compress_ratio,
@@ -1353,19 +1365,37 @@ class Qwen4ExpQSAIndexer(nn.Module):
             0, 1, 3, 2
         )
         if batch == 1 and seq_len == 1 and past_len == key_len - 1:
-            # Aligned one-row decode: every complete block is causal and the
-            # sparse arm is active, so the mask is the winning blocks plus the
-            # incomplete tail -- one launch for the ops below.
-            decode_mask = decode_block_selection_mask(
-                scores,
-                head_dim=self.head_dim,
-                key_tokens=key_len,
-                compress_ratio=self.compress_ratio,
-                block_topk=self.block_topk,
-            )
-            if decode_mask is not None:
-                return decode_mask
+            return self.aligned_row_mask(scores, key_len)
+        return self._selection_mask(scores, past_len, key_len, max_complete_blocks)
 
+    def aligned_row_mask(self, scores: mx.array, key_len: int) -> mx.array:
+        """Token mask of one batch-one row whose query is the last of its
+        ``key_len`` keys, from its FP32 head scores ``[1, heads, 1, blocks]``."""
+        # Every complete block is causal and the sparse arm is active, so the
+        # mask is the winning blocks plus the incomplete tail -- one launch
+        # for the ops of _selection_mask.
+        decode_mask = decode_block_selection_mask(
+            scores,
+            head_dim=self.head_dim,
+            key_tokens=key_len,
+            compress_ratio=self.compress_ratio,
+            block_topk=self.block_topk,
+        )
+        if decode_mask is not None:
+            return decode_mask
+        return self._selection_mask(
+            scores, key_len - 1, key_len, key_len // self.compress_ratio
+        )
+
+    def _selection_mask(
+        self,
+        scores: mx.array,
+        past_len: int,
+        key_len: int,
+        max_complete_blocks: int,
+    ) -> mx.array:
+        batch, _, seq_len, _ = scores.shape
+        complete_key_len = max_complete_blocks * self.compress_ratio
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
@@ -1902,6 +1932,126 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
 
+    def _row_exact_masked_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Multi-row row-exact verify windows whose serial decode steps all take
+        the masked QSA arm (``_masked_decode``): past the block budget from the
+        first row on, positions the gathered arms above do not take. One-row
+        windows keep the path below, which already selects with the decode
+        kernel and runs MLX's SDPA (same bits, faster below ~16K keys)."""
+
+        if _MASKED_VERIFY_DISABLED or not (target_verify and _row_exact_verify_armed()):
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] > 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+        ):
+            return False
+        index_keys = cache.index_keys
+        index_positions = cache.index_position_ids
+        if (
+            index_keys is None
+            or index_positions is None
+            or index_keys.shape[1] != cache.offset
+            or index_positions.shape[-1] != cache.offset
+        ):
+            return False
+        indexer = self.indexer
+        return (cache.offset + 1) // indexer.compress_ratio > indexer.block_topk
+
+    def _row_exact_masked_verify(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array:
+        """Attend every verify row exactly as its serial ``_masked_decode`` step.
+
+        Projections, norms, RoPE and the cache appends cover all rows at once
+        (per-row arithmetic already). Each row then scores its own completed
+        blocks as a one-row product -- the multi-row product is a GEMM whose
+        FP32 sums round differently -- selects them with the decode kernel and
+        runs the selected-keys decode SDPA over its causal prefix.
+        """
+
+        from ..qwen3_5 import language as q35_language
+
+        batch, length, _ = x.shape
+        indexer = self.indexer
+        past_len = cache.offset
+        # The indexer half of ``indexer.from_projected`` for all rows.
+        projected = _target_verify_linear(indexer.index_qk_proj, x).reshape(
+            batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim
+        )
+        index_queries = indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
+            0, 2, 1, 3
+        )
+        index_positions = (
+            position_ids
+            if position_ids is not None
+            else indexer._default_position_ids(batch, past_len, length)
+        )
+        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
+        index_queries = indexer._apply_rope(index_queries, index_positions)
+        pooled_keys = mx.expand_dims(
+            cache.pooled_indexer_keys(
+                indexer.compress_ratio,
+                indexer.k_layernorm,
+                indexer._apply_rope,
+                cache_tag=indexer,
+            ),
+            axis=1,
+        ).astype(mx.float32)
+
+        q_proj_output, keys, values = _VERIFIER._linears(
+            (self.q_proj, self.k_proj, self.v_proj), x
+        )
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, None, None
+        )
+
+        outputs = []
+        for row in range(length):
+            key_tokens = past_len + row + 1
+            blocks = key_tokens // indexer.compress_ratio
+            # A contiguous one-row FP32 query, as the serial step builds it: a
+            # strided row view takes another matmul kernel (other FP32 sums).
+            scores = index_queries[:, :, row : row + 1].astype(mx.float32) @ pooled_keys[
+                :, :, :blocks
+            ].transpose(0, 1, 3, 2)
+            row_mask = indexer.aligned_row_mask(scores, key_tokens)
+            row_queries = queries[:, :, row : row + 1]
+            row_keys = keys[..., :key_tokens, :]
+            row_values = values[..., :key_tokens, :]
+            output = masked_decode_sdpa(
+                row_queries, row_keys, row_values, row_mask, self.scale
+            )
+            if output is None:
+                output = q35_language.scaled_dot_product_attention(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=row_mask,
+                )
+            outputs.append(output)
+        output = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3)
+        output = output.reshape(batch, length, -1)
+        return _VERIFIER._linear(self.o_proj, output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -1956,6 +2106,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return self._gathered_text_prefill(
                 x, cache, position_ids, target_verify=True
             )
+
+        if self._row_exact_masked_verify_eligible(
+            x, mask, cache, position_embeddings, target_verify
+        ):
+            cache._omlx_last_prefill_gathered = False
+            return self._row_exact_masked_verify(x, cache, position_ids)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
@@ -3570,7 +3726,7 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states, target_verify=target_verify, write=write
             )
 
-        if inputs_embeds is None and gdn_sink is None:
+        if inputs_embeds is None and gdn_sink is None and not _MTP_ONE_ROW_STEP.get():
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -3769,11 +3925,20 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        one_row_step = (
+            mtp_capture
+            and not _ONE_ROW_MTP_DECODE_DISABLED
+            and inputs_embeds is None
+            and tuple(inputs.shape) == (1, 1)
+            and cache is not None
+            and not any(getattr(c, "_speculation", None) is not None for c in cache)
+        )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture
+            if mtp_capture and not one_row_step
             else None
         )
+        step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if mtp_capture and output.hidden_states:
@@ -3784,6 +3949,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+        finally:
+            if step is not None:
+                _MTP_ONE_ROW_STEP.reset(step)
 
     def ple_gathers_ahead(self) -> bool:
         """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
