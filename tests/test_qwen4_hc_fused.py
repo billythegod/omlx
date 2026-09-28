@@ -265,6 +265,14 @@ def test_compatible_fails_closed():
     del module.input_inject_weight
     module.input_mix_weight_down = nn.Linear(WIDTH, LOWRANK, bias=False)
     assert not hc_fused.compatible(module, ok)
+    # The layout verdict is cached per module; replacing a weight tensor must re-check it.
+    module = _module(4)
+    if mx.metal.is_available():
+        assert hc_fused.compatible(module, ok)
+    module.input_mix_weight_up.scales = module.input_mix_weight_up.scales.astype(
+        mx.float16
+    )
+    assert not hc_fused.compatible(module, ok)
 
 
 def test_kill_switch_disables_fused_path(monkeypatch):
@@ -274,6 +282,7 @@ def test_kill_switch_disables_fused_path(monkeypatch):
     reloaded = importlib.reload(hc_fused)
     try:
         assert not reloaded.enabled()
+        assert not reloaded.write_enabled()
         assert not reloaded.compatible(
             _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
         )
@@ -386,24 +395,173 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
     assert max_ulps <= 16 and mean_ulps <= 0.5
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_prefill_pending_write_matches_eager_write():
-    from mlx_vlm.models.qwen4_exp import hc_fused, language
+# The prefill tail/inject arithmetic as originally shipped: one row per threadgroup, the
+# normed row read from device memory for both the mix and the inject dot. Kernel changes
+# must keep these bits (prefix caches and accuracy baselines depend on them).
+_REFERENCE_TAIL_INJECT = r"""
+    const uint row = threadgroup_position_in_grid.z;
+    const uint t = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const device T* up_r = up + (size_t)row * K;
+    const device T* xn_r = xn + (size_t)row * K;
+    for (int h = int(t); h < H; h += 256) {
+        float acc = 0.0f;
+        for (int s = 0; s < HC; ++s) {
+            const int n = s * H + h;
+            const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
+            const T p = T(float(g) * float(xn_r[n]));
+            acc = s == 0 ? float(p) : float(T(acc + float(p)));
+        }
+        mixed[(size_t)row * H + h] = T(acc * (1.0f / float(HC)));
+    }
+    constexpr int PF = hc_pack_factor<BITS_I>();
+    constexpr int BP = hc_bytes_per_pack<BITS_I>();
+    constexpr int ROW_BYTES = K * BP / PF;
+    constexpr int GROUPS = K / 64;
+    constexpr int PER = K / 256;
+    float res[HC] = {0.0f};
+    float xv[PF];
+    const int e0 = int(t) * PER;
+    for (int e = e0; e < e0 + PER; e += PF) {
+        const float sum = hc_load_vector<T, PF, BITS_I>(xn_r + e, xv);
+        const int g = e / 64;
+        for (int r = 0; r < HC; ++r) {
+            res[r] += hc_qdot<PF, BITS_I>(
+                (const device uint8_t*)inject_w + r * ROW_BYTES + e * BP / PF,
+                xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
+                sum);
+        }
+    }
+    threadgroup float part[HC][8];
+    for (int r = 0; r < HC; ++r) {
+        const float v = simd_sum(res[r]);
+        if (lane == 0) part[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < HC) {
+        float v = 0.0f;
+        for (int i = 0; i < 8; ++i) v += part[t][i];
+        const float q = float(T(float(T(v)) / float(HC)));
+        const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
+        inj[(size_t)row * HC + t] = T(2.0f * gate);
+    }
+"""
 
-    mx.random.seed(11)
-    rows = hc_fused.MAX_ROWS + 1
-    module = _module(4)
-    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
-    branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
-    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
-    written = language._hc_write(hyper, branch, gate)
-    expected = hc_fused.prefill_forward(module, written)
-    actual = hc_fused.prefill_forward(module, hyper, (branch, gate))
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("rows,seed", [(17, 0), (300, 1), (300, 2)])
+def test_prefill_tail_inject_keeps_reference_bits(bits, rows, seed):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(900 + seed * 10 + bits)
+    module = _module(bits)
+    inject = module.block_inject_weight
+    up = (mx.random.normal((rows, WIDTH)) * 3).astype(mx.bfloat16)
+    normed = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
+
+    def run(name, source, header):
+        return hc_fused._kernel(
+            name,
+            ["up", "xn", "inject_w", "inject_s", "inject_b"],
+            ["mixed", "inj"],
+            source,
+            header=header,
+        )(
+            inputs=[up, normed, inject.weight, inject.scales, inject.biases],
+            template=[
+                ("T", mx.bfloat16),
+                ("BITS_I", bits),
+                ("K", WIDTH),
+                ("H", HIDDEN),
+                ("HC", HC),
+            ],
+            grid=(256, 1, rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HC)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16],
+        )
+
+    expected = run(
+        "test_reference_tail_inject", _REFERENCE_TAIL_INJECT, hc_fused._HEADER
+    )
+    actual = run(
+        "omlx_qwen4_hc_prefill_tail_inject",
+        hc_fused._TI_SOURCE,
+        hc_fused._HEADER + hc_fused._TG_HEADER,
+    )
     mx.eval(expected, actual)
     for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed.view(mx.uint16), reference.view(mx.uint16)).item()
+
+
+def test_prefill_activation_rounds_like_eager_ops():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(5)
+    special = mx.array(
+        [0.0, -0.0, 1e-40, -1e-40, 3e38, -3e38, float("inf"), -float("inf"), float("nan")]
+    )
+    for scale in (1e-38, 1e-3, 1.0, 40.0, 1e5):
+        y = mx.concatenate([mx.random.normal((4096,)) * scale, special]).astype(
+            mx.bfloat16
+        ).reshape(1, -1, 1)
+        expected = nn.silu(y / HC)
+        actual = hc_fused._act(HC)(y)
+        mx.eval(expected, actual)
+        assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize(
+    "shape", [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 16), (1, 17), (1, 2048)]
+)
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_pending_write_matches_eager_write(bits, shape, use_combine):
+    """The write-norm kernels store the eager residual bit for bit and normalize the same bits."""
+    from mlx_vlm.models.qwen4_exp import hc_fused, language
+
+    mx.random.seed(11 + 31 * bits + 7 * shape[0] + shape[1])
+    module = _module(bits, use_combine)
+    hyper = (mx.random.normal((*shape, WIDTH)) * 2).astype(mx.bfloat16)
+    branch = mx.random.normal((*shape, HIDDEN)).astype(mx.bfloat16)
+    gate = (2 * mx.sigmoid(mx.random.normal((*shape, HC)))).astype(mx.bfloat16)
+    written = language._hc_write(hyper, branch, gate)
+    decode = shape[0] * shape[1] <= hc_fused.MAX_ROWS
+    forward = hc_fused.fused_forward if decode else hc_fused.prefill_forward
+    expected = forward(module, written)
+    actual = forward(module, hyper, (branch, gate))
+    expected = (
+        (expected[0], written, expected[2]) if use_combine else (expected, written)
+    )
+    assert actual is not None and len(actual) == len(expected)
+    mx.eval(actual, expected)
+    for observed, reference in zip(actual, expected):
+        assert observed.shape == reference.shape
         assert mx.array_equal(
             observed.view(mx.uint16), reference.view(mx.uint16)
         ).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 64])
+def test_promoting_pending_write_falls_back_to_eager_write(rows):
+    # An FP32 branch promotes the eager write; the BF16 kernels must not take it.
+    from mlx_vlm.models.qwen4_exp import language
+
+    mx.random.seed(rows)
+    module = _module(6)
+    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    branch = mx.random.normal((1, rows, HIDDEN))
+    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+    expected = module(language._hc_write(hyper, branch, gate))
+    actual = module(hyper, write=(branch, gate))
+    mx.eval(actual, expected)
+    assert actual[1].dtype == mx.float32
+    for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed, reference).item()
 
 
 def test_prefill_path_not_offered_for_fused_rows():
@@ -502,7 +660,7 @@ needs_nax = pytest.mark.skipif(
 )
 
 
-# Deferred MLP residual writes in Qwen4ExpModel prefill.
+# Small quantized Qwen4ExpModel for model-level prefill checks.
 
 
 def _deferred_model():
@@ -550,76 +708,6 @@ def _logits(model, inputs):
     out = getattr(out, "logits", out)
     mx.eval(out)
     return out
-
-
-@needs_metal
-@pytest.mark.parametrize("rows", [40, 129])
-def test_deferred_write_is_bit_identical_and_fused(monkeypatch, rows):
-    from mlx_vlm.models.qwen4_exp import hc_fused, language
-
-    model, config = _deferred_model()
-    layers = model.model.layers
-    assert "ple" in layers[1] and "ple" not in layers[2]
-    assert hc_fused.prefill_compatible(
-        layers[0].attn_hyper_connection,
-        mx.zeros((1, rows, 4 * 512), dtype=mx.bfloat16),
-    )
-    inputs = mx.random.randint(0, config.text_config.vocab_size, (1, rows))
-
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", False)
-    eager = _logits(model, inputs)
-
-    writes = []
-    real = hc_fused.prefill_forward
-
-    def spy(module, hyper_input, write=None):
-        writes.append(
-            (
-                module is layers[2].attn_hyper_connection,
-                write is not None,
-            )
-        )
-        return real(module, hyper_input, write)
-
-    monkeypatch.setattr(hc_fused, "prefill_forward", spy)
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", True)
-    deferred = _logits(model, inputs)
-
-    # Layer 1 carries PLE, so layer 0's write is applied eagerly there; layer
-    # 1's write is fused into layer 2's stream norm; layer 2 writes eagerly.
-    assert (True, True) in writes
-    assert eager.dtype == deferred.dtype
-    view = mx.uint32 if eager.dtype == mx.float32 else mx.uint16
-    assert mx.array_equal(eager.view(view), deferred.view(view)).item()
-
-
-@needs_metal
-def test_decode_rows_and_kill_switch_never_defer(monkeypatch):
-    from mlx_vlm.models.qwen4_exp import language
-
-    model, config = _deferred_model()
-    deferred = []
-    real_call = language.Qwen4ExpDecoderLayer.__call__
-
-    def spy(self, *args, **kwargs):
-        deferred.append(bool(kwargs.get("defer_write")))
-        return real_call(self, *args, **kwargs)
-
-    monkeypatch.setattr(language.Qwen4ExpDecoderLayer, "__call__", spy)
-    # 16 rows take the fused decode kernels, which have no pending-write input.
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 16)))
-    assert deferred and not any(deferred)
-
-    deferred.clear()
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", False)
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 40)))
-    assert deferred and not any(deferred)
-
-    deferred.clear()
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", True)
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 40)))
-    # Every layer but the last defers.
-    assert deferred == [True, True, False]
 
 
 # Tensor-unit (NAX) prefill: bitwise parity with the MLX matmul path.
