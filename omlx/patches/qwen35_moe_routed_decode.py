@@ -85,6 +85,14 @@ import numpy as np
 from .module_cache import cached_per_module
 from .moe_verify_gather import _BITS, _GROUP_SIZES
 from .moe_verify_gather import _HEADER as _QMV_HEADER
+from .qwen35_moe_router import (
+    fused_router_topk,
+    router_eligible,
+    router_gemv,
+    softmax_topk_row,
+    softmax_topk_rows,
+)
+from .qwen35_verify_qmm import is_row_exact_armed
 
 logger = logging.getLogger(__name__)
 
@@ -603,8 +611,6 @@ def _build_plan(block) -> _Plan | None:
     gate = block.get("gate")
     router_logits = None
     if type(gate) is nn.Linear and "bias" not in gate and gate["weight"].shape[-1] == hidden:
-        from .qwen35_moe_router import router_gemv
-
         router_logits = router_gemv(gate["weight"])
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     gate_up_template = [
@@ -745,8 +751,6 @@ def routed_verify_window(block, x):
         or block.top_k != TOP_K
     ):
         return None
-    from .qwen35_moe_router import fused_router_topk, router_eligible, softmax_topk_rows
-
     hidden = x.shape[-1]
     rows = x.size // hidden
     if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(x, block.num_experts):
@@ -784,8 +788,6 @@ def _ensure_verify_window_patch(cls) -> None:
     modes, blocks and shapes keep the wrapped body."""
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
-    from .qwen35_verify_qmm import is_row_exact_armed
-
     original = Qwen3_5BatchInvariantForward._feed_forward
     if getattr(original, "_omlx_routed_verify_window", False):
         return
@@ -814,8 +816,6 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
         from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
     except ImportError:
         return False
-    from .qwen35_moe_router import fused_router_topk, router_eligible, softmax_topk_row
-
     cls = getattr(vlm_moe, "Qwen3_5MoeSparseMoeBlock", None)
     if cls is None or not getattr(cls, "_omlx_router_fused", False):
         return False

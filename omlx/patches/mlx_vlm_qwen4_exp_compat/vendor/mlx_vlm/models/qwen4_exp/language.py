@@ -21,6 +21,7 @@ import mlx.nn as nn
 import numpy as np
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from mlx_vlm.models.cache import ArraysCache
@@ -34,6 +35,7 @@ from ..qwen3_5.language import (
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
 )
+from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .qsa_fast import (
@@ -113,8 +115,6 @@ def _gathered_min_query_tokens() -> int:
 
 def _row_exact_verify_armed() -> bool:
     """Inside an armed MTP verify whose rows must equal serial decode steps."""
-    from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
-
     return is_row_exact_armed()
 
 
@@ -1839,8 +1839,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         (what the official path computes when the indexer selects every block).
         """
 
-        from ..qwen3_5 import language as q35_language
-
         batch, length, _ = x.shape
         q_proj_output, new_keys, new_values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj), x
@@ -1985,8 +1983,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         FP32 sums round differently -- selects them with the decode kernel and
         runs the selected-keys decode SDPA over its causal prefix.
         """
-
-        from ..qwen3_5 import language as q35_language
 
         batch, length, _ = x.shape
         indexer = self.indexer
@@ -2162,8 +2158,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
     ) -> mx.array:
         """``Qwen3_5Attention.__call__`` for one QSA-masked decode row, with an
         SDPA that visits only the selected keys (same bits as MLX's)."""
-
-        from ..qwen3_5 import language as q35_language
 
         batch, length, _ = x.shape
         queries, keys, values, gate, mask = self._prepare_projected_qkv(

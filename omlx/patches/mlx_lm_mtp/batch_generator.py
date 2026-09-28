@@ -2097,7 +2097,12 @@ def _call_backbone_impl(
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify, row_exact=_row_exact_verify(model))
+    # Row-exact runs each row as a one-row matvec. Batched decode has no
+    # one-row baseline, so B > 1 verify keeps the multi-row kernels.
+    _set_verify_qmm_armed(
+        not dspark_verify,
+        row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
+    )
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
