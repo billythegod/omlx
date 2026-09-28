@@ -12,11 +12,6 @@ step, then its tail block, so every step is exactly the query's own keys: no
 block unions, no per-row masks (only tail tokens past the query and the slots
 past the list are -inf).
 
-(The previous organization grouped 4 queries per threadgroup over the union
-of their blocks: adjacent queries share 60-80% of their blocks, but the
-4-query union grows from 1.3x of 513 blocks at 8K context to 2x at 64K, all
-of it masked work.)
-
 Throughput: the key loop is latency bound, so the kernel keeps its register
 and threadgroup-memory footprint small for occupancy: Q is re-read from
 device memory (L1) each step instead of held in registers, S and O live in
@@ -24,7 +19,7 @@ persistent tensor-unit cooperative tensors (no per-MMA operand copies),
 tensor ops are 16x32x32 (Q K^T over 32 head dims; P V with the fp16 hi and lo
 pieces of P packed along K), and O is only rescaled when a row max changed.
 
-Numerics (unchanged): scores are bf16 x bf16 products accumulated in fp32 and
+Numerics: scores are bf16 x bf16 products accumulated in fp32 and
 the online softmax runs in fp32. The tensor unit truncates a float operand to
 tf32, so ``P @ V`` takes the fp32 probabilities as two fp16 pieces, hi =
 fp16(P) and lo = fp16(P - hi), whose sum is P within 2^-24 absolute (the size
@@ -35,9 +30,12 @@ fp32 summation grouping differs from the native kernel.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 # How P (fp32 probabilities) enters the P @ V tensor-unit MMA (see module doc):
 #   "half2" (default): fp16 hi + fp16 lo pieces, |error| <= 2^-24 per probability.
@@ -48,6 +46,9 @@ _PV_MODES = {
     "half2": (mx.float16, 2),
     "bf16x3": (mx.bfloat16, 3),
 }
+if PV_MODE not in _PV_MODES:
+    logger.warning("Unknown OMLX_QWEN4_QSA_NAX_PV=%r; using half2", PV_MODE)
+    PV_MODE = "half2"
 GQA = 12
 HEAD_DIM = 256
 COMPRESS = 4

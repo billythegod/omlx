@@ -41,6 +41,7 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import hc_fused
+from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -1058,24 +1059,15 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
 # Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
 # verify rows only) so the GPU executes layer i while the host builds layer i+1.
 # Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
-_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
 _EAGER_DISPATCH_MAX_ROWS = 64
 # Prefill: hand each decoder layer's MLP residual write to the next layer's fused
 # stream norm instead of a separate multiply + add over the 4-stream residual.
 # The fused kernel rounds exactly like the eager write, so outputs are
 # bit-identical. Disable with OMLX_QWEN4_HC_DEFERRED_WRITE=0.
-_DEFERRED_HC_WRITE = os.environ.get(
-    "OMLX_QWEN4_HC_DEFERRED_WRITE", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
+_DEFERRED_HC_WRITE = env_enabled("OMLX_QWEN4_HC_DEFERRED_WRITE")
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
 
 
 class Qwen4ExpRMSNorm(nn.Module):
@@ -2950,8 +2942,7 @@ _DEPTHWISE_CONV_SOURCE = r"""
     y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
 """
 _DEPTHWISE_CONV_STATE = {
-    "enabled": os.environ.get("OMLX_QWEN4_PLE_CONV_KERNEL", "1").strip().lower()
-    not in {"0", "false", "no", "off"},
+    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
     "kernel": None,
     "validated": False,
 }
@@ -3503,6 +3494,14 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+
+    def ple_gathers_ahead(self) -> bool:
+        """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+                return True
+        return False
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""

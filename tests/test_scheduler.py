@@ -4225,18 +4225,17 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen4_wide_first_chunk is True
             assert step(0, 16384) == 8192
             assert step(0, 4095) == 8192
-            # After a narrow first chunk, prompts that fit in two narrow
-            # chunks stay narrow.
-            assert step(2048, 2047) == 2048
             if paged:
-                # Once the first narrow chunk is done the rest runs wide; the
-                # block clamp ends each wide request on the 8192 grid.
+                # After the first chunk the rest runs wide; the block clamp
+                # ends each wide request on the 8192 grid.
                 assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 2047) == 8192
                 assert step(2048, 2048) == 8192
                 assert step(2048, 8191) == 8192
                 assert step(2048, 14336) == 8192
             else:
                 # Without the clamp the wide step itself ends on the 8192 grid.
+                assert step(2048, 2047) == 6144
                 assert step(2048, 2048) == 6144
                 assert step(2048, 8191) == 6144
                 assert step(2048, 14336) == 6144
@@ -4247,12 +4246,8 @@ class TestSchedulerArraysCacheBlockAlignment:
         self, mock_tokenizer, tmp_path
     ):
         model = self._hybrid_model(model_type="qwen4_exp_text")
-        ngram = SimpleNamespace(prefetch=lambda indices: None)
-        layer = SimpleNamespace(
-            ple=SimpleNamespace(ple_embedding=SimpleNamespace(ngram_embedding=ngram))
-        )
         model.prefetch_ple = lambda next_ids, current_ids: None
-        model.language_model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+        model.ple_gathers_ahead = lambda: True
         with (
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),

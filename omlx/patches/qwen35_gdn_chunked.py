@@ -66,11 +66,16 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
         gated_delta_pipelined,
     )
 
-    impl = os.environ.get("OMLX_GDN_IMPL", "pipelined")
-    fast_prefill = {
+    kernels = {
+        "pipelined": gated_delta_pipelined,
         "chunked": gated_delta_chunked_metal,
         "blocked_seq": gated_delta_blocked_seq,
-    }.get(impl, gated_delta_pipelined)
+    }
+    impl = os.environ.get("OMLX_GDN_IMPL", "pipelined")
+    if impl not in kernels:
+        logger.warning("Unknown OMLX_GDN_IMPL=%r; using pipelined", impl)
+        impl = "pipelined"
+    fast_prefill = kernels[impl]
 
     def gated_delta_update_metal(
         q,

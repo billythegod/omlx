@@ -11,40 +11,31 @@ streams and affine group-size-64 projections with 4/5/6/8-bit weights. FP32
 epilogues can round differently from the canonical BF16 operations.
 
 Each kernel specialization is evaluated once to catch lazy compilation errors.
-Failures only fall back for the current call; later evaluation errors propagate.
+A failure falls back for the current call only; the NAX prefill projections
+instead fall back to MLX for the process after a failure or a bitwise
+mismatch on first use. Later evaluation errors propagate.
 Disable with OMLX_QWEN4_HC_FUSED=0.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from . import hc_prefill_nax
-from .hc_projection import _HEADER
+from .hc_projection import _HEADER, env_enabled
 
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED")
 # Prefill rows on the tensor units (hc_prefill_nax): three dispatches instead of
 # six, bit-identical. Disable with OMLX_QWEN4_HC_NAX_PREFILL=0.
-_NAX_DISABLED = os.environ.get("OMLX_QWEN4_HC_NAX_PREFILL", "1").strip().lower() in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_NAX_DISABLED = not env_enabled("OMLX_QWEN4_HC_NAX_PREFILL")
 _NAX_AVAILABLE: bool | None = None
 _NAX_BROKEN = False
 _KERNELS: dict[str, object] = {}

@@ -568,10 +568,6 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-# With SSD-backed PLE the first chunk stays narrow; widen as soon as a full
-# narrow chunk remains after it: the wide step only feeds the expert GEMMs
-# more rows per expert, it never waits for the whole 8192 to be available.
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + 2048
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -2970,27 +2966,19 @@ class Scheduler:
         """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
 
         Only then does a narrow first chunk buy anything: it lets the gather
-        of the next chunk overlap GPU work. Resident PLE tables have no
-        gather-ahead, and unknown layouts count as gathering ahead.
+        of the next chunk overlap GPU work. Models without a probe count as
+        gathering ahead.
         """
         if getattr(self.model, "prefetch_ple", None) is None:
             return False
-        language_model = getattr(self.model, "_language_model", None) or getattr(
-            self.model, "language_model", None
-        )
-        layers = getattr(getattr(language_model, "model", None), "layers", None)
-        if layers is None:
+        probe = getattr(self.model, "ple_gathers_ahead", None)
+        if probe is None:
             return True
         try:
-            for layer in layers:
-                ple = getattr(layer, "ple", None)
-                embedding = getattr(getattr(ple, "ple_embedding", None), "ngram_embedding", None)
-                if getattr(embedding, "prefetch", None) is not None:
-                    return True
+            return bool(probe())
         except Exception:
             logger.debug("qwen4 PLE gather-ahead probe failed", exc_info=True)
             return True
-        return False
 
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
@@ -5811,15 +5799,7 @@ class Scheduler:
                 size = floor
             wide = getattr(self, "_qwen4_wide_prefill_step", 0)
             if wide and (
-                (
-                    processed_tokens > 0
-                    and processed_tokens + remaining_tokens
-                    >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
-                )
-                or (
-                    processed_tokens == 0
-                    and getattr(self, "_qwen4_wide_first_chunk", False)
-                )
+                processed_tokens > 0 or getattr(self, "_qwen4_wide_first_chunk", False)
             ):
                 # Wide steps feed the expert GEMMs more rows per expert. With
                 # SSD-backed PLE the first chunk stays narrow so the n-gram

@@ -16,6 +16,8 @@ from collections.abc import Callable
 
 import mlx.core as mx
 
+from . import qsa_nax
+
 IndexKeyNorm = Callable[[mx.array], mx.array]
 IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
@@ -373,8 +375,6 @@ def _nax_sparse_gqa_attention(
     global _NAX_QSA_MAIN_DISABLED, _NAX_QSA_MAIN_PROVEN
     if _NAX_QSA_MAIN_DISABLED:
         return None
-    from . import qsa_nax
-
     if (
         not qsa_nax.enabled()
         or queries.ndim != 4
