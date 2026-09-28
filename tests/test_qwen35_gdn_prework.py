@@ -286,6 +286,10 @@ def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
     state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
     a = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
     b = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
+    # A fast bf16 exp in the sigmoid gives this beta one ulp off MLX's on M3.
+    b = mx.concatenate(
+        [mx.full((1, 1, 1), -6.84375, dtype=mx.bfloat16), b[..., 1:]], axis=-1
+    )
     A_log = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
     dt_bias = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
     q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)

@@ -293,7 +293,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
+            // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
+            T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
             beta_out[head] = (bv < T(0)) ? by : T(1) - by;
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
@@ -436,7 +437,8 @@ _QWEN4_DECODE_STEP_SOURCE = """
     } else if (sg == 3 && lane == 0) {
         const uint head = hv;
         const T bv = b_in[head];
-        T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
+        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
+        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
         tg_beta[0] = (bv < T(0)) ? by : T(1) - by;
 
         const T apd = T(float(a_in[head]) + float(dt_bias[head]));
@@ -641,7 +643,8 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         const uint t = lane;
         const uint head = hv;
         const T bv = proj[t * P + b_off + head];
-        T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
+        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
+        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
         tg_beta[t] = (bv < T(0)) ? by : T(1) - by;
 
         const T apd = T(float(proj[t * P + a_off + head]) + float(dt_bias[head]));
