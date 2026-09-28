@@ -1764,6 +1764,8 @@ def test_fused_pre_does_not_depend_on_tile_shape(monkeypatch, rows, threads):
     mx.eval(default)
     monkeypatch.setattr(hc_prefill, "_ROWS", rows)
     monkeypatch.setattr(hc_prefill, "_THREADS", threads)
+    # A launch failure disables the kernels module-wide; restore it afterwards.
+    monkeypatch.setattr(hc_prefill, "_DISABLED", hc_prefill._DISABLED)
     other = hc_prefill.hc_pre(connection, x)
     if other is None:
         # The kernel fails closed where the device cannot launch this
