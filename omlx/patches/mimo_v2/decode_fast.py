@@ -28,17 +28,14 @@ same math with fewer, cheaper dispatches:
 * long KV caches: from ``_FLASH_MIN_KEYS`` keys every forward's attention
   runs the split-key matrix kernel ``sdpa_flash`` (float32 simdgroup MMA, all
   rows and heads of a KV head sharing each K/V tile: 2-3x MLX's vector kernel,
-  which is ALU-bound at GQA 16); multi-row forwards over shorter 2-pass-sized
-  caches read the cache once for all rows (``sdpa_rows``) instead of once per
-  row chunk.
+  which is ALU-bound at GQA 16).
 
 Exactness: a one-row (decode) forward is bit-identical to the reference
 below ``_FLASH_MIN_KEYS`` keys (or with ``OMLX_MIMO_DECODE_FLASH=0``).
 For verify forwards (L > 1) two reductions run in another order than the
 reference: every row's router logits are the M=1 gemv a decode step computes
-(MLX's batched float32 matmul sums differently) and attention rows use the
-vector SDPA kernel's arithmetic (``sdpa_rows`` is bit-identical to MLX's
-kernel on the same rows); everything else is bit-identical.  ``sdpa_flash``
+(MLX's batched float32 matmul sums differently) and chunked attention rows
+use the vector SDPA kernel; everything else is bit-identical.  ``sdpa_flash``
 computes MLX's float32 attention in another summation order (within one bf16
 ULP of MLX's kernel, closer to float64) for one-row and verify forwards
 alike, so a verify row's attention matches the one-row decode's at the same
@@ -62,6 +59,10 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+import mlx.nn as nn
+
+from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.mimo_v2 import moe_decode, sdpa_flash
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,6 @@ def enabled() -> bool:
 
 def _nax_available() -> bool:
     try:
-        from omlx.custom_kernels.nax import is_nax_available
-
         return bool(is_nax_available())
     except Exception:  # noqa: BLE001
         return False
@@ -108,12 +107,6 @@ def sdpa_chunks_enabled() -> bool:
 def experts_enabled() -> bool:
     """Decode-time MXFP4 expert kernels (``moe_decode``); on by default."""
     return _env_on("OMLX_MIMO_DECODE_EXPERTS")
-
-
-def sdpa_rows_enabled() -> bool:
-    """Multi-row forwards' attention in one pass over the KV cache
-    (``sdpa_rows``, bit-identical to MLX's vector kernel); on by default."""
-    return _env_on("OMLX_MIMO_DECODE_SDPA_ROWS")
 
 
 def sdpa_flash_enabled() -> bool:
@@ -705,8 +698,6 @@ def _fuse_qkv(attn) -> Optional[_FusedQKV]:
     The fused buffer replaces the three separate ones (the projections keep
     working unchanged on row slices of it), so memory is not duplicated.
     """
-    import mlx.nn as nn
-
     projs = (attn.q_proj, attn.k_proj, attn.v_proj)
     if not all(isinstance(p, nn.QuantizedLinear) for p in projs):
         return None
@@ -752,8 +743,6 @@ _SWIGLU_MODULES = ("mlx_lm.models.switch_layers", "omlx.patches.glm_moe_dsa.swit
 def _expert_kind(switch_mlp) -> Optional[str]:
     """``"split"`` / ``"fused"`` when the decode expert kernels reproduce this
     ``SwitchGLU`` (MXFP4 gs32 experts, SwiGLU activation), else ``None``."""
-    from omlx.patches.mimo_v2 import moe_decode
-
     if (
         type(switch_mlp).__name__ != "SwitchGLU"
         or type(switch_mlp).__module__ not in _SWIGLU_MODULES
@@ -802,8 +791,6 @@ def _expert_layout(mlp) -> Optional[str]:
 
 def _experts(switch_mlp, kind, x, inds):
     """Per-(row, expert) down-projected rows, ``(..., top_k, hidden)``."""
-    from omlx.patches.mimo_v2 import moe_decode
-
     down = switch_mlp.down_proj
     inter = int(down.weight.shape[-1]) * 8
     if kind == "fused":
@@ -825,8 +812,6 @@ def _prepare(model) -> bool:
     state = model.__dict__.get("_omlx_decode_fast_state")
     if state is not None:
         return state
-    import mlx.nn as nn
-
     ok = True
     try:
         for layer in model.layers:
@@ -913,33 +898,24 @@ def _vector_attention(q, k, v, cache, scale, mask, sinks, kernels):
     """``(B, L, H * Dv)`` attention of a short forward from the one-pass
     kernels, or ``None`` (the caller keeps MLX's SDPA).
 
-    ``kernels`` is ``(rows, flash, flash_min_keys)``.  From
-    ``flash_min_keys`` keys ``sdpa_flash`` serves every row count (so a verify
-    row's attention matches the one-row decode's); below it, forwards of 2+
-    rows use ``sdpa_rows``, which is MLX's own arithmetic in one pass.
+    ``kernels`` is ``(flash, flash_min_keys)``.  From ``flash_min_keys`` keys
+    ``sdpa_flash`` serves every row count, so a verify row's attention matches
+    the one-row decode's.
     """
-    rows_on, flash_on, flash_min = kernels
-    if not (rows_on or flash_on) or cache is None or hasattr(cache, "bits"):
+    flash_on, flash_min = kernels
+    if not flash_on or cache is None or hasattr(cache, "bits"):
         return None
     inner = getattr(cache, "_cache", None)
     if inner is not None and hasattr(inner, "bits"):
         return None
     if not isinstance(k, mx.array) or not isinstance(v, mx.array) or k.ndim != 4:
         return None
-    if flash_on and k.shape[2] >= flash_min:
-        from omlx.patches.mimo_v2 import sdpa_flash
-
-        out = sdpa_flash.sdpa_flash(q, k, v, scale, mask, sinks)
-        if out is not None:
-            return out
-    if rows_on and q.shape[2] > 1:
-        from omlx.patches.mimo_v2 import sdpa_rows
-
-        return sdpa_rows.sdpa_rows(q, k, v, scale, mask, sinks)
-    return None
+    if k.shape[2] < flash_min:
+        return None
+    return sdpa_flash.sdpa_flash(q, k, v, scale, mask, sinks)
 
 
-def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks, kernels=(False, False, 0)):
+def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks, kernels=(False, 0)):
     B, L, _ = x.shape
     fused = attn.__dict__.get("_omlx_qkv")
     if fused and not fused.current(attn):
@@ -1053,6 +1029,10 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         return None
     if any(c is None or hasattr(c, "bits") for c in cache):
         return None
+    # The fused q/k/v path reads RoPE parameters directly, so a wrapped rope
+    # (SpecPrefill's position-mapped or offset-adjusted RoPE) runs the reference.
+    if any(type(layer.self_attn.rope) is not nn.RoPE for layer in model.layers):
+        return None
     if not _prepare(model):
         return None
     layers = model.layers
@@ -1072,11 +1052,11 @@ def run_layers(model, h, cache, full_mask, swa_mask):
     offsets_memo = {}
     use_experts = experts_enabled()
     row_chunks = sdpa_chunks_enabled()
-    # The one-pass kernels replace MLX's own SDPA only; a patched attention
-    # function bound in the model module keeps serving its calls.
-    kernels = (False, False, 0)
+    # sdpa_flash replaces MLX's own SDPA only; a patched attention function
+    # bound in the model module keeps serving its calls.
+    kernels = (False, 0)
     if _is_mlx_sdpa(sdpa):
-        kernels = (sdpa_rows_enabled(), sdpa_flash_enabled(), _flash_min_keys())
+        kernels = (sdpa_flash_enabled(), _flash_min_keys())
     for i, layer in enumerate(layers):
         nxt = layers[i + 1].input_layernorm if i + 1 < n else model.norm
         mask = swa_mask if layer.is_sliding_window else full_mask

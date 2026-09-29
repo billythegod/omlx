@@ -32,6 +32,7 @@ from typing import Optional
 
 import mlx.core as mx
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.utils.nax_attention import nax_mixed_head_dim_attention, uses_key_passes
 
 # Kill switch for A/B comparisons: OMLX_FAST_ATTENTION=0 keeps MLX's default
@@ -46,8 +47,6 @@ _ENABLED = os.environ.get("OMLX_FAST_ATTENTION", "1").strip().lower() not in {
 @lru_cache(maxsize=1)
 def _nax_available() -> bool:
     try:
-        from omlx.custom_kernels.nax import is_nax_available
-
         return bool(is_nax_available())
     except Exception:  # noqa: BLE001
         return False

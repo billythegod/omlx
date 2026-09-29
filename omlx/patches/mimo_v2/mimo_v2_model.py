@@ -22,6 +22,7 @@ from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
+from omlx.patches.mimo_v2 import decode_fast as _decode_fast
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -137,10 +138,14 @@ class Attention(nn.Module):
         # Blocked window attention runs whole 128-query blocks. Padding the
         # (hidden-wide) projection input costs a third of padding the
         # (64 x 192-wide) queries; projection and RoPE are row-wise, so the
-        # real rows are bit-identical and the padded ones are dropped.
+        # real rows are bit-identical and the padded ones are dropped. A wrapped
+        # rope (SpecPrefill) maps positions per query row, so it gets no padding.
         q_pad = (
             window_query_padding(L)
-            if self.is_sliding_window and B == 1 and not hasattr(cache, "bits")
+            if self.is_sliding_window
+            and B == 1
+            and not hasattr(cache, "bits")
+            and type(self.rope) is nn.RoPE
             else 0
         )
         q_in = mx.pad(x, [(0, 0), (0, q_pad), (0, 0)]) if q_pad else x
@@ -452,8 +457,6 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         pipeline_size = self.pipeline_size
 
         # Decode / short verify forwards: same math, fewer dispatches.
-        from omlx.patches.mimo_v2 import decode_fast as _decode_fast
-
         fast = (
             _decode_fast.run_layers(self, h, cache, full_mask, swa_mask)
             if pipeline_size == 1

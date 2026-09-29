@@ -57,6 +57,7 @@ from typing import Optional
 
 import mlx.core as mx
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.custom_kernels.nax_tiles import NAX_TILE_HEADER
 
 logger = logging.getLogger(__name__)
@@ -91,11 +92,6 @@ def _env_int(name: str, default: int) -> int:
 # threadgroups stay in step anyway.
 _PASS_KEYS = _env_int("OMLX_NAX_ATTN_PASS_KEYS", 8192)
 _PASS_MIN_GROUPS = 512
-# Query tile resident in registers across key blocks (A/B switch).
-_QREG = _env_int("OMLX_NAX_ATTN_QREG", 1) != 0
-# Fully unrolled Q @ K.T head-dim loop (A/B switch; the head-dim split
-# kernel always unrolls it).
-_QKFULL = _env_int("OMLX_NAX_ATTN_QKFULL", 0) != 0
 # Head-dim split over simdgroup pairs (MLX's attention_nax_dsplit scheme):
 # 0 = never, 1 = for calls that run in key-range passes (long contexts,
 # 3-4% faster there), 2 = always. It changes the summation order of
@@ -172,7 +168,7 @@ struct ExpSubOp {
 //   flight only stream one key slice of their KV head, which stays on chip;
 //   over one long dispatch they drift apart and, once the KV head no longer
 //   fits in the caches, each re-streams it from DRAM.
-// * The query tile stays in registers (QREG) instead of being re-read from
+// * The query tile stays in registers instead of being re-read from
 //   memory for every key block, and each row max is reduced over all of the
 //   row's score fragments before the cross-lane shuffles (max is exact, so
 //   the grouping does not matter).
@@ -198,8 +194,6 @@ template <
     bool has_sinks,
     bool FIRST,
     bool LAST,
-    bool QREG,
-    bool QKFULL,
     typename MaskType,
     typename AccumType,
     typename StridePtr,
@@ -356,14 +350,12 @@ METAL_FUNC void attention_nax_bdv(
   K += int64_t(kb_lo) * BK * K_strides[2];
   V += int64_t(kb_lo) * BK * V_strides[2];
 
-  // Query fragments, loaded once when register resident.
-  NAXTile<T, TQ, (QREG ? TD : 1)> Qreg;
-  if (QREG) {
-    if (!align_Q && is_last_q) {
-      Qreg.load_rows(Q, int(Q_strides[2]), lim_rows_q);
-    } else {
-      Qreg.load(Q, int(Q_strides[2]));
-    }
+  // Query fragments, loaded once and kept in registers.
+  NAXTile<T, TQ, TD> Qreg;
+  if (!align_Q && is_last_q) {
+    Qreg.load_rows(Q, int(Q_strides[2]), lim_rows_q);
+  } else {
+    Qreg.load(Q, int(Q_strides[2]));
   }
 
   // Loop over KV seq length
@@ -384,17 +376,9 @@ METAL_FUNC void attention_nax_bdv(
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
 
-          const int Q_load_off = iq * kU * int(Q_strides[2]) + id * kU;
           const int K_load_off = ik * kU * int(K_strides[2]) + id * kU;
 
-          if (QREG) {
-            Qtile.frag_at(0, 0) = Qreg.frag_at(iq, QREG ? id : 0);
-          } else if (!align_Q && is_last_q) {
-            Qtile.load_rows(
-                Q + Q_load_off, int(Q_strides[2]), lim_rows_q - iq * kU);
-          } else {
-            Qtile.load(Q + Q_load_off, int(Q_strides[2]));
-          }
+          Qtile.frag_at(0, 0) = Qreg.frag_at(iq, id);
 
           if (!align_K && is_last_k) {
             Ktile.load_rows(
@@ -412,8 +396,8 @@ METAL_FUNC void attention_nax_bdv(
               Ktile.frag_at(1, 0),
               metal::true_type{});
         };
-        if constexpr (QKFULL) {
-          // Register-resident query fragments need static indices.
+        if constexpr (WN == 2) {
+          // The head-dim split kernel keeps static fragment indices.
           OMLX_NAX_UNROLL
           for (short id = 0; id < TD; id++) {
             qk_step(id);
@@ -728,7 +712,7 @@ _SOURCE = r"""
   omlx_nax::attention_nax_bdv<
       {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, {WN},
       {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS},
-      {FIRST}, {LAST}, {QREG}, {QKFULL}, bool, float>(
+      {FIRST}, {LAST}, bool, float>(
       q, k, v, out,
       reinterpret_cast<const device omlx_nax::AttnParams*>(params),
       q_strides, k_strides, v_strides, mask_strides,
@@ -755,9 +739,7 @@ def _kernel(
     has_sinks: bool,
     first: bool = True,
     last: bool = True,
-    qreg: bool = True,
     wn: int = 1,
-    qkfull: bool = False,
 ):
     wm = _WM // wn
     source = (
@@ -775,8 +757,6 @@ def _kernel(
         .replace("{HAS_SINKS}", _flag(has_sinks))
         .replace("{FIRST}", _flag(first))
         .replace("{LAST}", _flag(last))
-        .replace("{QREG}", _flag(qreg))
-        .replace("{QKFULL}", _flag(qkfull))
     )
     tag = "".join(
         "1" if f else "0"
@@ -788,8 +768,6 @@ def _kernel(
             has_sinks,
             first,
             last,
-            qreg,
-            qkfull,
         )
     )
     return mx.fast.metal_kernel(
@@ -805,8 +783,6 @@ def _kernel(
 @lru_cache(maxsize=1)
 def _nax_available() -> bool:
     try:
-        from omlx.custom_kernels.nax import is_nax_available
-
         return bool(is_nax_available())
     except Exception:  # noqa: BLE001
         return False
@@ -866,6 +842,8 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
     else:
         sinks = mx.zeros((1,), dtype=q.dtype)
     # fp32 row state between passes: O accumulator, running max, running sum.
+    # Passes in flight each hold their state until their command buffer ends:
+    # about 3 GB per call from 128k keys at 8192 queries x 64 heads.
     state_size = B * H * NQ * bq * (DV + 2)
     state = mx.zeros((1,), dtype=mx.float32)
     out = None
@@ -902,9 +880,7 @@ def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
             has_sinks,
             first,
             last,
-            _QREG or wn == 2,
             wn,
-            _QKFULL or wn == 2,
         )
         out, state = kernel(
             inputs=[q, k, v, mask, sinks, state, params],

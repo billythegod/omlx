@@ -3394,13 +3394,6 @@ class Scheduler:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
 
-        # The generator re-chunks prompt processing at its own step, so the
-        # wide-prefill floor has to reach it too or the scheduler's larger
-        # chunks are silently split back into the configured size.
-        generator_step = max(
-            int(self.config.prefill_step_size or 0),
-            int(getattr(self, "_qwen35_prefill_floor", 0) or 0),
-        )
         bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
@@ -3409,7 +3402,7 @@ class Scheduler:
             logits_processors=logits_processors if logits_processors else [],
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
-            prefill_step_size=generator_step,
+            prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
 
