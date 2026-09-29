@@ -345,26 +345,23 @@ def _process_image_blocks(
         elif block.get("type") == "text":
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
-                # See comment in _validate_no_image_sp_tokens: tool results with
-                # list content hit this path.
                 block = copy.copy(block)
-                block["text"] = text.replace(IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
+                block["text"] = text.replace(
+                    IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
             new_blocks.append(block)
         else:
             new_blocks.append(block)
     return new_blocks, images
 
 
-def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
+def _sanitize_image_sp_tokens(msg: Dict[str, Any]) -> None:
     """Sanitize user-supplied image placeholder tokens in textual fields."""
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
-        # Placeholder as plain text (pasted logs/transcripts) is data, not an
-        # image reference: replace it instead of rejecting the whole request.
-        msg["content"] = content.replace(IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
+        msg["content"] = content.replace(
+            IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
     reasoning_content = msg.get("reasoning_content")
     if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
-        # See comment above.
         msg["reasoning_content"] = reasoning_content.replace(
             IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
 
@@ -377,7 +374,7 @@ def process_image_messages(
     images: List[Dict[str, Any]] = []
     for msg in messages:
         msg = copy.deepcopy(msg)
-        _validate_no_image_sp_tokens(msg)
+        _sanitize_image_sp_tokens(msg)
 
         if isinstance(msg.get("content"), list) and "content_blocks" not in msg:
             msg["content_blocks"] = msg.pop("content")
