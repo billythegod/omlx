@@ -1,5 +1,4 @@
 import logging
-import os
 from functools import partial
 from typing import Any, Optional
 
@@ -16,9 +15,12 @@ from ..base import (
 from ..cache import ArraysCache, CacheList, KVCache
 from ..deepseek_v4.hyper_connection import HyperConnection as _HyperConnection
 from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
+from ..fast_ops import exact_hc_norm
 from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import glm53_kda_prework
+from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
 from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
@@ -30,6 +32,8 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.patches.qwen35_verify_qmm import _is_armed as _verify_qmm_armed
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed as _row_exact_armed
 from omlx.patches.glm_moe_dsa.indexer_nax import (
     indexer_scores_nax,
     max_rows_per_call,
@@ -40,10 +44,6 @@ from . import hc_prefill
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
 
-try:
-    from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
-except ImportError:  # pragma: no cover - vendored copy used without oMLX
-    _decode_kernels = None
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
@@ -64,27 +64,11 @@ def _cache_parts(cache):
 # Single-sequence decode (L == 1) and short verify blocks (L <= 8, the
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
-# They are validated bit for bit on M5 (NAX) GPUs and are used there by
-# default; OMLX_GLM5_DECODE_FUSION=1 forces them on elsewhere and =0 restores
-# the reference graph everywhere.
-
-
-def _decode_fusion_default() -> bool:
-    value = os.environ.get("OMLX_GLM5_DECODE_FUSION", "").strip()
-    if value in ("0", "1"):
-        return value == "1"
-    try:
-        from omlx.custom_kernels.nax import is_nax_available
-
-        return bool(is_nax_available())
-    except Exception:  # noqa: BLE001
-        return False
-
-
-_DECODE_FUSION = _decode_fusion_default()
+# They are validated on M5 (NAX) GPUs and used there.
+_DECODE_FUSION = is_nax_available()
 _DECODE_BLOCK = 8
 
-# One-token decode forwards start evaluating every this many layers (0 = off).
+# One-token decode forwards start evaluating every this many layers.
 # A step is ~800 dependent dispatches whose Python graph build takes ~2.7 ms;
 # mlx keeps at most ~10 command buffers in flight and, with its default
 # per-buffer size budget (every expert or projection weight input counts in
@@ -92,7 +76,7 @@ _DECODE_BLOCK = 8
 # last few buffers long before the next graph is built and encoded (~1.3 ms
 # idle per token). Encoding the first layers while the later ones are being
 # built keeps it fed. The values computed are unchanged.
-_DECODE_EVAL_EVERY = max(0, int(os.environ.get("OMLX_GLM5_DECODE_EVAL_EVERY", "8") or 0))
+_DECODE_EVAL_EVERY = 8
 
 
 def _decode_hc_pre(connection, norm, x: mx.array):
@@ -105,8 +89,7 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     Returns None when the shape or module state is not covered.
     """
     if (
-        _decode_kernels is None
-        or not _DECODE_FUSION
+        not _DECODE_FUSION
         or connection.training
         or connection.hc_mult != 4
         or x.ndim != 4
@@ -117,8 +100,6 @@ def _decode_hc_pre(connection, norm, x: mx.array):
     mixes = _decode_kernels.hc_mix(x, connection.fn, connection.norm_eps)
     if mixes is None:
         return None
-    from ..fast_ops import exact_hc_norm
-
     return exact_hc_norm(connection, norm, x, mixes)
 
 
@@ -130,11 +111,24 @@ def _switch_projections(sw):
     return (sw.up_proj, sw.gate_proj, sw.down_proj)
 
 
+def verify_qmm_routed(rows: int) -> bool:
+    """Whether a ``QuantizedLinear`` call of ``rows`` rows takes the armed
+    MTP verify routes (``qwen35_verify_qmm``) instead of the reference qmm.
+    Fused kernels replay the reference qmm, so they decline then."""
+    return (
+        rows > 1
+        and getattr(nn.QuantizedLinear, "_omlx_verify_qmm_patched", False)
+        and (_verify_qmm_armed() or _row_exact_armed())
+    )
+
+
 def _multi_linear(x, layers):
     """``[linear_forward(layer, x) for layer in layers]`` for a decode/verify
     block ``x`` [1, L, D]: layers sharing (bits, group size) run as one exact
     ``decode_kernels.multi_qmv`` dispatch, the others as the reference call.
     Returns None when no two layers could share a dispatch."""
+    if verify_qmm_routed(x.shape[1]):
+        return None
     groups = {}
     for i, layer in enumerate(layers):
         key = (getattr(layer, "bits", None), getattr(layer, "group_size", None))
@@ -159,8 +153,7 @@ def _multi_linear(x, layers):
 def _decode_hc_expand(x: mx.array, residual: mx.array, post, comb) -> mx.array:
     """``hc_expand`` with the one-token case in a single exact dispatch."""
     if (
-        _decode_kernels is not None
-        and _DECODE_FUSION
+        _DECODE_FUSION
         and x.ndim == 3
         and x.shape[:2] == (1, 1)
     ):
@@ -198,8 +191,7 @@ class _HCDeferred:
 
 def _hc_defer_ok(connection, norm, dtype, width: int) -> bool:
     return (
-        _decode_kernels is not None
-        and _DECODE_FUSION
+        _DECODE_FUSION
         and not connection.training
         and _decode_kernels.hc_defer_supported(connection, norm, dtype, width)
     )
@@ -277,7 +269,7 @@ def compile_ffn_block(layer, method):
 def _mla_head_proj(layer, x: mx.array) -> mx.array:
     """``layer(x)`` for the MLA per-head projections (embed_q, unembed_out);
     one token through ``decode_kernels.mla_head_qmv`` (same values)."""
-    if _decode_kernels is not None and _DECODE_FUSION and x.ndim == 4 and x.shape[2] == 1:
+    if _DECODE_FUSION and x.ndim == 4 and x.shape[2] == 1:
         out = _decode_kernels.mla_head_qmv(x, layer)
         if out is not None:
             return out
@@ -622,8 +614,7 @@ class Glm5NextLinearAttention(nn.Module):
         B, S, _ = inputs.shape
         fg = self.forget_gate
         if (
-            _decode_kernels is None
-            or not _DECODE_FUSION
+            not _DECODE_FUSION
             or B != 1
             or not 1 <= S <= _DECODE_BLOCK
             or mask is not None
@@ -900,14 +891,28 @@ class Glm5NextIndexer(nn.Module):
             before, pool_lengths = before[0], pool_lengths[0]
         if not isinstance(before, int) or not isinstance(pool_lengths, int):
             return None
-        if select_k * self.index_kpool > self.index_topk or _decode_kernels is None:
+        if select_k * self.index_kpool > self.index_topk:
             return None
         dk = _decode_kernels
         weights = w_raw if w_raw is not None else linear_forward(self.weights_proj, x)
         weights = (weights * self.weight_scale).astype(q.dtype)
-        scores = dk.dsa_decode_scores(
-            q, pool_keys, weights, before, pool_lengths, self.index_kpool
-        )
+        if (
+            select_k == 512
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and q.dtype == mx.bfloat16
+            and pool_keys.dtype == mx.bfloat16
+            and nax_indexer_available()
+        ):
+            # Same scores as the reference path, which uses the NAX indexer here.
+            scores = indexer_scores_nax(
+                q[0], pool_keys[0], weights[0], before, pool_lengths, self.index_kpool
+            )
+            scores = None if scores is None else scores[None]
+        else:
+            scores = dk.dsa_decode_scores(
+                q, pool_keys, weights, before, pool_lengths, self.index_kpool
+            )
         if scores is None:
             return None
         # Same output as the native top-k (which covers select_k == 512 only).
@@ -1338,30 +1343,16 @@ class Glm5NextSparseAttention(nn.Module):
             if mask is not None:
                 mask = mask[..., dense_rows:, :]
         attn_mask = mask
-        fused_attn = None
-        q_latent = None
+        q_latent = q_latent_early
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
             valid_sel = topk_indices >= 0
-            if L == 1 and mask is None:
-                # Exact fused latent attention reading the selected rows in
-                # place (no gathered copy of the latent keys).
-                q_latent = (
-                    q_latent_early
-                    if q_latent_early is not None
-                    else _mla_head_proj(self.embed_q, q)
-                )
-                fused_attn = self._decode_latent(
-                    q_latent, kv_latent, None, cache, indices=topk_indices[0, 0, 0]
-                )
             gathered = None
-            if fused_attn is None and L == 1 and mask is None and _decode_kernels is not None and _DECODE_FUSION:
+            if L == 1 and mask is None and _DECODE_FUSION:
                 gathered = _decode_kernels.dsa_gather_selected(
                     kv_latent, topk_indices[:, :, 0, :]
                 )
-            if fused_attn is not None:
-                pass
-            elif gathered is not None:
+            if gathered is not None:
                 kv_latent, attn_mask = gathered
             elif L == 1:
                 clamped = mx.clip(topk_indices[:, :, 0, :], 0, Kv - 1)
@@ -1449,13 +1440,6 @@ class Glm5NextSparseAttention(nn.Module):
                 if mask is not None and mask.dtype == mx.bool_:
                     sparse_mask = sparse_mask & mask
                 attn_mask = sparse_mask
-        elif L <= 8:
-            q_latent = (
-                q_latent_early
-                if q_latent_early is not None
-                else _mla_head_proj(self.embed_q, q)
-            )
-            fused_attn = self._decode_latent(q_latent, kv_latent, attn_mask, cache)
 
         if (
             cache is not None
@@ -1466,11 +1450,6 @@ class Glm5NextSparseAttention(nn.Module):
             deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
             if deps:
                 cache[0].keys = mx.depends(cache[0].keys, deps)
-
-        if fused_attn is not None:
-            output = _mla_head_proj(self.unembed_out, fused_attn)
-            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return self._finish(output, out_dense)
 
         # Short verification blocks use the same latent-space attention as
         # decode. Expanding every cached key and value into all heads makes
@@ -1503,7 +1482,7 @@ class Glm5NextSparseAttention(nn.Module):
         Returns ``(qr, q, compressed_kv, indexer_projected)`` or None.
         """
         B, L, D = x.shape
-        if _decode_kernels is None or not _DECODE_FUSION or B != 1 or L > _DECODE_BLOCK:
+        if not _DECODE_FUSION or B != 1 or L > _DECODE_BLOCK:
             return None
         if cache is None:
             return None
@@ -1528,46 +1507,6 @@ class Glm5NextSparseAttention(nn.Module):
         )
         return qr, qr_outs[0], outs[1], indexer_projected
 
-    def _decode_latent(self, q_latent, kv_latent, attn_mask, cache, indices=None):
-        """Latent-space attention of a decode/verify block (B == 1, L <= 8)
-        on the exact fused kernels (``decode_kernels.latent_attention``).
-
-        Covers the reference ``scaled_dot_product_attention`` call with the
-        embed_q queries ``q_latent`` and the latent cache as keys and values:
-        dense with no mask, a bool mask or "causal", and one-token sparse
-        decode through the selected indices. Returns the output or None.
-        """
-        q = q_latent
-        if (
-            _decode_kernels is None
-            or not _DECODE_FUSION
-            or q.shape[0] != 1
-            or not 1 <= q.shape[2] <= _DECODE_BLOCK
-        ):
-            return None
-        kv_cache = cache[0] if cache is not None and hasattr(cache, "__getitem__") else None
-        if kv_cache is not None and (
-            hasattr(kv_cache, "bits") or "TurboQuant" in type(kv_cache).__name__
-        ):
-            return None
-        mask_arr, causal = None, False
-        if isinstance(attn_mask, str):
-            if attn_mask != "causal":
-                return None
-            causal = True
-        elif attn_mask is not None:
-            if attn_mask.dtype != mx.bool_:
-                return None
-            mask_arr = attn_mask
-        return _decode_kernels.latent_attention(
-            q_latent,
-            kv_latent,
-            self.scale,
-            indices=indices,
-            mask=mask_arr,
-            causal=causal,
-        )
-
     def _gathered_attention(self, q, kv_latent, topk_indices):
         """Latent-space gather for short query blocks; returns pre-o_proj flat."""
         B, H, L, _ = q.shape
@@ -1576,14 +1515,6 @@ class Glm5NextSparseAttention(nn.Module):
         selected = topk_indices[:, 0]
         topk = selected.shape[-1]
         q_embedded = self.embed_q(q)
-        if _decode_kernels is not None and _DECODE_FUSION and B == 1:
-            # Same per-token gemv/softmax/gemv_t arithmetic, reading the
-            # selected latent rows in place for a chunk of heads at a time.
-            fused = _decode_kernels.latent_attention_sparse_rows(
-                q_embedded, kv_latent, selected[0], self.scale
-            )
-            if fused is not None:
-                return self.unembed_out(fused).transpose(0, 2, 1, 3).reshape(B, L, -1)
         clamped = mx.clip(selected, 0, Kv - 1)
         gathered = mx.take_along_axis(
             mx.broadcast_to(kv_latent[:, 0, None], (B, L, Kv, dim)),
@@ -1638,8 +1569,7 @@ class Glm5NextMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         if (
-            _decode_kernels is not None
-            and _DECODE_FUSION
+            _DECODE_FUSION
             and self.limit is not None
             and x.ndim == 3
             and x.shape[:2] == (1, 1)
@@ -1672,8 +1602,7 @@ class Glm5NextMoEGate(nn.Module):
 
     def __call__(self, x):
         if (
-            _decode_kernels is not None
-            and _DECODE_FUSION
+            _DECODE_FUSION
             and x.ndim == 3
             and x.shape[:2] == (1, 1)
             and self.n_group == 1
@@ -1693,8 +1622,7 @@ class Glm5NextMoEGate(nn.Module):
                 indices, scores = routed
                 return indices.reshape(1, 1, -1), scores.reshape(1, 1, -1)
         if (
-            _decode_kernels is not None
-            and _DECODE_FUSION
+            _DECODE_FUSION
             and x.ndim == 3
             and x.shape[0] == 1
             and 2 <= x.shape[1] <= _DECODE_BLOCK
@@ -1770,12 +1698,12 @@ class Glm5NextMoE(nn.Module):
         sw = self.switch_mlp
         shared = self.shared_experts
         if (
-            dk is None
-            or not _DECODE_FUSION
+            not _DECODE_FUSION
             or x.ndim != 3
             or x.shape[:2] != (1, 1)
             or gate.n_group != 1
             or shared is None
+            or not isinstance(sw, SwitchGLU)
             or gate.top_k >= _sort_threshold(*_switch_projections(sw))
         ):
             return None
@@ -1793,18 +1721,11 @@ class Glm5NextMoE(nn.Module):
         fused = dk.moe_gate_up_swiglu(
             x2, None, limit, routed_gate, routed_up, shared.gate_proj, shared.up_proj,
             select=(*logits, gate.top_k, gate.routed_scaling_factor, gate.norm_topk_prob),
-            split_shared=True,
         )
         if fused is None:
             return None
-        if len(fused) == 4:
-            act, shared_act, routes, weights = fused
-            y = dk.moe_down_combine(
-                act, routes, weights, sw.down_proj, shared.down_proj, shared_act_sep=shared_act
-            )
-        else:
-            act, routes, weights = fused
-            y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
+        act, routes, weights = fused
+        y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
         return None if y is None else y.reshape(x.shape)
 
     def _decode_experts(self, x, indices, scores):
@@ -1820,11 +1741,11 @@ class Glm5NextMoE(nn.Module):
         sw = self.switch_mlp
         shared = self.shared_experts
         if (
-            _decode_kernels is None
-            or not _DECODE_FUSION
+            not _DECODE_FUSION
             or x.ndim != 3
             or x.shape[0] != 1
             or indices.shape[:2] != x.shape[:2]
+            or not isinstance(sw, SwitchGLU)
             or indices.size >= _sort_threshold(*_switch_projections(sw))
         ):
             return None
@@ -1915,7 +1836,7 @@ class Glm5NextDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         defer: bool = False,
     ) -> mx.array:
-        if _decode_kernels is not None and _DECODE_FUSION:
+        if _DECODE_FUSION:
             # Settle (eagerly, once) how MLX's eager fp32 sigmoid evaluates;
             # the fused router inside the compiled FFN block follows it and
             # cannot probe while being traced.
@@ -2031,8 +1952,8 @@ class Glm5NextModel(nn.Module):
 
         # Evaluate layer by layer to bound prefill memory, but pipelined: the
         # GPU runs layer i while the host builds layer i + 1 (at most two
-        # layers in flight). Keep decode lazy; the MTP replacement loop must
-        # use the same policy.
+        # layers in flight). Decode and verify blocks only start evaluation
+        # early. The MTP replacement loop must use the same policy.
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
