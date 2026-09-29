@@ -54,7 +54,7 @@ _EXECUTOR_DRAIN_TIMEOUT = 10.0
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    DFlash 0.1.10+omlx.8 registers QwenGdnTargetOps, Gemma4TargetOps, and
     MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
     The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
