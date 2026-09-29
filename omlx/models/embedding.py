@@ -101,116 +101,44 @@ class MLXEmbeddingModel:
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
 
-    def _is_target_qwen3_embedding(self, module: Any = None) -> bool:
-        """Check if this is a tested non-quantized Qwen3-Embedding (0.6B or 8B) model."""
-        haystack_parts = [str(self.model_name).lower()]
+    # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
+    _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
 
-        model_path = Path(self.model_name)
-        config_path = model_path / "config.json"
-        is_quantized = False
+    def _should_promote_to_fp16(self) -> bool:
+        """Match an unquantized Qwen3-Embedding 0.6B or 8B checkpoint.
 
-        if config_path.is_file():
-            try:
-                with open(config_path) as fh:
-                    cfg = json.load(fh)
-                if isinstance(cfg, dict):
-                    if cfg.get("quantization"):
-                        is_quantized = True
-                    haystack_parts.append(str(cfg.get("_name_or_path", "")).lower())
-                    haystack_parts.append(str(cfg.get("model_type", "")).lower())
-                    for arch in cfg.get("architectures", []):
-                        haystack_parts.append(str(arch).lower())
-            except (OSError, ValueError):
-                pass
-
-        if module is not None:
-            mod_type = type(module)
-            haystack_parts.append(mod_type.__module__.lower())
-            haystack_parts.append(mod_type.__name__.lower())
-            cfg = getattr(module, "config", None)
-            if cfg is not None:
-                if isinstance(cfg, dict):
-                    if cfg.get("quantization"):
-                        is_quantized = True
-                    haystack_parts.append(str(cfg.get("_name_or_path", "")).lower())
-                    haystack_parts.append(str(cfg.get("model_type", "")).lower())
-                    for arch in cfg.get("architectures", []):
-                        haystack_parts.append(str(arch).lower())
-                else:
-                    if getattr(cfg, "quantization", None):
-                        is_quantized = True
-                    haystack_parts.append(str(getattr(cfg, "_name_or_path", "")).lower())
-                    haystack_parts.append(str(getattr(cfg, "model_type", "")).lower())
-                    for arch in getattr(cfg, "architectures", None) or []:
-                        haystack_parts.append(str(arch).lower())
-
-        haystack = " ".join(haystack_parts)
-
-        is_qwen3 = "qwen3" in haystack
-        is_emb = (
-            "embed" in haystack
-            or "qwen3fortextembedding" in haystack
-            or "mlx_embeddings.models.qwen3" in haystack
-        )
-        is_vl = "vl" in haystack or "qwen3_vl" in haystack or "qwen3vl" in haystack
-        is_tested_size = "0.6b" in haystack or "8b" in haystack
-
-        quant_indicators = (
-            "4bit",
-            "8bit",
-            "mxfp8",
-            "fp8",
-            "int4",
-            "int8",
-            "-q4",
-            "-q8",
-            "q4_",
-            "q8_",
-            "-oq",
-            "awq",
-            "gptq",
-            "quantized",
-        )
-        if any(q in haystack for q in quant_indicators):
-            is_quantized = True
-
-        return is_qwen3 and is_emb and (not is_vl) and is_tested_size and (not is_quantized)
-
-    def _resolve_embedding_dtype(self, module: Any = None):
-        """Target compute dtype for a loaded module, or None to leave it as-is.
-
-        Promotes bfloat16 checkpoints to float16 for tested non-quantized
-        Qwen3-Embedding models (0.6B and 8B): bf16 MLX embedding matmuls round
-        activations to bf16 and miss the 1e-3 conformance gate (measured
-        max|delta| 0.0037, vs 0.0006 for the identical weights computed in
-        fp16). Other model families and quantized variants remain unchanged.
+        bf16 matmuls miss the 1e-3 fp32 conformance gate on these models
+        (max |delta| 0.0037 vs 0.0006 in fp16). Other sizes are not validated.
         """
-        if module is None or not self._is_target_qwen3_embedding(module):
-            return None
-        for _, value in tree_flatten(module.parameters()):
-            if isinstance(value, mx.array) and value.dtype == mx.bfloat16:
-                return mx.float16
-        return None
+        try:
+            with open(Path(self.model_name) / "config.json") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(cfg, dict) or cfg.get("model_type") != "qwen3":
+            return False
+        if cfg.get("quantization") or cfg.get("quantization_config"):
+            return False
+        name = f"{self.model_name} {cfg.get('_name_or_path') or ''}".lower()
+        if "qwen3-embedding" not in name:
+            return False
+        shape = (cfg.get("hidden_size"), cfg.get("num_hidden_layers"))
+        return shape in self._FP16_PROMOTE_SHAPES
 
-    def _apply_embedding_dtype(self, module: Any) -> None:
-        """Promote bfloat16 parameters to float16 for tested Qwen3-Embedding models."""
-        target = self._resolve_embedding_dtype(module)
-        if target is None or module is None:
+    def _promote_bf16_to_fp16(self, module: Any) -> None:
+        if not self._should_promote_to_fp16():
+            return
+        params = module.parameters()
+        if not any(v.dtype == mx.bfloat16 for _, v in tree_flatten(params)):
             return
         module.update(
             tree_map(
-                lambda a: a.astype(target)
-                if isinstance(a, mx.array) and a.dtype == mx.bfloat16
-                else a,
-                module.parameters(),
+                lambda a: a.astype(mx.float16) if a.dtype == mx.bfloat16 else a,
+                params,
             )
         )
         mx.eval(module.parameters())
-        logger.info(
-            "Promoted bfloat16 parameters to %s for %s for numerical conformance",
-            target,
-            self.model_name,
-        )
+        logger.info("Promoted bfloat16 parameters to float16 for %s", self.model_name)
 
     # Fallbacks for MLX conversions that dropped the sentence-transformers
     # metadata. Reviewed against the concrete checkpoints on the Hub: none of
@@ -377,7 +305,6 @@ class MLXEmbeddingModel:
             weights = model_instance.sanitize(weights)
             self._validate_native_weights(model_instance, weights)
             model_instance.load_weights(list(weights.items()), strict=False)
-            self._apply_embedding_dtype(model_instance)
             mx.eval(model_instance.parameters())
             # Embedding inference must be deterministic: put the model in eval
             # mode so dropout (p>0 in XLM-RoBERTa/BERT) is disabled. Without this
@@ -442,7 +369,7 @@ class MLXEmbeddingModel:
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
             patch_modernbert_attention(self.model)
-            self._apply_embedding_dtype(self.model)
+            self._promote_bf16_to_fp16(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config
