@@ -343,9 +343,12 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
 
     original_call = cls.__call__
 
-    def __call__(self, x, mask=None, cache=None, gdn_sink=None):
+    def __call__(self, x, mask=None, cache=None, gdn_sink=None, defer=False):
         if gdn_sink is None:
-            return original_call(self, x, mask, cache)
+            return original_call(self, x, mask, cache, defer=defer)
+        deferred_cls = getattr(g5_lang, "_HCDeferred", None)
+        if deferred_cls is not None and isinstance(x, deferred_cls):
+            x = x.materialize()
         # Capture recurrent state only in KDA layers. Both attention families
         # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
@@ -364,7 +367,14 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
             if self._ffn_c is None:
-                self._ffn_c = mx.compile(self._ffn_block)
+                # The vendor's compile keeps the layer's weights out of the
+                # trace's constants (a leaked trace would pin them in memory).
+                compile_ffn_block = getattr(g5_lang, "compile_ffn_block", None)
+                self._ffn_c = (
+                    compile_ffn_block(self, self._ffn_block)
+                    if compile_ffn_block is not None
+                    else mx.compile(self._ffn_block)
+                )
             return self._ffn_c(x)
         return self._ffn_block(x)
 
@@ -415,7 +425,8 @@ def _patch_model_call(g5_lang: Any) -> None:
         )
         h = mx.contiguous(h)
 
-        # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
+        # This replaces Glm5NextModel.__call__; preserve its prefill memory
+        # policy and its one-token decode early evaluation.
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
@@ -425,15 +436,27 @@ def _patch_model_call(g5_lang: Any) -> None:
             if prefill
             else None
         )
+        eval_every = (
+            getattr(g5_lang, "_DECODE_EVAL_EVERY", 0) if h.shape[1] == 1 else 0
+        )
+        n_layers = len(self.layers)
+        # One-token decode defers each layer's last HC expand into the next
+        # layer, as Glm5NextModel.__call__ does.
+        deferred_cls = getattr(g5_lang, "_HCDeferred", None)
+        defer = deferred_cls is not None and gdn_sink is None and h.shape[:2] == (1, 1)
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             if gdn_sink is not None:
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+            elif defer:
+                h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
                 h = layer(h, mask=mask, cache=c)
             if pipeline is not None:
                 pipeline.push(h)
+            elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
+                mx.async_eval(h.arrays() if defer and isinstance(h, deferred_cls) else h)
         if pipeline is not None:
             pipeline.drain()
 
