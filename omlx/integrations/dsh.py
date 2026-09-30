@@ -593,7 +593,10 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
             f"generated credential store failed validation for {ref_name!r}"
         )
 
+    # The harness refuses to load a credential store with group/other bits.
+    credentials_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _write_config(credentials_path, text)
+    credentials_path.chmod(0o600)
 
 
 # ---------------------------------------------------------------------------

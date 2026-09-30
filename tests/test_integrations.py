@@ -2611,3 +2611,5 @@ class TestDshCredentialsRef:
             # back up.
             backups = list(tmp_path.glob(f"credentials-{index}.*.bak"))
             assert bool(backups) == (seed is not None), name
+            if seed is None:
+                assert path.stat().st_mode & 0o777 == 0o600, name
