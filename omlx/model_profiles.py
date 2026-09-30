@@ -144,11 +144,7 @@ def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_turboquant_kv_bits(value: Any) -> Any:
-    """Canonicalize numeric spellings without adding load-time validation.
-
-    Invalid legacy values must not cause the settings loader to discard a
-    model's other settings. Unset markers keep their existing semantics.
-    """
+    """Return float bits; keep invalid legacy values so other settings still load."""
     if isinstance(value, bool):
         return value
     try:
