@@ -2,7 +2,17 @@
 """HuggingFace model downloader for oMLX admin panel.
 
 Downloads models with huggingface_hub's snapshot_download, filesystem-based
-progress polling, and an isolated HTTP retry for xet transport failures.
+progress polling fed by both disk allocation and the transfer bar's network
+byte counts, and an isolated HTTP retry for xet transport failures.
+
+The task queue persists to a JSON file beside settings.json, so a restart
+re-queues interrupted downloads (resume is snapshot_download's own "skip
+finalized files" behaviour), and a row that is still pending or downloading
+keeps the credential the request supplied so a gated download resumes with
+it. Cancelling aborts every recorded xet download group, so a shard-parallel
+Rust transfer stops immediately instead of running to completion — including
+a group the call only opens after the cancel, once abort_xet_session() has
+already replaced its session.
 """
 
 import asyncio
@@ -14,7 +24,9 @@ import os
 import shutil
 import signal
 import sys
+import threading
 import time
+from collections import deque
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -40,16 +52,94 @@ logger = logging.getLogger(__name__)
 # Prevents server from hanging when HF is unreachable.
 _HF_API_TIMEOUT = 10
 
-# Seconds with no download progress before considering the download stalled.
+# Seconds with no payload activity (disk writes or wire bytes) before
+# considering the download stalled.
 _STALL_TIMEOUT = 300
 
 # A separate first-activity deadline catches xet token/CAS hangs that never
-# create a payload file. Once any write is observed, the more tolerant stall
-# timeout above applies so slow but active connections are left alone.
+# move the wire counter or create a payload file. Once any payload activity
+# is observed, the more tolerant stall timeout above applies so slow but
+# active connections are left alone.
 _STARTUP_STALL_TIMEOUT = 120
 
-_PROGRESS_POLL_INTERVAL = 2
+_PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds of byte-count history the reported speed averages over. One second
+# makes the readout a true per-second mean: a single interval reads as bursts
+# (0 between files, double during one) and an exponential average never
+# forgets the past. The display trails reality by at most one window plus one
+# poll interval, and stops moving only when the transfer stops.
+_SPEED_WINDOW = 1.0
+
+
+class _SlidingRate:
+    """Mean bytes/second over a sliding window of cumulative byte samples.
+
+    Subclasses turn their own signal into a monotone cumulative count and
+    hand it to :meth:`_record`; the window arithmetic (and therefore the
+    smoothing every readout uses) lives here once.
+    """
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        self.window = window
+        self._samples: deque[tuple[float, float]] = deque()
+
+    def _record(self, total: float, now: float) -> float:
+        self._samples.append((now, float(total)))
+        # Retire samples the window has outgrown, but keep one older sample
+        # as the anchor so every reading spans (at least) a full window.
+        while len(self._samples) > 2 and self._samples[1][0] < now - self.window:
+            self._samples.popleft()
+        if len(self._samples) < 2:
+            return 0.0
+        start_t, start_b = self._samples[0]
+        end_t, end_b = self._samples[-1]
+        span = end_t - start_t
+        if span <= 0:
+            return 0.0
+        return (end_b - start_b) / span
+
+
+class _SpeedMeter(_SlidingRate):
+    """Sliding-window bytes/second from per-file allocation continuity.
+
+    A sample is the path -> allocated-bytes mapping from one directory walk.
+    Only positive growth of paths that were also present in the previous
+    sample counts as transfer:
+
+    - A path first seen at non-zero size contributes nothing (a file moved or
+      copied in wholesale, a tree that vanished and came back, a walk that
+      aborted early and came back partial).
+    - A vanished path is forgotten, so if it reappears it starts from zero
+      instead of replaying its old size as fresh growth.
+    - A truncated path lowers its baseline, so the refill counts once, from
+      the new size.
+
+    Both hubs stage inside the target directory, so a real transfer always
+    grows paths that are already under watch.
+    """
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        super().__init__(window)
+        self._prev: dict[str, int] = {}
+
+    def add(self, files: dict, now: float | None = None) -> float:
+        """Record a per-file sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        growth = 0
+        prev = self._prev
+        for path, allocated in files.items():
+            before = prev.get(path)
+            if before is not None and allocated > before:
+                growth += allocated - before
+        # Replace rather than merge: forgotten paths must not carry a stale
+        # baseline across a disappearance, and a truncated file registers
+        # its new, smaller size as the baseline.
+        self._prev = dict(files)
+        total = (self._samples[-1][1] if self._samples else 0.0) + growth
+        return self._record(total, now)
+
 
 _NON_XET_WORKER_MODULE = "omlx._hf_download_worker"
 
@@ -163,6 +253,10 @@ class _DownloadActivity:
     logical_size: int = 0
     allocated_size: int = 0
     latest_mtime_ns: int = 0
+    # Per-file allocated bytes (path -> blocks), so the speed meter can
+    # follow file-level continuity instead of one aggregate number that
+    # jumps whenever files appear or vanish between walks.
+    files: dict = field(default_factory=dict)
 
 
 def _is_xet_transport_error(error: BaseException) -> bool:
@@ -187,7 +281,55 @@ def _is_xet_transport_error(error: BaseException) -> bool:
     return any(marker in detail for marker in _XET_ERROR_MARKERS)
 
 
-def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
+class _WireCounter:
+    """Cumulative network bytes reported by huggingface_hub's progress bars.
+
+    The xet transfer bar (``snapshot_download.transfer``) receives each
+    ``transfer_inc`` as it arrives from the network, while the filesystem
+    meter only sees bytes once buffered chunks are flushed to disk — during
+    xet's fetch phase that lag can be hundreds of MB of wire traffic
+    (``min_reconstruction_fetch_size``, 256MB) showing as 0 B/s on disk.
+    Feeding these callbacks into a second window keeps the readout live
+    during exactly the stretches where the disk meter reads zero.
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> None:
+        if n <= 0:
+            return
+        with self._lock:
+            self._value += int(n)
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class _WireSpeedMeter(_SlidingRate):
+    """Sliding-window bytes/second over a cumulative wire-byte counter.
+
+    Same window semantics as ``_SpeedMeter`` (the readout must not switch
+    smoothing between the fetch and reconstruction phases): the mean rate
+    over the last ``window`` seconds, so it moves within one poll interval
+    of any change and settles to zero once the counter stops advancing.
+    """
+
+    def add(self, total: int, now: float | None = None) -> float:
+        """Record a cumulative sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        return self._record(max(0.0, float(total)), now)
+
+
+def _make_cancellable_tqdm(
+    should_cancel: Callable[[], bool],
+    on_wire_bytes: Callable[[int], None] | None = None,
+) -> type:
     """Build a tqdm subclass that aborts the download when cancelled.
 
     huggingface_hub's http_get calls ``progress.update(len(chunk))`` once per
@@ -201,10 +343,37 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
     callback exception until the whole transfer finishes (issue #1322), so
     cancellation there is driven by ``abort_xet_session()`` instead; this
     class is kept as the raise-on-next-chunk backstop for http_get.
+
+    When ``on_wire_bytes`` is given, snapshot_download's transfer bar
+    (``bar_format=XET_TRANSFER_BAR_FORMAT``, which — unlike the reconstruction
+    bar and the default per-file/meta formats — carries no ``{total_fmt}``
+    because network byte totals are unpredictable) reports each increment as
+    it arrives from the network. Every other bar in the pipeline (disk
+    reconstruction bytes, per-file counters, the meta file-count bar) only
+    participates in cancellation, so wire and disk bytes are never summed
+    twice.
     """
 
     class _CancellableTqdm(_hf_tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            fmt = kwargs.get("bar_format")
+            # After init, tqdm keeps bar_format as passed (None for the
+            # default format), so classify from the resolved attribute too.
+            if fmt is None:
+                fmt = getattr(self, "bar_format", None)
+            self._wire_bar = (
+                on_wire_bytes is not None
+                and isinstance(fmt, str)
+                and "total_fmt" not in fmt
+            )
+
         def update(self, n=1):
+            if self._wire_bar and n:
+                try:
+                    on_wire_bytes(int(n))
+                except Exception:  # noqa: BLE001 — metering must never break a transfer
+                    logger.debug("wire-byte hook failed", exc_info=True)
             if should_cancel():
                 raise _DownloadCancelled()
             return super().update(n)
@@ -271,6 +440,28 @@ class DownloadStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+def _read_float(value, default: float = 0.0) -> float:
+    """A number this build cannot read reads as its default, never a raise.
+
+    Persisted rows outlive the code that wrote them: an ISO timestamp where a
+    float belongs, a counter stored as text, a JSON null. Every reader of the
+    queue file funnels through here (and :func:`_read_int`) so one such field
+    costs only that field, not the row.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_int(value, default: int = 0) -> int:
+    """Integer twin of :func:`_read_float`; see why there."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class DownloadTask:
     """Represents a single model download task."""
@@ -281,7 +472,16 @@ class DownloadTask:
     progress: float = 0.0
     total_size: int = 0
     downloaded_size: int = 0
+    # Smoothed transfer rate in bytes/second over the last poll intervals.
+    # 0.0 whenever the task is not actively transferring.
+    speed_bps: float = 0.0
     error: str = ""
+    # Request-supplied credential (HF or MS token). Kept for restart
+    # recovery only: _write_tasks_file persists it (owner-only file) so a
+    # restored row resumes private/gated downloads with the credentials
+    # that queued them. Deliberately absent from to_dict() — the queue API
+    # must never hand tokens back to clients.
+    token: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
@@ -296,12 +496,49 @@ class DownloadTask:
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
             "downloaded_size": self.downloaded_size,
+            "speed_bps": round(self.speed_bps, 1),
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "retry_count": self.retry_count,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DownloadTask":
+        """Rebuild a task from :meth:`to_dict` output.
+
+        Used to restore rows after a restart. An unknown status value (a row
+        written by a newer build) folds into FAILED so the entry still
+        displays and stays retryable instead of crashing the queue load, and
+        every numeric field is read through _read_float/_read_int for the same
+        reason: a timestamp or counter this build cannot parse must not cost
+        the whole row — only a missing task_id/repo_id (the row's identity)
+        makes it unpersistable.
+        """
+        task = cls(
+            task_id=str(data["task_id"]),
+            repo_id=str(data["repo_id"]),
+        )
+        try:
+            # A missing status is as unknown as one this build does not
+            # recognise: it folds into FAILED rather than reading as a queue
+            # row this boot never started and the next boot then starts.
+            task.status = DownloadStatus(data.get("status") or "")
+        except ValueError:
+            task.status = DownloadStatus.FAILED
+        task.progress = _read_float(data.get("progress"))
+        task.total_size = _read_int(data.get("total_size"))
+        task.downloaded_size = _read_int(data.get("downloaded_size"))
+        task.error = str(data.get("error", ""))
+        # Credential for a later retry/resume; rows written before the
+        # token field existed simply fall back to hub's env/login lookup.
+        task.token = str(data.get("token") or "")
+        task.created_at = _read_float(data.get("created_at")) or task.created_at
+        task.started_at = _read_float(data.get("started_at"))
+        task.completed_at = _read_float(data.get("completed_at"))
+        task.retry_count = _read_int(data.get("retry_count"))
+        return task
 
 
 _DTYPE_BYTES = {
@@ -563,7 +800,495 @@ _SORT_MAP = {
 }
 
 
-class HFDownloader:
+def _write_tasks_file(path: Path, tasks) -> None:
+    """Atomically persist task rows for restart recovery.
+
+    Written owner-only (mode 0600) via a temp file + rename, so a crash
+    mid-write never leaves a truncated queue behind and no other user can
+    read the rows while they are being written. Callers gate on their own
+    lifecycle flags (restore/shutdown) before getting here.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = []
+        for task in sorted(tasks, key=lambda t: t.created_at):
+            row = task.to_dict()
+            # to_dict() never carries the credential (the API must not echo
+            # it), and neither does a finished row: only a row that can
+            # still be resumed needs the token the request supplied. A
+            # terminal row keeps it in memory for a retry in this process
+            # but is written without it, so tokens do not outlive the
+            # download that needed them.
+            row["token"] = (
+                task.token
+                if task.status
+                in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING)
+                else ""
+            )
+            payload.append(row)
+        tmp_path = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_CREAT's mode only applies when this call creates the file, and the
+        # temp name is reused, so an earlier writer's mode would stand.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
+        tmp_path.replace(path)
+    except OSError as exc:
+        logger.warning(
+            "Could not persist download tasks to %s: %s", path, exc
+        )
+
+
+def _read_tasks_file(path: Path | None) -> list[dict]:
+    """Read persisted task rows; a missing or corrupt file yields []."""
+    if path is None or not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read persisted download tasks from %s: %s", path, exc
+        )
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _persist_queue(downloader) -> None:
+    """Write the queue to disk — no-op outside normal operation.
+
+    Skipped while restoring (the on-disk queue must stay intact until
+    every interrupted row has been re-queued) and during shutdown
+    (interrupted rows must keep saying "downloading" so the next boot
+    resumes them instead of seeing this process's dying cancelled state).
+    """
+    if (
+        downloader._tasks_file is None
+        or downloader._restoring
+        or downloader._shutting_down
+    ):
+        return
+    _write_tasks_file(downloader._tasks_file, downloader._tasks.values())
+
+
+async def _restore_queue(downloader, logger) -> None:
+    """Restore the persisted queue after a restart.
+
+    Rows interrupted mid-download (pending/downloading) re-enter through
+    the downloader's own start_download, which resumes from files already
+    on disk and re-serializes behind the download semaphore; terminal rows
+    come back as display-only entries so a failed or cancelled download
+    stays retryable. The row's persisted request-supplied token rides
+    along with the resumed download (credential recovery for private and
+    gated repos); when a row carries none, start_download hands an empty
+    token — hub then falls back to HF_TOKEN/the login cache, ModelScope to
+    its env/anonymous fallback — and a resume that still fails on auth
+    lands in FAILED where the user can re-enter a credential and retry.
+    Never raises: a corrupt queue file only loses the queue, and a row the
+    environment refuses (an SDK that went away between boots — anything
+    start_download raises beyond ValueError) stays on disk for a boot that
+    can start it, because the healing rewrite below skips that row.
+    """
+    entries = _read_tasks_file(downloader._tasks_file)
+    if not entries:
+        return
+    downloader._restoring = True
+    # Set when a row could not start for a reason that is not the row's
+    # own (the environment refused it). Those rows must stay on disk for
+    # the next boot, so the healing rewrite below is skipped entirely.
+    deferred = False
+    try:
+        for entry in sorted(
+            (e for e in entries if isinstance(e, dict)),
+            # Order persisted rows oldest first, and carry their queue
+            # position over. A row a build that stored the field
+            # differently left behind reads as 0.0 instead of raising:
+            # inside ``sorted`` a single bad value would abort the whole
+            # restore, and outside it the assignment below would drop
+            # every row behind it as well as the healing rewrite.
+            key=lambda e: _read_float(e.get("created_at")),
+        ):
+            status = entry.get("status")
+            if status in (
+                DownloadStatus.PENDING.value,
+                DownloadStatus.DOWNLOADING.value,
+            ):
+                repo_id = entry.get("repo_id")
+                if not isinstance(repo_id, str):
+                    continue
+                try:
+                    task = await downloader.start_download(
+                        repo_id, str(entry.get("token") or "")
+                    )
+                except ValueError as exc:
+                    # The row itself is bad (invalid repo/model id, or
+                    # already queued): it can never start, so let the
+                    # rewrite below forget it.
+                    logger.warning(
+                        "Could not resume download %s: %s", repo_id, exc
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 — restore never raises
+                    # Not the row's fault: start_download refused the
+                    # environment (an SDK that went away between boots, an
+                    # unexpected failure upstream). Keep restoring the rows
+                    # behind it and leave the on-disk queue untouched, so
+                    # the next boot retries this one instead of the healing
+                    # rewrite dropping it.
+                    logger.warning(
+                        "Deferring resume of %s to the next boot: %s",
+                        repo_id,
+                        exc,
+                    )
+                    deferred = True
+                    continue
+                # Keep the pre-restart queue position and retry history.
+                # A row this build cannot read keeps the fresh task's own
+                # values instead of aborting the restore for the rows
+                # behind it — the same tolerance from_dict gets (a retry
+                # count this build cannot read reads as none, not raises).
+                task.created_at = (
+                    _read_float(entry.get("created_at")) or task.created_at
+                )
+                task.retry_count = _read_int(entry.get("retry_count"))
+                logger.info("Resumed interrupted download: %s", repo_id)
+                continue
+            try:
+                task = DownloadTask.from_dict(entry)
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Skipping unpersistable download row: %s",
+                    {k: v for k, v in entry.items() if k != "token"},
+                )
+                continue
+            downloader._tasks.setdefault(task.task_id, task)
+    finally:
+        downloader._restoring = False
+    if not deferred:
+        downloader._persist()
+
+
+class _QueuePersistenceMixin:
+    """The restart-surviving queue shared by both downloader backends.
+
+    HuggingFace and ModelScope differ only in how a download runs; the queue
+    file, its lifecycle gates, the restore walk and the one directory walk
+    that feeds progress, liveness and the speed meter are the same.
+    """
+
+    @staticmethod
+    def _get_download_activity(path: Path) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files."""
+        if not path.exists():
+            return _DownloadActivity()
+        file_count = 0
+        logical_size = 0
+        allocated_size = 0
+        latest_mtime_ns = 0
+        files: dict[str, int] = {}
+        try:
+            for file_path in path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                logical_size += stat.st_size
+                blocks = getattr(stat, "st_blocks", 0) * 512
+                allocated_size += blocks
+                files[str(file_path)] = blocks
+                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        except OSError:
+            # A walk aborted mid-way (concurrent cleanup) under-counts.
+            # Hand the partial `files` map to the meter anyway: paths that
+            # drop out are forgotten, so when they show up again they read
+            # as first-sight (0) instead of replaying as a giant delta.
+            pass
+        return _DownloadActivity(
+            file_count=file_count,
+            logical_size=logical_size,
+            allocated_size=allocated_size,
+            latest_mtime_ns=latest_mtime_ns,
+            files=files,
+        )
+
+    def _init_queue(self, tasks_file: str | Path | None) -> None:
+        # Where the queue persists for restart recovery; None disables
+        # persistence (tests and embedders manage their own lifecycle).
+        self._tasks_file = Path(tasks_file) if tasks_file else None
+        # _persist() stays silent while either flag is set: shutdown must
+        # leave on-disk rows reading "pending/downloading" so the next boot
+        # resumes them, and restore must not rewrite the queue until every
+        # interrupted row has been re-queued.
+        self._shutting_down = False
+        self._restoring = False
+
+    def _persist(self) -> None:
+        """Persist the queue; the lifecycle gates live in _persist_queue."""
+        _persist_queue(self)
+
+    async def restore_tasks(self) -> None:
+        """Restore the persisted queue after a restart; see _restore_queue."""
+        await _restore_queue(self, logger)
+
+
+# Every xet download group still in flight. snapshot_download shards files
+# across hf_thread_map workers, so one snapshot runs many xet_get() calls
+# concurrently — one XetFileDownloadGroup per file — and cancel/shutdown must
+# abort all of them. Groups register on creation and unregister when their
+# `with` block settles, so this registry only holds live transfers.
+_xet_groups: list = []
+# One token per snapshot_download call that is running right now, plus the
+# subset of those calls whose transfer was already aborted. A cancel that
+# lands before the call reaches its first xet_get() finds an empty registry,
+# and abort_xet_session() cannot cover the gap either: it only drops the
+# session, so that call's next get_xet_session() builds a fresh one and the
+# group opened on it would never be aborted. Each call registers a token
+# before its work starts and drops it when its worker returns.
+_xet_live_calls: set = set()
+_xet_aborted_calls: set = set()
+# The call the current thread is downloading for. hub opens the xet groups on
+# its per-file worker threads, so _install_xet_call_marking marks those too;
+# attributing a group this way keeps an abort from reaching a download that
+# started after the cancel while the cancelled worker is still unwinding.
+_xet_call_in_thread = threading.local()
+_xet_group_lock = threading.Lock()
+
+
+def _open_xet_call() -> object:
+    """Register one running snapshot_download call; see _xet_live_calls."""
+    call = object()
+    with _xet_group_lock:
+        _xet_live_calls.add(call)
+    return call
+
+
+def _close_xet_call(call: object) -> None:
+    """Drop a settled call and any abort flag it was still carrying."""
+    with _xet_group_lock:
+        _xet_live_calls.discard(call)
+        _xet_aborted_calls.discard(call)
+
+
+def _abort_xet_call(call: object) -> None:
+    """Flag one live call: every group it opens from now on is aborted."""
+    with _xet_group_lock:
+        if call in _xet_live_calls:
+            _xet_aborted_calls.add(call)
+
+
+def _mark_xet_call(call) -> None:
+    """Make ``call`` own the xet groups opened on this thread."""
+    _xet_call_in_thread.call = call
+
+
+def _register_xet_group(group) -> bool:
+    """Record an in-flight xet download group (identity-deduplicated).
+
+    Returns True when the group belongs to a call that was already aborted;
+    its caller then aborts the group instead of leaving it registered.
+    Testing the flag and registering share one lock, so a cancel landing in
+    between still leaves the group reachable: it is either in the registry
+    when that abort snapshots it, or aborted on the spot here.
+    """
+    call = getattr(_xet_call_in_thread, "call", None)
+    with _xet_group_lock:
+        if call is not None and call in _xet_aborted_calls:
+            return True
+        if not any(g is group for g in _xet_groups):
+            _xet_groups.append(group)
+        return False
+
+
+def _unregister_xet_group(group) -> None:
+    """Drop a group whose download settled; a miss means abort ran first."""
+    with _xet_group_lock:
+        _xet_groups[:] = [g for g in _xet_groups if g is not group]
+
+
+def _abort_xet_group(group) -> bool:
+    """Abort one group. True if the abort was accepted."""
+    try:
+        group.abort()
+        return True
+    except Exception:  # pragma: no cover - stale or already-finished
+        logger.debug("xet group abort failed", exc_info=True)
+        return False
+
+
+def _abort_xet_transfers() -> bool:
+    """Abort every active recorded xet group. True if one was aborted."""
+    with _xet_group_lock:
+        groups = list(_xet_groups)
+        _xet_groups.clear()
+        # A call that has not opened a group yet is unreachable through the
+        # registry; flag it so the group it opens later is aborted on sight.
+        _xet_aborted_calls.update(_xet_live_calls)
+    aborted = False
+    for group in groups:
+        if _abort_xet_group(group):
+            aborted = True
+    return aborted
+
+
+def _tracked_snapshot_download(func, is_cancelled, /, **kwargs):
+    """Run one snapshot_download call, tracking it for post-abort groups.
+
+    The call is registered while its worker runs and dropped in a
+    ``finally``, so the flag can never outlive the only worker that could
+    still open a group for it. ``is_cancelled`` is re-read before the call
+    starts: a cancel that landed before this worker registered would not
+    have flagged it, and the call would otherwise recreate the session and
+    download into the void.
+    """
+    call = _open_xet_call()
+    previous = getattr(_xet_call_in_thread, "call", None)
+    _mark_xet_call(call)
+    try:
+        if is_cancelled():
+            _abort_xet_call(call)
+        return func(**kwargs)
+    finally:
+        _mark_xet_call(previous)
+        _close_xet_call(call)
+
+
+def _install_xet_call_marking() -> None:
+    """Attribute hub's per-file download threads to the call they serve.
+
+    snapshot_download maps its files across a ThreadPoolExecutor, so the xet
+    groups are opened on threads other than the one that owns the call.
+    Wrapping hub's thread-map entry point re-marks each worker for the
+    duration of one file, which is what lets a group be attributed to the
+    transfer that owns it. Best effort, like the group capture above: without
+    the marker a group is unattributed and only the registry can abort it, so
+    downloads keep working either way.
+    """
+    try:
+        from huggingface_hub import _snapshot_download as hub_snapshot
+
+        original = hub_snapshot.hf_thread_map
+        if getattr(original, "_omlx_call_marking", False):
+            return
+
+        def hf_thread_map_with_call_marking(fn, iterable, **kwargs):
+            # Called on the download's own thread where the marker is set;
+            # hub's workers only inherit it through the wrapper below.
+            call = getattr(_xet_call_in_thread, "call", None)
+            if call is None:
+                return original(fn, iterable, **kwargs)
+
+            def marked(item):
+                previous = getattr(_xet_call_in_thread, "call", None)
+                _mark_xet_call(call)
+                try:
+                    return fn(item)
+                finally:
+                    _mark_xet_call(previous)
+
+            return original(marked, iterable, **kwargs)
+
+        hf_thread_map_with_call_marking._omlx_call_marking = True
+        hub_snapshot.hf_thread_map = hf_thread_map_with_call_marking
+    except Exception:  # pragma: no cover - defensive against hub refactors
+        logger.debug("xet call marking not installed", exc_info=True)
+
+
+class _TrackedXetGroup:
+    """Context-manager wrapper that keeps the active-group registry in sync.
+
+    hub opens one group per file (``with session.new_file_download_group()``
+    inside ``xet_get``) and snapshot_download runs those concurrently, so
+    cancel must be able to reach every group that is still transferring.
+    The proxy registers the group at creation; this wrapper unregisters it
+    when the ``with`` block exits, so a settled group is never aborted
+    later and an active one can never be missed.
+    """
+
+    __slots__ = ("_group",)
+
+    def __init__(self, group) -> None:
+        self._group = group
+
+    def __enter__(self):
+        try:
+            entered = self._group.__enter__()
+        except BaseException:
+            # The `with` statement skips __exit__ when __enter__ raises,
+            # so drop the registration here or a failed handshake would
+            # leak a stale entry into the registry.
+            _unregister_xet_group(self._group)
+            raise
+        # XetFileDownloadGroup.__enter__ returns itself; hand hub whatever
+        # it yields so the real group drives the transfer.
+        return self._group if entered is None else entered
+
+    def __exit__(self, *exc_info):
+        try:
+            return self._group.__exit__(*exc_info)
+        finally:
+            _unregister_xet_group(self._group)
+
+    def __getattr__(self, name: str):
+        return getattr(self._group, name)
+
+
+class _XetSessionProxy:
+    """Delegating XetSession wrapper that records download groups.
+
+    huggingface_hub exposes no cancellation hook for the transfers it
+    starts, but ``XetFileDownloadGroup.abort()`` cancels the group's active
+    downloads while leaving the session usable — the precise stop that
+    ``sigint_abort()`` alone does not deliver for a long reconstruction
+    (the Rust side only checks the session flag at task boundaries, so a
+    ghost transfer can keep running minutes after a cancel). Every other
+    session attribute passes through untouched, so uploads and future hub
+    APIs keep working.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def new_file_download_group(self, *args, **kwargs):
+        group = self._inner.new_file_download_group(*args, **kwargs)
+        if _register_xet_group(group):
+            # abort_xet_session() dropped the session this call's cancel
+            # aborted, so the group it just opened on the fresh session is
+            # the one that abort could not reach: stop it on sight.
+            _abort_xet_group(group)
+        return _TrackedXetGroup(group)
+
+
+def _install_xet_group_capture() -> None:
+    """Route get_xet_session() through the recording proxy (idempotent).
+
+    hub imports ``get_xet_session`` by name from its module at call time,
+    so replacing the module attribute takes effect for the next download.
+    Best effort: if a future hub refactors the seam, downloads keep working
+    and cancellation just falls back to ``abort_xet_session()``.
+    """
+    try:
+        from huggingface_hub.utils import _xet as hub_xet
+
+        original = hub_xet.get_xet_session
+        if getattr(original, "_omlx_group_capture", False):
+            return
+
+        def get_xet_session_with_capture():
+            return _XetSessionProxy(original())
+
+        get_xet_session_with_capture._omlx_group_capture = True
+        hub_xet.get_xet_session = get_xet_session_with_capture
+    except Exception:  # pragma: no cover - defensive against hub refactors
+        logger.debug("xet group capture not installed", exc_info=True)
+
+
+class HFDownloader(_QueuePersistenceMixin):
     """Manages HuggingFace model downloads with progress tracking.
 
     Uses huggingface_hub.snapshot_download() for actual downloads and polls
@@ -892,6 +1617,7 @@ class HFDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        tasks_file: str | Path | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
@@ -899,6 +1625,7 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._init_queue(tasks_file)
         self._stalled: dict[str, _DownloadStalledError] = {}
         self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
         self._download_sem = asyncio.Semaphore(1)
@@ -945,12 +1672,18 @@ class HFDownloader:
 
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        # Keep the request-supplied credential with the row so a restart
+        # can resume gated downloads (the API never returns it).
+        task.token = hf_token or ""
         self._tasks[task_id] = task
 
         # Start download in background
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, hf_token)
         )
+        # The queued row must reach disk before anything can crash it, so a
+        # restart re-queues this download instead of dropping it.
+        self._persist()
 
         logger.info(f"Download queued: {repo_id} (task_id={task_id})")
         return task
@@ -976,13 +1709,23 @@ class HFDownloader:
         # Mark as cancelled
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+        # User intent: persist now so a restart does NOT resume this row.
+        self._persist()
 
-        # A task in DOWNLOADING owns the download semaphore, so the in-flight
-        # xet transfer is necessarily this one; aborting the (global) session
-        # makes its snapshot_download thread unwind immediately. Pending tasks
-        # must not abort, that would kill another task's transfer. The next
-        # download lazily creates a fresh session.
+        # A task in DOWNLOADING owns the download semaphore, so every group
+        # in the registry belongs to this task's shard-parallel transfer;
+        # aborting the (global) session makes its snapshot_download thread
+        # unwind immediately. Pending tasks must not abort, that would kill
+        # another task's transfer. The next download lazily creates a fresh
+        # session.
         if was_downloading:
+            # Group abort stops every shard's transfer where it stands —
+            # snapshot_download runs files concurrently, each with its own
+            # group, and all of them are registered. sigint_abort only flips
+            # a session flag that a long reconstruction may not check until
+            # it finishes (xet-core#1322 ghost downloads), so keep it as the
+            # backstop for anything the groups missed.
+            _abort_xet_transfers()
             abort_xet_session()
 
         # Stop progress polling
@@ -1016,6 +1759,8 @@ class HFDownloader:
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
+        # The row is gone from memory; drop it from disk too.
+        self._persist()
         return True
 
     async def retry_download(
@@ -1052,9 +1797,16 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        # Start fresh download (snapshot_download resumes from existing files).
+        # An empty retry token means "no new credential entered" (the app's
+        # retry sends none): keep the stored one instead of wiping it, so a
+        # retry after a restart still reaches a private repository.
+        new_task = await self.start_download(repo_id, hf_token or old_task.token)
         new_task.retry_count = old_retry_count + 1
+        # start_download persisted the row before this bookkeeping; write
+        # again so a crash right after a retry keeps the count and the
+        # (possibly re-entered) credential on disk too.
+        self._persist()
         return new_task
 
     def get_tasks(self) -> list[dict]:
@@ -1066,6 +1818,10 @@ class HFDownloader:
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
+        # Leave the persisted queue untouched: rows stay "pending/downloading"
+        # on disk so the next boot resumes them; the cancelled states below
+        # are this process's dying breath, not user intent.
+        self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
             if not progress_task.done():
@@ -1084,7 +1840,11 @@ class HFDownloader:
                     task.status = DownloadStatus.CANCELLED
         self._active_tasks.clear()
 
-        # Reap any in-flight xet transfer thread (no-op without a session).
+        # Reap any in-flight xet transfer threads: group abort stops every
+        # shard's Rust transfer where it stands (sigint alone can leave a
+        # reconstruction running, which would hang the non-daemon writer
+        # thread on interpreter exit), sigint is the backstop.
+        _abort_xet_transfers()
         abort_xet_session()
 
         logger.info("HF Downloader shut down")
@@ -1097,6 +1857,11 @@ class HFDownloader:
         thread while polling the target directory for progress updates.
         """
         task = self._tasks[task_id]
+
+        # Cancellation reaches the Rust transfers through the groups this
+        # records; install once, idempotently, before any xet session exists.
+        _install_xet_group_capture()
+        _install_xet_call_marking()
 
         try:
             async with self._download_sem:
@@ -1192,20 +1957,26 @@ class HFDownloader:
                         f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
+                wire_counter = _WireCounter()
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
+                    self._poll_progress(task_id, target_dir, wire_counter)
                 )
 
                 xet_error: Exception | None = None
                 try:
                     # Awaiting the thread here is intentional: after a stall,
                     # fallback cannot start until abort_xet_session() has made
-                    # the original writer return.
+                    # the original writer return. The wrapper keeps this call
+                    # registered for aborts that arrive before its first
+                    # xet_get(), when the group registry is still empty.
                     await asyncio.to_thread(
+                        _tracked_snapshot_download,
                         snapshot_download,
+                        lambda: task_id in self._cancelled,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
-                            lambda: task_id in self._cancelled
+                            lambda: task_id in self._cancelled,
+                            on_wire_bytes=wire_counter.add,
                         ),
                     )
                 except Exception as error:
@@ -1231,8 +2002,13 @@ class HFDownloader:
                     progress_task = self._progress_tasks.pop(task_id, None)
                     if progress_task and not progress_task.done():
                         progress_task.cancel()
+                    # The HTTP worker cannot reuse xet's chunk cache: it
+                    # refetches the payload into the target dir, so the
+                    # fetch-phase wire bytes no longer describe bytes any
+                    # file of this task owns. Start the replacement poll
+                    # from zero.
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir)
+                        self._poll_progress(task_id, target_dir, _WireCounter())
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -1253,6 +2029,7 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
+                task.speed_bps = 0.0
                 if size_estimated or not task.total_size:
                     # The estimate was only a progress denominator; report
                     # the measured on-disk size once the download is done.
@@ -1319,6 +2096,11 @@ class HFDownloader:
 
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
+
+            # Persist whatever terminal state the run settled on (completed,
+            # failed, or user-cancelled). Skipped during shutdown so an
+            # interrupted row survives for the next boot to resume.
+            self._persist()
 
     async def _run_http_fallback(
         self,
@@ -1388,7 +2170,9 @@ class HFDownloader:
                 return
             await process.wait()
 
-    async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
+    async def _poll_progress(
+        self, task_id: str, target_dir: Path, wire: _WireCounter | None = None
+    ) -> None:
         """Poll the target directory to estimate download progress.
 
         Uses both directory size and file modification times to detect
@@ -1396,7 +2180,13 @@ class HFDownloader:
         in, so size alone may not change for extended periods. File mtimes
         are updated on each write syscall and serve as a more reliable
         liveness signal.
+
+        The wire counter extends both duties across xet's fetch phase:
+        reported progress may come from bytes that are on the network but
+        not yet reconstructed on disk, and wire movement keeps the stall
+        deadline fresh while the filesystem stays silent.
         """
+        wire = wire or _WireCounter()
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -1404,6 +2194,24 @@ class HFDownloader:
         last_activity = self._get_download_activity(target_dir)
         last_activity_at = time.monotonic()
         observed_activity = False
+        # Two speed sources over the same payload, one per pipeline stage:
+        # APFS allocated blocks (grow as bytes are written, including into
+        # sparse/preallocated files) and the transfer bar's network-byte
+        # counter (xet fetch phase, where disk writes lag by up to a 256MB
+        # reconstruction block). Prime both windows with baselines taken
+        # before the first sleep so the first reading covers real transfer
+        # time rather than startup delay.
+        speed_meter = _SpeedMeter()
+        speed_meter.add(last_activity.files, now=last_activity_at)
+        wire_meter = _WireSpeedMeter()
+        wire_meter.add(wire.value, now=last_activity_at)
+        last_wire = wire.value
+        # Bytes already on disk when this attempt started. A resumed
+        # download re-fetches only what is missing, so the wire counter
+        # measures the remainder while the disk already holds the files
+        # from earlier attempts: the wire delta is progress on top of this
+        # baseline (and is 0 for a fresh download).
+        base_logical = last_activity.logical_size
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1413,14 +2221,41 @@ class HFDownloader:
                     break
 
                 activity = self._get_download_activity(target_dir)
-                task.downloaded_size = activity.logical_size
+                wire_now = wire.value
 
+                # Progress follows whichever pipeline stage is further along:
+                # fetch-phase bytes exist only on the wire (reconstruction
+                # lags by up to a 256MB block) and reconstruction-phase bytes
+                # only on disk. Bytes this attempt flushed are already counted
+                # by the disk, so only the wire bytes the disk has not caught
+                # up with are added: a fresh download reduces to
+                # max(disk, wire), and a resume — the disk already holds the
+                # earlier files while the wire counts only the remainder —
+                # stays live instead of parking on the disk figure for the
+                # whole fetch phase. Both readings are cumulative, so the
+                # report never regresses, and snapshot_download's completion
+                # write has the final word.
+                disk_growth = max(0, activity.logical_size - base_logical)
+                reported = activity.logical_size + max(0, wire_now - disk_growth)
                 if task.total_size > 0:
+                    reported = min(reported, task.total_size)
                     # Cap at 99% until snapshot_download confirms completion
                     task.progress = min(
-                        (activity.logical_size / task.total_size) * 100,
+                        (reported / task.total_size) * 100,
                         99.0,
                     )
+                task.downloaded_size = reported
+
+                disk_bps = speed_meter.add(activity.files)
+                wire_bps = wire_meter.add(wire_now)
+                # Report the larger of the two stages, never their sum: the
+                # fetch phase advances only the wire counter, the
+                # reconstruction flush advances only the disk meter, and a
+                # genuine stall leaves both at zero.
+                task.speed_bps = max(disk_bps, wire_bps)
+
+                wire_moved = wire_now > last_wire
+                last_wire = wire_now
 
                 if activity != last_activity:
                     # A zero-byte temp file or metadata touch is not payload
@@ -1429,6 +2264,16 @@ class HFDownloader:
                     if activity.allocated_size > last_activity.allocated_size:
                         observed_activity = True
                     last_activity = activity
+                    last_activity_at = time.monotonic()
+                    continue
+
+                if wire_moved:
+                    # Payload on the wire is progress even while xet's fetch
+                    # phase keeps the filesystem silent: keep the stall
+                    # deadline fresh, and count bytes past the token/CAS
+                    # handshake as observed activity — that handshake, not
+                    # the silent fetch, is what the startup deadline guards.
+                    observed_activity = True
                     last_activity_at = time.monotonic()
                     continue
 
@@ -1460,55 +2305,10 @@ class HFDownloader:
                     break
         except asyncio.CancelledError:
             pass
-
-    @staticmethod
-    def _get_download_activity(path: Path) -> _DownloadActivity:
-        """Return size, allocation, and mtime signals including Hub temp files."""
-        if not path.exists():
-            return _DownloadActivity()
-        file_count = 0
-        logical_size = 0
-        allocated_size = 0
-        latest_mtime_ns = 0
-        try:
-            for file_path in path.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                try:
-                    stat = file_path.stat()
-                except OSError:
-                    continue
-                file_count += 1
-                logical_size += stat.st_size
-                allocated_size += getattr(stat, "st_blocks", 0) * 512
-                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-        except OSError:
-            pass
-        return _DownloadActivity(
-            file_count=file_count,
-            logical_size=logical_size,
-            allocated_size=allocated_size,
-            latest_mtime_ns=latest_mtime_ns,
-        )
-
-    @staticmethod
-    def _get_latest_mtime(path: Path) -> float:
-        """Return the most recent modification time of any file in a directory."""
-        if not path.exists():
-            return 0.0
-        latest = 0.0
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    try:
-                        mt = f.stat().st_mtime
-                        if mt > latest:
-                            latest = mt
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return latest
+        finally:
+            # Terminal states (done, failed, cancelled, stalled) report no
+            # rate — only a live transfer has a speed.
+            task.speed_bps = 0.0
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:
