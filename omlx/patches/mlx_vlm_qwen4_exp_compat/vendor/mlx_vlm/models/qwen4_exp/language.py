@@ -13,10 +13,11 @@ from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from threading import Lock, RLock
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -3120,7 +3121,9 @@ class ShardedEmbedding(nn.Module):
         values = mx.take(values, mx.array(inverse.astype(np.int32)), axis=0)
         return (values * self.weight_scale).reshape(*indices.shape, self.dims)
 
-    def fuse_quantized_shards(self, sources: list | None) -> bool:
+    def fuse_quantized_shards(
+        self, load_sources: Callable[[], list | None] | None = None
+    ) -> bool:
         """Join compatible packed shards without dequantizing the PLE table.
 
         Resident Qwen4 PLE otherwise synchronizes token IDs to the host before
@@ -3128,7 +3131,9 @@ class ShardedEmbedding(nn.Module):
         single packed embedding keeps exactly the same affine rows while making
         the lookup a normal device-side gather.  The caller owns the temporary
         peak-memory admission check required while old and joined buffers
-        coexist.
+        coexist.  ``load_sources`` runs only once the shards can be joined, and
+        its copies are used only when every packed array matches in shape and
+        dtype.
         """
 
         if getattr(self, "fused", None) is not None:
@@ -3156,8 +3161,9 @@ class ShardedEmbedding(nn.Module):
         if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
             return False
 
-        if not sources or [s.weight.shape for s in sources] != [
-            s.weight.shape for s in shards
+        sources = load_sources() if load_sources is not None else None
+        if not sources or [_packed_layout(s) for s in sources] != [
+            _packed_layout(s) for s in shards
         ]:
             sources = shards
         fused = nn.QuantizedEmbedding(
@@ -3181,6 +3187,15 @@ class ShardedEmbedding(nn.Module):
         self.fused = fused
         self.shards = []
         return True
+
+
+def _packed_layout(shard) -> tuple:
+    return tuple(
+        None if array is None else (array.shape, array.dtype)
+        for array in (
+            getattr(shard, name, None) for name in ("weight", "scales", "biases")
+        )
+    )
 
 
 def _droppable_ple_shards(layer_idx: int) -> list | None:
@@ -3234,7 +3249,7 @@ def fuse_resident_ple_embeddings(
             None,
         )
         if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards(
-            _droppable_ple_shards(ple.ple_embedding.layer_idx)
+            partial(_droppable_ple_shards, ple.ple_embedding.layer_idx)
         ):
             fused += 1
     if fused:
