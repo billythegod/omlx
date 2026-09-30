@@ -291,7 +291,6 @@ template <typename T, int D, int V = D>
   }
 }
 
-// The split pass can also launch 1024 threads (gqa_factor * query_length == 32).
 template <typename T, int D, int V = D>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void omlx_sdpa_decode_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -529,7 +528,7 @@ template <typename T, int D, int V = D>
 }
 
 template <typename T, int D>
-[[kernel]] void omlx_sdpa_decode_2pass_2(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void omlx_sdpa_decode_2pass_2(
     const device float* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
