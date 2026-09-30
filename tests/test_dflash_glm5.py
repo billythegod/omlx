@@ -340,6 +340,7 @@ def test_make_cache_replaces_linear_layer_caches_and_fails_closed():
     from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
     from omlx.patches.dflash_glm5 import Glm5NextTargetOps
+    from omlx.patches.glm53_kda_prework import glm53_kda_prefill_eligible
 
     layers = [
         SimpleNamespace(is_linear=True, self_attn=SimpleNamespace(conv_kernel_size=4)),
@@ -357,6 +358,17 @@ def test_make_cache_replaces_linear_layer_caches_and_fails_closed():
     assert caches[0].conv_kernel_size == 4
     assert caches[1] is made[1]
     assert isinstance(caches[2], RecurrentRollbackCache)
+
+    # Cold prefill takes the fused KDA path; armed verify windows do not.
+    module = SimpleNamespace(
+        conv_kernel_size=4, head_dim=128, num_heads=2, qkv_dim=256, conv_dim=768
+    )
+    inputs = mx.zeros((1, 64, 8), dtype=mx.bfloat16)
+    assert glm53_kda_prefill_eligible(module, inputs, None, caches[0])
+    caches[0].arm_rollback(prefix_len=0)
+    assert not glm53_kda_prefill_eligible(module, inputs, None, caches[0])
+    caches[0].clear_transients()
+    assert glm53_kda_prefill_eligible(module, inputs, None, caches[0])
 
     with pytest.raises(ValueError, match="recurrent rollback"):
         ops.make_cache(target, enable_speculative_linear_cache=False)
@@ -974,22 +986,45 @@ def test_glm_target_loader_rejects_kv_quantization_and_foreign_configs(tmp_path)
         load_glm5_target_bundle(tmp_path)
 
 
-def test_glm_adapter_prefill_chunk_follows_scheduler_nax_step(monkeypatch):
-    """DFlash GLM-5.3 prefill uses the batched scheduler's NAX floor when wider."""
+def test_glm_adapter_prefill_chunk_follows_scheduler_floor(monkeypatch):
+    """DFlash GLM-5.3 prefill uses the batched scheduler's floor when wider."""
     import types
 
-    import omlx.scheduler as scheduler
+    import omlx.engine.dflash as dflash_engine
     from omlx.engine.dflash import _adapter_prefill_chunk
 
     glm = types.SimpleNamespace(backend_name="glm5_next")
     other = types.SimpleNamespace(backend_name="qwen3")
-    monkeypatch.setattr(
-        scheduler, "_glm5_next_nax_prefill_step", lambda: 4096, raising=False
-    )
+    monkeypatch.setattr(dflash_engine, "_glm5_next_prefill_floor", lambda: 4096)
     assert _adapter_prefill_chunk(glm, 2048) == 4096
     assert _adapter_prefill_chunk(glm, 8192) == 8192
     assert _adapter_prefill_chunk(other, 2048) == 2048
-    monkeypatch.setattr(
-        scheduler, "_glm5_next_nax_prefill_step", lambda: 0, raising=False
-    )
+    monkeypatch.setattr(dflash_engine, "_glm5_next_prefill_floor", lambda: 0)
     assert _adapter_prefill_chunk(glm, 2048) == 2048
+
+
+@pytest.mark.parametrize(
+    "native,memory_gb,nax,nax_mla,expected",
+    [
+        (False, 512, False, False, 0),
+        (True, 32, False, False, 0),
+        (True, 512, False, False, 4096),
+        (True, 256, True, True, 4096),
+        (True, 256, True, False, 0),
+    ],
+)
+def test_glm5_next_prefill_floor(
+    monkeypatch, native, memory_gb, nax, nax_mla, expected
+):
+    from omlx import settings
+    from omlx.custom_kernels import nax as nax_mod
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa import sparse_mla_nax
+    from omlx.scheduler import _glm5_next_prefill_floor
+
+    monkeypatch.setattr(fast, "is_native_available", lambda: native)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: native)
+    monkeypatch.setattr(settings, "get_system_memory", lambda: memory_gb * 1024**3)
+    monkeypatch.setattr(nax_mod, "is_nax_available", lambda: nax)
+    monkeypatch.setattr(sparse_mla_nax, "nax_sparse_mla_available", lambda: nax_mla)
+    assert _glm5_next_prefill_floor() == expected

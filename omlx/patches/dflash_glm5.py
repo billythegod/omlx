@@ -47,6 +47,7 @@ import mlx.core as mx
 from dflash_mlx.engine.target_ops import TargetCapabilities
 from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
 
+from ..utils.layer_pipeline import LayerPipeline
 from .deepseek_v4.cache_extras import POOLING_UNDO_MAX_TOKENS
 
 logger = logging.getLogger(__name__)
@@ -111,20 +112,6 @@ def _glm_linear_forward() -> Any:
     return linear_forward
 
 
-def _layer_pipeline() -> Any | None:
-    """Return the bounded layer pipeline when this tree vendors it.
-
-    The vendored GLM model evaluates prefill layer by layer; trees that carry
-    ``omlx.utils.layer_pipeline`` overlap that evaluation with graph
-    construction instead. Use the same policy as the model in either case.
-    """
-    try:
-        from ..utils.layer_pipeline import LayerPipeline
-    except ImportError:
-        return None
-    return LayerPipeline()
-
-
 def _contract_mhc_hidden(hidden: mx.array) -> mx.array:
     """Contract GLM's ``[B, T, hc_mult, H]`` residual streams for DFlash."""
     if hidden.ndim == 4:
@@ -187,6 +174,17 @@ def validate_glm5_dflash_pair(
         or int(getattr(target_args, "hc_mult", 0) or 0) <= 0
     ):
         raise ValueError("GLM-5.3 DFlash requires the checkpoint's MHC target")
+
+
+class _Glm5RecurrentRollbackCache(RecurrentRollbackCache):
+    """Rollback cache that reports verify windows to the vendored KDA gates.
+
+    The fused GLM KDA prefill only runs on caches that are not speculating.
+    """
+
+    @property
+    def is_speculating(self) -> bool:
+        return bool(self._armed)
 
 
 def _install_glm5_recurrent_hook(linear_attn: Any) -> None:
@@ -333,7 +331,7 @@ class Glm5NextTargetOps:
         for index, layer in enumerate(inner.layers):
             if getattr(layer, "is_linear", False):
                 conv_kernel = int(layer.self_attn.conv_kernel_size)
-                caches[index] = RecurrentRollbackCache(
+                caches[index] = _Glm5RecurrentRollbackCache(
                     size=2, conv_kernel_size=conv_kernel
                 )
         return caches
@@ -470,10 +468,13 @@ class Glm5NextTargetOps:
             capture_layer_ids = set(capture_layer_ids)
             captured = {0: _contract_mhc_hidden(h)} if 0 in capture_layer_ids else {}
 
-        # Wide (prefill) chunks evaluate layer by layer like the vendored
-        # model does, so a 45-layer MoE graph never builds up unevaluated.
-        wide = int(h.shape[1]) >= int(self.pipeline_min_tokens)
-        pipeline = _layer_pipeline() if wide else None
+        # Wide (prefill) chunks use the vendored model's layer pipeline, so a
+        # 45-layer MoE graph never builds up unevaluated.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if int(h.shape[1]) >= int(self.pipeline_min_tokens)
+            else None
+        )
         for layer_index, (layer, layer_cache) in enumerate(
             zip(inner.layers, cache, strict=True)
         ):
@@ -481,14 +482,13 @@ class Glm5NextTargetOps:
             h = layer(h, mask=mask, cache=layer_cache)
             if pipeline is not None:
                 pipeline.push(h)
-            elif wide:
-                mx.eval(h)
-                mx.clear_cache()
             capture_key = layer_index + 1
             if capture_all:
                 captured.append(_contract_mhc_hidden(h))
             elif capture_layer_ids is not None and capture_key in capture_layer_ids:
                 captured[capture_key] = _contract_mhc_hidden(h)
+        if pipeline is not None:
+            pipeline.drain()
 
         if not want_logits:
             return None, captured

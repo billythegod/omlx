@@ -1654,6 +1654,32 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
     return max(1, next_n)
 
 
+def _glm5_next_prefill_floor() -> int:
+    """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
+
+    Wider chunks require the native sparse MLA path. NAX hosts also need the
+    tensor-unit sparse MLA: its attention cost per query does not depend on
+    the chunk, so a wider chunk feeds the MoE more rows.
+    """
+    try:
+        from .custom_kernels.glm_moe_dsa import fast
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "glm_dsa_sparse_mla_attention"
+        ):
+            return 0
+        if get_system_memory() < 64 * 1024**3:
+            return 0
+        if not is_nax_available() or nax_sparse_mla_available():
+            return 4096
+    except Exception:
+        logger.debug("glm5_next prefill floor probe failed", exc_info=True)
+    return 0
+
+
 def _mimo_fused_full_attention() -> bool:
     """True when MiMo's 192/128 full-attention layers run a fused kernel.
 
@@ -2969,30 +2995,16 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            # Wider GLM chunks require the native sparse MLA path.
-            is_glm5_next = model_type.startswith("glm5_next")
-            if is_glm5_next:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "glm_dsa_sparse_mla_attention"
-                ):
-                    return 0
-            if is_qwen35 or is_qwen4 or is_glm5_next:
+            if model_type.startswith("glm5_next"):
+                return _glm5_next_prefill_floor()
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
-                from .patches.glm_moe_dsa.sparse_mla_nax import (
-                    nax_sparse_mla_available,
-                )
                 from .settings import get_system_memory
 
                 if get_system_memory() < 64 * 1024**3:
                     return 0
+                # NAX hosts keep the default chunk.
                 if not is_nax_available():
-                    return 4096
-                # NAX hosts keep the default chunk, except GLM-5.3 with the
-                # tensor-unit sparse MLA: its attention cost per query does not
-                # depend on the chunk, so a wider chunk feeds the MoE more rows.
-                if is_glm5_next and nax_sparse_mla_available():
                     return 4096
             if self._is_mimo_hybrid():
                 from .custom_kernels.nax import is_nax_available
