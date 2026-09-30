@@ -491,20 +491,19 @@ def _distributed_model_type(model_path: str | Path) -> str:
 def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) -> str:
     """Install the normal oMLX model protocol on this distributed rank."""
 
-    from omlx.utils.tool_parser import repair_tool_parser
-
-    repaired = repair_tool_parser(tokenizer)
     model_type = _distributed_model_type(model_path)
     from omlx.adapter.output_parser import (
         install_minimax_m3_tokenizer_protocol,
+        repair_tool_parser,
     )
 
+    repair_tool_parser(tokenizer)
     installed = install_minimax_m3_tokenizer_protocol(
         tokenizer,
         str(model_path),
         {"model_type": model_type} if model_type else None,
     )
-    return "minimax_m3" if installed else (repaired or "")
+    return "minimax_m3" if installed else ""
 
 
 def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
