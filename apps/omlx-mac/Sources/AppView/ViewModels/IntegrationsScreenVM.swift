@@ -6,7 +6,7 @@ final class IntegrationsScreenVM {
     enum Field: Sendable {
         case claudeMode, opusModel, sonnetModel, haikuModel
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
-        case hermesModel, copilotModel
+        case hermesModel, copilotModel, dshModel
         case mcpConfig
     }
 
@@ -24,6 +24,7 @@ final class IntegrationsScreenVM {
     var openclawToolsProfile: String = "coding"
     var hermesModel: String = ""
     var copilotModel: String = ""
+    var dshModel: String = ""
 
     // MCP
     var mcpConfigPath: String = ""
@@ -103,6 +104,7 @@ final class IntegrationsScreenVM {
     var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
     var piCommand: String       { "\(cliCommandPrefix) launch pi" }
     var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
+    var dshCommand: String      { "\(cliCommandPrefix) launch dsh" }
 
     var hasPendingMCPChanges: Bool {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
@@ -140,6 +142,7 @@ final class IntegrationsScreenVM {
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
+                self.dshModel             = it.dshModel ?? ""
             }
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
@@ -182,6 +185,7 @@ final class IntegrationsScreenVM {
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
         case .hermesModel:          patch.integrationsHermesModel = hermesModel
         case .copilotModel:         patch.integrationsCopilotModel = copilotModel
+        case .dshModel:             patch.integrationsDshModel = dshModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
         }
