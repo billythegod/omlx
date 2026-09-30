@@ -820,8 +820,7 @@
                                                                     <span x-text="formatProgress(task)"></span>
                                                                 </template>
                                                                 <template x-if="task.total_size <= 0">
-                                                                    <span>{{ t('models.queue.downloading') }}</span>
-                                                                    <span x-text="formatSpeed(task)"></span>
+                                                                    <span>{{ t('models.queue.downloading') }} &middot; <span x-text="formatSpeed(task)"></span></span>
                                                                 </template>
                                                             </div>
                                                         </div>
@@ -1249,8 +1248,7 @@
                                                                                 <span x-text="formatProgress(task)"></span>
                                                                             </template>
                                                                             <template x-if="task.total_size <= 0">
-                                                                                <span>{{ t('models.queue.downloading') }}</span>
-                                                                                <span x-text="formatSpeed(task)"></span>
+                                                                                <span>{{ t('models.queue.downloading') }} &middot; <span x-text="formatSpeed(task)"></span></span>
                                                                             </template>
                                                                         </div>
                                                                     </div>

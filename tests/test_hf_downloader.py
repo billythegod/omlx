@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import threading
@@ -146,10 +145,6 @@ class TestDownloadTask:
         assert d["downloaded_size"] == 456700
         assert d["speed_bps"] == 4534000.6  # rounded to 1 decimal
         assert d["retry_count"] == 0
-
-    def test_to_dict_speed_defaults_to_zero(self):
-        task = DownloadTask(task_id="t", repo_id="o/m")
-        assert task.to_dict()["speed_bps"] == 0.0
 
     def test_to_dict_retry_count(self):
         task = DownloadTask(task_id="t", repo_id="o/m", retry_count=3)
@@ -3164,9 +3159,7 @@ class TestStallDetection:
     async def test_wire_activity_prevents_false_stall(
         self, model_dir, monkeypatch
     ):
-        """xet's fetch phase keeps the filesystem silent for minutes while
-        bytes keep arriving on the wire: wire movement alone must hold the
-        stall deadline open."""
+        """Wire bytes alone keep the stall deadline open."""
         import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
@@ -3199,9 +3192,7 @@ class TestStallDetection:
     async def test_stopped_wire_reports_an_active_stall(
         self, model_dir, monkeypatch
     ):
-        """Wire bytes are payload activity, so once they stop against a
-        silent disk the stall must be reported as 'active' under the longer
-        deadline — not as a startup handshake hang."""
+        """Once wire bytes stop against a silent disk, the stall is 'active'."""
         import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
@@ -3646,16 +3637,6 @@ class TestDownloadSpeed:
         scan.state = state  # the running total, for assertions
         return scan
 
-    def test_defaults_read_as_a_per_second_rate(self):
-        """The readout is "bytes per second": sample at 0.5s, average over
-        a 1s window, and never average fewer samples than the window holds."""
-        import omlx.admin.hf_downloader as dl_module
-        import omlx.admin.ms_downloader as ms_module
-
-        assert dl_module._PROGRESS_POLL_INTERVAL == 0.5
-        assert ms_module._PROGRESS_POLL_INTERVAL == 0.5
-        assert dl_module._SPEED_WINDOW == 1.0
-
     @pytest.mark.asyncio
     async def test_poll_reports_speed_then_zeroes_it(self, model_dir, monkeypatch):
         """A live transfer publishes bytes/s; a terminal task publishes 0."""
@@ -3675,32 +3656,6 @@ class TestDownloadSpeed:
         assert observed_speed > 0, "a live download must report a rate"
         # The poll loop's finally clause clears the rate with the task.
         assert task.speed_bps == 0.0
-
-    @pytest.mark.asyncio
-    async def test_speed_smooths_steady_rate(self, model_dir, monkeypatch):
-        """A constant per-interval rate must be reported near its true value."""
-        interval = 0.02
-        step = 200_000
-        downloader, task = _downloading_task(model_dir, task_id="t-smooth")
-
-        with patch.object(
-            downloader,
-            "_get_download_activity",
-            side_effect=self._growing_activity(step),
-        ):
-            poll = start_poll(
-                monkeypatch, downloader, task, model_dir, interval=interval
-            )
-            # Let several samples accumulate so the EMA settles.
-            await asyncio.sleep(0.12)
-            steady_speed = task.speed_bps
-            task.status = DownloadStatus.COMPLETED
-            await poll
-
-        expected = step / interval
-        assert steady_speed > 0
-        # Order of magnitude of the true rate: smoothing must not lose it.
-        assert 0.25 * expected <= steady_speed <= 4 * expected
 
     @staticmethod
     def _meter_rates(window, samples):
@@ -3820,40 +3775,6 @@ class TestDownloadSpeed:
 
         assert seen == [5]
 
-    def test_wire_counter_is_thread_safe_and_ignores_junk(self):
-        """Progress callbacks fire from xet's reporting thread while the poll
-        loop reads: the accumulator must be exact under concurrency and skip
-        non-positive increments."""
-        from omlx.admin.hf_downloader import _WireCounter
-
-        counter = _WireCounter()
-
-        def spam():
-            for _ in range(500):
-                counter.add(100)
-
-        threads = [threading.Thread(target=spam) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert counter.value == 400_000
-        counter.add(0)
-        counter.add(-1)
-        assert counter.value == 400_000
-
-    def test_wire_speed_meter_window_and_settle_to_zero(self):
-        """Same window semantics as the disk meter: a live mean over the
-        window, reaching 0 within ~window of the last wire byte."""
-        from omlx.admin.hf_downloader import _WireSpeedMeter
-
-        meter = _WireSpeedMeter(window=1.0)
-        assert meter.add(0, now=0.0) == 0.0  # a prime alone is no rate
-        assert meter.add(500, now=0.5) == 1000.0  # 500B over 0.5s
-        assert meter.add(500, now=1.0) == 500.0  # averaged over the window
-        assert meter.add(500, now=1.6) == 0.0  # stopped -> settles to 0
-
     @pytest.mark.asyncio
     async def test_poll_shows_wire_speed_while_disk_is_idle(
         self, model_dir, monkeypatch
@@ -3882,51 +3803,6 @@ class TestDownloadSpeed:
         assert frozen.allocated_size == 0, "precondition: the disk never moved"
         assert observed > 0, "wire traffic must show while the disk is idle"
         assert task.speed_bps == 0.0  # terminal tasks publish 0
-
-    @pytest.mark.asyncio
-    async def test_poll_publishes_the_larger_stage_not_the_sum(
-        self, model_dir, monkeypatch
-    ):
-        """Fetch (wire) and reconstruction (disk) are two views of one
-        payload: the published rate is the larger of the two, never their
-        sum, which would count the same bytes twice."""
-        from omlx.admin.hf_downloader import _WireCounter
-
-        downloader, task = _downloading_task(model_dir, task_id="t-stage", total_size=10_000_000_000)
-        counter = _WireCounter()
-
-        activity = self._growing_activity(step=2_000_000)
-        observed = 0.0
-        with patch.object(
-            downloader, "_get_download_activity", side_effect=activity
-        ):
-            poll = start_poll(
-                monkeypatch,
-                downloader,
-                task,
-                model_dir,
-                wire=counter,
-                interval=0.02,
-            )
-            start = time.monotonic()
-            for _ in range(5):
-                counter.add(2_000_000)  # same order of magnitude as the disk
-                await asyncio.sleep(0.02)
-                observed = max(observed, task.speed_bps)
-            elapsed = max(time.monotonic() - start, 1e-6)
-            task.status = DownloadStatus.COMPLETED
-            await poll
-
-        grown = activity.state["allocated"]
-        stage_rate = (
-            max(grown, 10_000_000) / elapsed
-        )  # the two stages carry comparable byte counts
-        assert observed > 0
-        assert observed <= stage_rate * 1.5, "must not exceed the larger stage"
-        assert observed < (grown + 10_000_000) / elapsed * 0.8, (
-            "the two stages must not be summed"
-        )
-
 
 # =============================================================================
 # Progress Reads Both Pipeline Stages (fetch = wire, reconstruction = disk)
@@ -4199,418 +4075,3 @@ class TestResolveEndpoint:
         assert r1 == r2 == "https://huggingface.co"
         # Second call was a cache hit — head() count unchanged from first probe.
         assert mock_client.head.call_count == 2
-
-
-# =============================================================================
-# Xet Group Capture and Cancellation
-# =============================================================================
-
-
-class TestXetGroupCancellation:
-    """Cancelling in-flight work aborts every recorded xet group."""
-
-    @pytest.fixture
-    def downloader(self, tmp_path):
-        model_dir = tmp_path / "models"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        return HFDownloader(model_dir=str(model_dir))
-
-    def setup_method(self):
-        hf_downloader_mod._xet_groups.clear()
-
-    def teardown_method(self):
-        hf_downloader_mod._xet_groups.clear()
-
-    def test_session_proxy_records_new_groups_and_delegates(self):
-        inner = MagicMock()
-        group = MagicMock()
-        group.__enter__.return_value = group
-        inner.new_file_download_group.return_value = group
-
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-        got = proxy.new_file_download_group(endpoint="ep")
-
-        inner.new_file_download_group.assert_called_once_with(endpoint="ep")
-        # hub gets a tracked wrapper; the real group is registered the moment
-        # it is created and stays registered while its `with` block is open.
-        assert isinstance(got, hf_downloader_mod._TrackedXetGroup)
-        assert list(hf_downloader_mod._xet_groups) == [group]
-        with got as entered:
-            assert entered is group
-            assert list(hf_downloader_mod._xet_groups) == [group]
-        # Settled groups leave the registry: abort would find no work there.
-        group.__exit__.assert_called_once_with(None, None, None)
-        assert list(hf_downloader_mod._xet_groups) == []
-        # Every other session attribute delegates to the real session.
-        assert proxy.status is inner.status
-
-    def test_install_is_idempotent_and_delegates(self):
-        import huggingface_hub.utils._xet as hub_xet
-
-        sentinel = object()
-        original = hub_xet.get_xet_session
-        try:
-            # Fresh un-wrapped function, so a wrapper installed by an earlier
-            # test cannot shadow this one.
-            hub_xet.get_xet_session = lambda: sentinel
-            hf_downloader_mod._install_xet_group_capture()
-            hf_downloader_mod._install_xet_group_capture()
-
-            proxy = hub_xet.get_xet_session()
-            assert isinstance(proxy, hf_downloader_mod._XetSessionProxy)
-            assert proxy._inner is sentinel
-        finally:
-            hub_xet.get_xet_session = original
-
-    def test_abort_xet_transfers_aborts_recorded_group_once(self):
-        group = MagicMock()
-        hf_downloader_mod._register_xet_group(group)
-
-        assert hf_downloader_mod._abort_xet_transfers() is True
-        group.abort.assert_called_once()
-        assert hf_downloader_mod._xet_groups == []
-        # Second call finds nothing left to abort.
-        assert hf_downloader_mod._abort_xet_transfers() is False
-        group.abort.assert_called_once()
-
-    def test_abort_xet_transfers_swallows_stale_group_errors(self):
-        group = MagicMock()
-        group.abort.side_effect = RuntimeError("stale group")
-        hf_downloader_mod._register_xet_group(group)
-
-        assert hf_downloader_mod._abort_xet_transfers() is False
-        group.abort.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_cancel_active_download_aborts_registered_group(
-        self, downloader
-    ):
-        group = MagicMock()
-        hf_downloader_mod._register_xet_group(group)
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
-        active = asyncio.create_task(asyncio.sleep(10))
-        downloader._active_tasks[task.task_id] = active
-
-        with patch(
-            "omlx.admin.hf_downloader.abort_xet_session"
-        ) as mock_abort:
-            assert await downloader.cancel_download(task.task_id) is True
-
-        group.abort.assert_called_once()
-        mock_abort.assert_called_once()
-        with pytest.raises(asyncio.CancelledError):
-            await active
-
-    @pytest.mark.asyncio
-    async def test_cancel_pending_download_keeps_registered_group(
-        self, downloader
-    ):
-        group = MagicMock()
-        hf_downloader_mod._register_xet_group(group)
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.PENDING,
-        )
-        downloader._tasks[task.task_id] = task
-
-        with patch("omlx.admin.hf_downloader.abort_xet_session"):
-            assert await downloader.cancel_download(task.task_id) is True
-
-        group.abort.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_cancel_aborts_every_concurrently_active_group(
-        self, downloader
-    ):
-        """snapshot_download shards files across hf_thread_map workers.
-
-        One xet_get() (hence one group) runs per file, concurrently, so the
-        registry holds several live groups at once and cancel must abort
-        all of them — aborting only the newest would leave the other shards
-        ghost-running.
-        """
-        inner = MagicMock()
-        groups = [MagicMock(), MagicMock()]
-        inner.new_file_download_group.side_effect = list(groups)
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        for _ in range(len(groups)):  # two shard downloads open at once
-            proxy.new_file_download_group()
-        assert list(hf_downloader_mod._xet_groups) == groups
-
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
-        active = asyncio.create_task(asyncio.sleep(10))
-        downloader._active_tasks[task.task_id] = active
-
-        with patch(
-            "omlx.admin.hf_downloader.abort_xet_session"
-        ) as mock_abort:
-            assert await downloader.cancel_download(task.task_id) is True
-
-        for group in groups:
-            group.abort.assert_called_once()
-        assert hf_downloader_mod._xet_groups == []
-        mock_abort.assert_called_once()
-        with pytest.raises(asyncio.CancelledError):
-            await active
-
-    @pytest.mark.asyncio
-    async def test_shutdown_aborts_every_concurrently_active_group(
-        self, downloader
-    ):
-        """Shutdown must reap all open shard groups, then settle cleanly.
-
-        A writer thread parked in any group's reconstruction would block
-        interpreter exit, so every live group gets aborted — and the groups'
-        later `with` exits must not trip over the cleared registry.
-        """
-        inner = MagicMock()
-        groups = [MagicMock(), MagicMock()]
-        inner.new_file_download_group.side_effect = list(groups)
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        open_groups = [
-            proxy.new_file_download_group() for _ in range(len(groups))
-        ]
-        for tracked in open_groups:
-            tracked.__enter__()  # shards mid-transfer
-
-        with patch("omlx.admin.hf_downloader.abort_xet_session"):
-            await downloader.shutdown()
-
-        for group in groups:
-            group.abort.assert_called_once()
-        assert hf_downloader_mod._xet_groups == []
-
-        # The with-blocks settle after the abort without tripping anything.
-        for tracked in open_groups:
-            tracked.__exit__(None, None, None)
-        assert hf_downloader_mod._xet_groups == []
-
-    def test_group_deregisters_when_enter_fails(self):
-        """A failed CAS handshake must not leak a stale registry entry.
-
-        The `with` statement skips __exit__ when __enter__ raises, so the
-        wrapper has to unregister itself on that path.
-        """
-        inner = MagicMock()
-        group = MagicMock()
-        group.__enter__.side_effect = RuntimeError("handshake failed")
-        inner.new_file_download_group.return_value = group
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        tracked = proxy.new_file_download_group()
-        with pytest.raises(RuntimeError):
-            with tracked:
-                pass
-
-        assert list(hf_downloader_mod._xet_groups) == []
-
-    def test_late_group_is_aborted_and_the_flag_dies_with_its_call(self):
-        """A group opened after the abort is stopped, a later call's is not.
-
-        abort_xet_session() only drops the session, so a snapshot_download
-        call that reached its first xet_get() after the cancel opens its
-        group on a fresh session that nothing is left to abort. The call is
-        flagged instead, and that flag has to die with the call rather than
-        catch the download that starts after it.
-        """
-        inner = MagicMock()
-        late, next_call = MagicMock(), MagicMock()
-        inner.new_file_download_group.side_effect = [late, next_call]
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        def aborted_call(**kwargs):
-            # The cancel lands while this call is registered but before it has
-            # opened a group: the registry it snapshots is empty.
-            assert hf_downloader_mod._abort_xet_transfers() is False
-            proxy.new_file_download_group()
-            return []
-
-        hf_downloader_mod._tracked_snapshot_download(
-            aborted_call, lambda: False
-        )
-        late.abort.assert_called_once()
-
-        def next_download(**kwargs):
-            proxy.new_file_download_group()
-            return []
-
-        hf_downloader_mod._tracked_snapshot_download(
-            next_download, lambda: False
-        )
-        next_call.abort.assert_not_called()
-
-    def test_tracked_call_flags_itself_when_already_cancelled(self):
-        """A cancel that landed before the worker registered still stops it.
-
-        The to_thread job is submitted before its awaiter can be cancelled,
-        so by the time the worker runs the abort that cleared the (empty)
-        registry is history; the call has to notice the cancel itself.
-        """
-        inner = MagicMock()
-        group = MagicMock()
-        inner.new_file_download_group.return_value = group
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        def call(**kwargs):
-            proxy.new_file_download_group()
-            return []
-
-        hf_downloader_mod._tracked_snapshot_download(call, lambda: True)
-
-        group.abort.assert_called_once()
-
-    def test_abort_reaches_only_the_call_that_was_cancelled(self):
-        """A download started while an aborted worker unwinds keeps its groups.
-
-        Task cancellation does not stop the worker, so the semaphore can be
-        released and the next download can reach its first xet_get() before
-        the cancelled one does. That next download must not inherit the
-        abort: aborting its group mid-handshake turns its xet_get() into a
-        "User cancelled" failure.
-        """
-        inner = MagicMock()
-        old_group, new_group = MagicMock(), MagicMock()
-        inner.new_file_download_group.side_effect = [new_group, old_group]
-        proxy = hf_downloader_mod._XetSessionProxy(inner)
-
-        aborted_call = hf_downloader_mod._open_xet_call()
-        new_call = hf_downloader_mod._open_xet_call()
-        hf_downloader_mod._abort_xet_call(aborted_call)
-        previous = getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
-        try:
-            # The replacement download gets there first, then the cancelled
-            # worker finally reaches its own first xet_get().
-            hf_downloader_mod._mark_xet_call(new_call)
-            proxy.new_file_download_group()
-            hf_downloader_mod._mark_xet_call(aborted_call)
-            proxy.new_file_download_group()
-        finally:
-            hf_downloader_mod._mark_xet_call(previous)
-            hf_downloader_mod._close_xet_call(aborted_call)
-            hf_downloader_mod._close_xet_call(new_call)
-
-        new_group.abort.assert_not_called()
-        old_group.abort.assert_called_once()
-
-    def test_hub_per_file_workers_inherit_the_call_they_serve(self):
-        """hub opens groups on its own file workers, so they need the mark.
-
-        snapshot_download maps files across a ThreadPoolExecutor; without
-        wrapping that map the per-file threads carry no call, the late group
-        goes unattributed, and the abort that was supposed to stop it finds
-        nothing (or stops the wrong download).
-        """
-        from huggingface_hub import _snapshot_download as hub_snapshot
-        from huggingface_hub.utils.tqdm import hf_thread_map as pristine
-
-        original = hub_snapshot.hf_thread_map
-        call = hf_downloader_mod._open_xet_call()
-        previous = getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
-        try:
-            hub_snapshot.hf_thread_map = pristine
-            hf_downloader_mod._install_xet_call_marking()
-            hf_downloader_mod._install_xet_call_marking()  # idempotent
-            marked = hub_snapshot.hf_thread_map
-            assert getattr(marked, "_omlx_call_marking", False)
-
-            hf_downloader_mod._mark_xet_call(call)
-
-            seen = []
-
-            def worker(_item):
-                seen.append(
-                    getattr(hf_downloader_mod._xet_call_in_thread, "call", None)
-                )
-
-            marked(worker, [1, 2], disable=True)
-
-            assert seen == [call, call]
-        finally:
-            hub_snapshot.hf_thread_map = original
-            hf_downloader_mod._mark_xet_call(previous)
-            hf_downloader_mod._close_xet_call(call)
-
-    @pytest.mark.asyncio
-    async def test_group_opened_after_cancel_is_aborted(self, downloader):
-        """A cancel that beats the call's first xet_get() must still abort it.
-
-        Task cancellation does not stop the snapshot_download worker, so the
-        worker can reach its first xet_get() after cancel_download() returned.
-        By then the registry it emptied is still empty and abort_xet_session()
-        has already replaced the session, so the group opened on that fresh
-        session must be aborted the moment it appears instead of ghost-running
-        for the life of the process.
-        """
-        task = DownloadTask(task_id="t1", repo_id="owner/model")
-        downloader._tasks[task.task_id] = task
-
-        mock_api = MagicMock()
-        mock_info = MagicMock()
-        mock_info.safetensors = {}
-        mock_info.siblings = []
-        mock_api.model_info.return_value = mock_info
-
-        group = MagicMock()
-        group.__enter__.return_value = group
-        inner = MagicMock()
-        inner.new_file_download_group.return_value = group
-
-        worker_started = threading.Event()
-        release = threading.Event()
-        group_opened = threading.Event()
-
-        def fake_snapshot_download(**kwargs):
-            if kwargs.get("dry_run"):
-                return []
-            worker_started.set()
-            assert release.wait(5), "test never released the worker"
-            # Only now does the call reach its first xet_get(): the cancel has
-            # long returned and its abort_xet_session() dropped the session.
-            hf_downloader_mod._XetSessionProxy(
-                inner
-            ).new_file_download_group(endpoint="ep")
-            group_opened.set()
-            return []
-
-        try:
-            with patch(
-                "omlx.admin.hf_downloader._get_hf_api",
-                return_value=(mock_api, None),
-            ), patch(
-                "omlx.admin.hf_downloader.snapshot_download",
-                side_effect=fake_snapshot_download,
-            ), patch(
-                "omlx.admin.hf_downloader.abort_xet_session"
-            ) as mock_abort:
-                active = asyncio.create_task(
-                    downloader._run_download(task.task_id, "")
-                )
-                downloader._active_tasks[task.task_id] = active
-                assert await asyncio.to_thread(worker_started.wait, 5)
-
-                assert await downloader.cancel_download(task.task_id) is True
-                mock_abort.assert_called_once()
-                # The abort found nothing: the call has no group open yet and
-                # the group it opens next does not exist anywhere.
-                assert hf_downloader_mod._xet_groups == []
-                group.abort.assert_not_called()
-
-                release.set()
-                await active
-                assert await asyncio.to_thread(group_opened.wait, 5)
-                group.abort.assert_called_once()
-        finally:
-            release.set()

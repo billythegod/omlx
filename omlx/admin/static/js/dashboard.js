@@ -6422,11 +6422,6 @@
                 return `${base} \u00b7 ${this.formatSpeed(task)}`;
             },
 
-            // Live transfer rate for a download task, e.g. "43.2 MB/s".
-            // `speed_bps` reads 0 whenever no bytes land, so this prints an
-            // explicit "0 B/s" instead of hiding the readout. The console
-            // draws it on queued and downloading rows; a terminal row keeps
-            // its progress and status and drops the rate.
             formatSpeed(task) {
                 const bps = task.speed_bps || 0;
                 const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];

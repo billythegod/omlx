@@ -13,10 +13,7 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     let progress: Double
     let totalSize: Int64
     let downloadedSize: Int64
-    /// Transfer rate in bytes/second. 0 whenever no bytes are landing —
-    /// cancelled/failed/stalled/finished tasks reset it server-side, and
-    /// the meter reads 0 in between samples with no growth; absent only
-    /// when talking to a server that predates the field.
+    /// Transfer rate in bytes/second; nil for servers without the field.
     let speedBps: Double?
     let error: String
     let createdAt: Double
@@ -26,10 +23,7 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
 
     var id: String { taskId }
 
-    /// Human-readable transfer rate, e.g. "43.2 MB/s"; nil only for a
-    /// server that predates the speed field. A stopped task reads an
-    /// explicit "0 B/s" so an interrupted row shows a visible zero
-    /// instead of dropping the readout.
+    /// Formatted transfer rate, e.g. "43.2 MB/s".
     var speedText: String? {
         guard let bps = speedBps else { return nil }
         var value = bps

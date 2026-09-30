@@ -141,8 +141,6 @@ final class DownloadsScreenVM {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refreshTasks()
-                // Match the server's speed sampling cadence: the readout is
-                // a per-second rate, so a slower poll shows it in steps.
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }

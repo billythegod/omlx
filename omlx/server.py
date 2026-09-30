@@ -665,9 +665,7 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
-    # Resume the persisted download queues last: settings, model dirs, and
-    # the completion callback are all wired by now, and queueing a resume
-    # does no network I/O. Startup must never block on a broken queue file.
+    # Resume persisted download queues after settings and model dirs are set.
     if _server_state.hf_downloader is not None:
         try:
             await _server_state.hf_downloader.restore_tasks()
@@ -2363,8 +2361,6 @@ def init_server(
     from .admin.routes import set_hf_downloader
     from .settings import resolve_default_base_path
 
-    # Both download queues persist beside settings.json so a restart can
-    # resume interrupted downloads instead of dropping the queue.
     tasks_base = (
         Path(global_settings.base_path)
         if global_settings is not None

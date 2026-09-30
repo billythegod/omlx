@@ -44,9 +44,6 @@ _MS_API_TIMEOUT = 15
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
 
-# Seconds between directory scans that drive progress and speed updates.
-# Matches the HF poller: the speed window is one second, so sampling twice
-# per second keeps a reading inside the window at all times.
 _PROGRESS_POLL_INTERVAL = 0.5
 
 # Default ModelScope API base URL.
@@ -740,8 +737,6 @@ class MSDownloader(_QueuePersistenceMixin):
 
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=model_id)
-        # Keep the request-supplied credential with the row so a restart
-        # can resume private downloads (the API never returns it).
         task.token = ms_token or ""
         self._tasks[task_id] = task
 
@@ -749,8 +744,6 @@ class MSDownloader(_QueuePersistenceMixin):
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, ms_token)
         )
-        # The queued row must reach disk before anything can crash it, so a
-        # restart re-queues this download instead of dropping it.
         self._persist()
 
         logger.info(f"MS Download queued: {model_id} (task_id={task_id})")
@@ -780,7 +773,6 @@ class MSDownloader(_QueuePersistenceMixin):
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
         task.error = "Cancellation requested. Download will stop shortly."
-        # User intent: persist now so a restart does NOT resume this row.
         self._persist()
 
         # Stop progress polling
@@ -814,7 +806,6 @@ class MSDownloader(_QueuePersistenceMixin):
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
-        # The row is gone from memory; drop it from disk too.
         self._persist()
         return True
 
@@ -850,14 +841,9 @@ class MSDownloader(_QueuePersistenceMixin):
         self._cancelled.discard(task_id)
 
         # Start fresh download (snapshot_download resumes from existing files).
-        # An empty retry token means "no new credential entered": keep the
-        # stored one instead of wiping it, so a retry after a restart still
-        # reaches a private repository.
+        # An empty retry token keeps the stored one.
         new_task = await self.start_download(model_id, ms_token or old_task.token)
         new_task.retry_count = old_retry_count + 1
-        # start_download persisted the row before this bookkeeping; write
-        # again so a crash right after a retry keeps the count and the
-        # (possibly re-entered) credential on disk too.
         self._persist()
         return new_task
 
@@ -870,9 +856,8 @@ class MSDownloader(_QueuePersistenceMixin):
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
-        # Leave the persisted queue untouched: rows stay "pending/downloading"
-        # on disk so the next boot resumes them; the cancelled states below
-        # are this process's dying breath, not user intent.
+        # Keep persisted rows as pending/downloading so the next boot
+        # resumes them.
         self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
@@ -1036,9 +1021,6 @@ class MSDownloader(_QueuePersistenceMixin):
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
 
-            # Persist whatever terminal state the run settled on (completed,
-            # failed, or user-cancelled). Skipped during shutdown so an
-            # interrupted row survives for the next boot to resume.
             self._persist()
 
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
@@ -1053,12 +1035,6 @@ class MSDownloader(_QueuePersistenceMixin):
 
         last_size = 0
         last_activity_at = time.time()
-        # One directory walk per tick yields logical size (progress), latest
-        # mtime (liveness) and the per-file allocated-block map (speed: only
-        # growth of files already under watch counts, so a resumed download
-        # cannot replay bytes it already had as fresh transfer). Prime the
-        # window before the first sleep so the first reading covers transfer
-        # time rather than startup.
         speed_meter = _SpeedMeter()
         activity = self._get_download_activity(target_dir)
         speed_meter.add(activity.files)
@@ -1111,8 +1087,6 @@ class MSDownloader(_QueuePersistenceMixin):
         except asyncio.CancelledError:
             pass
         finally:
-            # Terminal states (done, failed, cancelled, stalled) report no
-            # rate — only a live transfer has a speed.
             task.speed_bps = 0.0
 
     @staticmethod

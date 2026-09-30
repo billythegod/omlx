@@ -211,10 +211,7 @@ final class DTOFixtureTests: XCTestCase {
     }
 
     func testHFTaskZeroSpeedReadsExplicitZero() throws {
-        // An interrupted row must show an explicit "0 B/s" — hiding the
-        // number at bps == 0 (the original behaviour this test pinned)
-        // made a stopped transfer look like a UI bug. nil now means only
-        // "a server that predates speed_bps" (covered above).
+        // A stopped row shows "0 B/s"; only a missing field hides it.
         let stopped = HFTaskDTO(
             taskId: "t1", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,

@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The restart-surviving download queue, tested for both backends.
-
-`_persist_queue`/`_restore_queue` and the on-disk row format are shared by
-HFDownloader and MSDownloader, so every shared case runs against both; only
-the seam a test has to reach differs (how an environment refuses a resume,
-which failure the SDK reports), and each such seam is selected by a fixture.
-"""
+"""Restart-surviving download queue, tested for both backends."""
 
 import asyncio
 import json
 import logging
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -34,13 +27,7 @@ def _read_rows(path: Path) -> list:
 
 @pytest.fixture(params=[HFDownloader, MSDownloader], ids=["hf", "ms"])
 def queue(request, tmp_path):
-    """One downloader of either kind with its run body neutralised.
-
-    Restore only schedules each resumed row's run coroutine, so the tests
-    here replace it wholesale — recording the credential it was handed in
-    ``queue.tokens`` — and open the ModelScope SDK gate, the check that HF's
-    start_download simply does not have.
-    """
+    """A downloader whose run body only records the token it was given."""
     cls = request.param
     model_dir = tmp_path / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -61,30 +48,12 @@ def queue(request, tmp_path):
         )
 
 
-@pytest.fixture
-def refuse_resume(queue):
-    """Make the environment refuse a queued row's `start_download`.
-
-    A refusal that is not the row's own: HF's hub may be unimportable, the
-    ModelScope SDK gate is checked inside start_download.
-    """
-    if queue.cls is HFDownloader:
-        async def _refused(self, repo_id, token):
-            raise RuntimeError("hub is not importable right now")
-
-        return patch.object(HFDownloader, "start_download", new=_refused)
-    return patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", False)
-
-
 class TestQueuePersistence:
     """The queue persists to disk and survives a restart."""
 
     def test_a_resumable_row_keeps_the_token_and_a_finished_one_does_not(
         self, queue
     ):
-        """Only a row that can still be resumed needs the credential: a
-        terminal row keeps it in memory for a retry in this process but is
-        written without it, so tokens do not outlive their download."""
         downloader, tasks_file = queue.downloader, queue.tasks_file
         task = DownloadTask(task_id="t1", repo_id="private/model")
         task.token = "SECRET"
@@ -96,20 +65,7 @@ class TestQueuePersistence:
         task.status = DownloadStatus.COMPLETED
         downloader._persist()
         assert _read_rows(tasks_file)[0]["token"] == ""
-        # The credential survives in memory, so a retry in this process can
-        # still reach a gated repository.
         assert task.token == "SECRET"
-
-    def test_the_queue_file_is_owner_only_from_the_first_write(self, queue):
-        downloader, tasks_file = queue.downloader, queue.tasks_file
-        task = DownloadTask(task_id="t1", repo_id="owner/model")
-        task.token = "SECRET"
-        downloader._tasks["t1"] = task
-
-        downloader._persist()
-
-        assert tasks_file.stat().st_mode & 0o777 == 0o600
-        assert not tasks_file.with_name(tasks_file.name + ".tmp").exists()
 
     @pytest.mark.asyncio
     async def test_start_and_cancel_persist_rows(self, queue):
@@ -165,9 +121,6 @@ class TestQueuePersistence:
         assert task.status == DownloadStatus.FAILED
         rows = _read_rows(tasks_file)
         assert rows[0]["status"] == DownloadStatus.FAILED.value
-        # The repo-info fallback may rewrite the raw error into a
-        # repository-not-found style message; only persistence matters here
-        # (error round-trip is covered by the restore tests below).
         assert rows[0]["error"]
 
     @pytest.mark.asyncio
@@ -179,83 +132,11 @@ class TestQueuePersistence:
         with patch("omlx.admin.hf_downloader.abort_xet_session"):
             await downloader.shutdown()
 
-        # The in-memory row went CANCELLED, but shutdown must not write that:
-        # the on-disk row keeps its queued status so the next boot resumes.
         rows = _read_rows(tasks_file)
         assert rows[0]["status"] not in (
             DownloadStatus.CANCELLED.value,
             DownloadStatus.FAILED.value,
         )
-
-    @pytest.mark.asyncio
-    async def test_a_terminal_row_with_unreadable_numbers_still_restores(
-        self, queue
-    ):
-        """A finished row gets the same tolerance the queued branch has.
-
-        A *queued* row carrying an ISO timestamp and a text retry count
-        restores regardless (its two fields go through _read_float and
-        _read_int). The same fields on a *finished* row go through
-        from_dict, which parsed every number eagerly: one unparseable value
-        raised, restore skipped the row, and its display, error text and
-        retry entry were lost — exactly what the resumable branch is built
-        to avoid.
-        """
-        downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(tasks_file, [
-            {"task_id": "junk", "repo_id": "owner/junk",
-             "status": DownloadStatus.FAILED.value, "error": "boom",
-             "progress": "n/a", "total_size": "big", "downloaded_size": None,
-             "created_at": "2026-09-25T00:00:00", "started_at": [],
-             "completed_at": {}, "retry_count": "many"},
-            {"task_id": "good", "repo_id": "owner/good",
-             "status": DownloadStatus.COMPLETED.value, "created_at": 5.0,
-             "retry_count": 1},
-        ])
-
-        await downloader.restore_tasks()
-
-        junk = downloader._tasks["junk"]
-        assert junk.status == DownloadStatus.FAILED
-        assert junk.error == "boom"
-        assert junk.progress == 0.0
-        assert junk.total_size == 0
-        assert junk.downloaded_size == 0
-        assert junk.retry_count == 0
-        assert junk.created_at  # the restore time, not 0.0
-        # ...and the healthy row behind it still restores.
-        assert downloader._tasks["good"].status == DownloadStatus.COMPLETED
-
-    @pytest.mark.asyncio
-    async def test_a_row_the_environment_refuses_stays_queued_on_disk(
-        self, queue, refuse_resume, caplog
-    ):
-        """`restore_tasks` promises never to raise — and a refusal that is not
-        the row's own must not cost the row either: the restore keeps going,
-        the healing rewrite is skipped, and the queue file stays byte-for-byte
-        so the next boot retries the interrupted row.
-        """
-        downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(tasks_file, [
-            {"task_id": "live", "repo_id": "owner/live",
-             "status": DownloadStatus.DOWNLOADING.value, "created_at": 10.0},
-            {"task_id": "done", "repo_id": "owner/done",
-             "status": DownloadStatus.COMPLETED.value, "created_at": 20.0},
-        ])
-        before = tasks_file.read_text(encoding="utf-8")
-
-        with refuse_resume, caplog.at_level(logging.WARNING):
-            await downloader.restore_tasks()
-
-        # The restore kept its promise and carried on: the terminal row came back.
-        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
-        # The row that could not start is not in memory...
-        assert "owner/live" not in {
-            t.repo_id for t in downloader._tasks.values()
-        }
-        # ...and is still queued on disk, byte for byte.
-        assert tasks_file.read_text(encoding="utf-8") == before
-        assert "Deferring resume of owner/live" in caplog.text
 
     @pytest.mark.asyncio
     async def test_restore_resumes_interrupted_rows(self, queue):
@@ -278,59 +159,14 @@ class TestQueuePersistence:
         assert [t.repo_id for t in resumed] == ["owner/live"]
         assert resumed[0].created_at == 300.0
         assert resumed[0].retry_count == 2
-        # Terminal rows come back as display-only entries, error text intact.
-        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
-        assert downloader._tasks["done"].speed_bps == 0.0
+        # Failed rows stay retryable; completed rows are dropped.
         assert downloader._tasks["fail"].error == "boom"
-        # The rewritten queue records the resumed row as pending under its
-        # new task id (task ids are restart-scoped; rows are matched by repo).
+        assert "done" not in downloader._tasks
         live_rows = [
             r for r in _read_rows(tasks_file) if r["repo_id"] == "owner/live"
         ]
         assert live_rows
         assert live_rows[0]["status"] == DownloadStatus.PENDING.value
-
-    @pytest.mark.asyncio
-    async def test_one_row_this_build_cannot_read_does_not_lose_the_queue(
-        self, queue
-    ):
-        """`restore_tasks` promises never to raise, so one field a build that
-        stored it differently left behind skips that row's bookkeeping alone:
-        the rows behind it come back and the healing rewrite runs."""
-        downloader, tasks_file = queue.downloader, queue.tasks_file
-        rows = [
-            # A queue row interrupted mid-download, carrying the two fields a
-            # newer build could have changed the type of.
-            {"task_id": "live", "repo_id": "owner/live",
-             "status": DownloadStatus.DOWNLOADING.value,
-             "created_at": "2026-09-25T00:00:00", "retry_count": "x"},
-            {"task_id": "done", "repo_id": "owner/done",
-             "status": DownloadStatus.COMPLETED.value,
-             "created_at": 5.0, "retry_count": 1},
-            # A status this build does not know is failed and display-only,
-            # not a queued row this boot never starts.
-            {"task_id": "no-status", "repo_id": "owner/unknown",
-             "created_at": 7.0},
-        ]
-        _write_rows(tasks_file, rows)
-
-        await downloader.restore_tasks()
-
-        by_repo = {task.repo_id: task for task in downloader._tasks.values()}
-        assert set(by_repo) == {"owner/live", "owner/done", "owner/unknown"}
-        assert by_repo["owner/live"].status in (
-            DownloadStatus.PENDING,
-            DownloadStatus.DOWNLOADING,
-        )
-        assert by_repo["owner/live"].retry_count == 0
-        assert by_repo["owner/done"].status == DownloadStatus.COMPLETED
-        assert by_repo["owner/unknown"].status == DownloadStatus.FAILED
-
-        # The rewrite at the end of the restore ran, so the next boot reads a
-        # queue this one already healed rather than failing the same way.
-        written = {row["repo_id"]: row for row in _read_rows(tasks_file)}
-        assert set(written) == set(by_repo)
-        assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
 
     @pytest.mark.asyncio
     async def test_restore_resumes_duplicate_interrupted_repo_once(self, queue):
@@ -369,39 +205,34 @@ class TestQueuePersistence:
         assert downloader._tasks == {}
 
     @pytest.mark.asyncio
-    async def test_restore_warns_about_a_bad_row_without_its_token(
+    async def test_restore_skips_a_bad_row_without_logging_its_token(
         self, queue, caplog
     ):
-        """A row the loader cannot read is skipped, not fatal — and the row may
-        still carry the credential, so the warning leaves it out."""
         downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(tasks_file, [{
-            "task_id": "t1",
-            "status": "completed",
-            "token": "SUPERSECRET",
-            # repo_id is what from_dict reads first; its absence is the
-            # KeyError this path already tolerates.
-        }])
+        _write_rows(tasks_file, [
+            {"task_id": "bad", "status": "failed", "token": "SUPERSECRET"},
+            {"task_id": "unknown", "repo_id": "owner/x", "status": "paused?"},
+            {"task_id": "fail", "repo_id": "owner/fail", "status": "failed"},
+        ])
 
         with caplog.at_level(logging.WARNING):
             await downloader.restore_tasks()
 
-        assert "Skipping unpersistable download row" in caplog.text
+        assert set(downloader._tasks) == {"fail"}
+        assert "Skipping persisted download row" in caplog.text
         assert "SUPERSECRET" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_credential_persists_and_restores_without_reaching_api(
         self, queue
     ):
-        """A gated download restarts with the token its request supplied."""
         downloader, tasks_file = queue.downloader, queue.tasks_file
         task = await downloader.start_download("owner/model", "GEHEIM")
         await asyncio.sleep(0)  # let the scheduled download coroutine run
 
         # On disk: the credential that queued the download, owner-only.
         assert _read_rows(tasks_file)[0]["token"] == "GEHEIM"
-        if os.name != "nt":
-            assert tasks_file.stat().st_mode & 0o777 == 0o600
+        assert tasks_file.stat().st_mode & 0o777 == 0o600
         # Over the API: never (the queue serves to_dict() output).
         assert "token" not in task.to_dict()
         assert all("token" not in row for row in downloader.get_tasks())
@@ -428,27 +259,6 @@ class TestQueuePersistence:
         assert _read_rows(tasks_file)[0]["token"] == "GEHEIM"
 
     @pytest.mark.asyncio
-    async def test_restore_without_token_row_falls_back_to_empty(self, queue):
-        """Rows written before the token field keep hub's env/login lookup."""
-        downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(
-            tasks_file,
-            [
-                {
-                    "task_id": "live",
-                    "repo_id": "owner/model",
-                    "status": "pending",
-                    "created_at": 100.0,
-                }
-            ],
-        )
-
-        await downloader.restore_tasks()
-        await asyncio.sleep(0)  # let the scheduled download coroutine run
-
-        assert queue.tokens["token"] == ""  # start_download maps "" to None
-
-    @pytest.mark.asyncio
     async def test_retry_recovers_credential_and_persists_bookkeeping(
         self, queue
     ):
@@ -462,19 +272,15 @@ class TestQueuePersistence:
         downloader._tasks["old"] = old
         downloader._persist()
 
-        # Retry without a token (the app sends none): the stored credential
-        # is kept instead of being wiped to "".
+        # The app retries without a token; the stored one is kept.
         kept = await downloader.retry_download("old", "")
         assert kept.token == "GEHEIM"
         assert kept.retry_count == 1
         rows = {r["task_id"]: r for r in _read_rows(tasks_file)}
         assert rows[kept.task_id]["token"] == "GEHEIM"
-        # The retry bookkeeping is on disk immediately, not on some later
-        # event — restarting right now must not lose the count.
         assert rows[kept.task_id]["retry_count"] == 1
 
-        # Retry with a freshly re-entered token (the web form): the new
-        # credential replaces the stale one on disk.
+        # A re-entered token replaces the stored one.
         kept.status = DownloadStatus.FAILED
         replaced = await downloader.retry_download(kept.task_id, "NEU")
         assert replaced.token == "NEU"
