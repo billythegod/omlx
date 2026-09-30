@@ -2638,43 +2638,6 @@ console.log(JSON.stringify({sent, user: peer.ssh_user, plan: component.plan,
     assert result["probes"] == {} and result["started"] is False
 
 
-def test_ssh_user_change_discards_old_checks_without_blocking_new_checks():
-    result = _run_wizard("""
-(async () => {
-    const peer = {node_id: 'peer', ssh_target: '192.0.2.1', ssh_user: 'old'};
-    const pending = [];
-    component.pairedDevices = () => [peer];
-    component.refreshDiscoveryHealth = async () => {};
-    component.refreshDevices = async () => {};
-    component.notify = () => {};
-    component.apiFetch = (url, options) => url.endsWith('/ssh-user')
-        ? Promise.resolve({ssh_user: 'new'})
-        : new Promise(resolve => pending.push({resolve, ssh: JSON.parse(options.body).ssh}));
-    const oldRun = component.runChecks();
-    component.sshUserDrafts.peer = 'new';
-    await component.saveSSHUser(peer);
-    const newRun = component.runChecks();
-    pending[0].resolve({old: true});
-    await oldRun;
-    const stillRunning = component.checks.running;
-    const oldIgnored = !component.checks.probes.peer;
-    pending[1].resolve({new: true});
-    await newRun;
-    console.log(JSON.stringify({stillRunning, oldIgnored,
-        running: component.checks.running,
-        ssh: component.checks.probes.peer.ssh,
-        targets: pending.map(p => p.ssh)}));
-})();
-""")
-    assert result == {
-        "stillRunning": True,
-        "oldIgnored": True,
-        "running": False,
-        "ssh": "new@192.0.2.1",
-        "targets": ["old@192.0.2.1", "new@192.0.2.1"],
-    }
-
-
 def test_ssh_repair_form_only_belongs_to_failed_check():
     template = _read(TEMPLATE)
     form = template.index("data-cluster-v2-ssh-user")

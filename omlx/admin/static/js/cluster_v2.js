@@ -225,7 +225,6 @@ function clusterV2Wizard() {
         manualAddr: '',
         manualBusy: false,
         manualError: '',
-        checksRevision: 0,
         checks: {
             started: false,
             running: false,
@@ -1658,19 +1657,13 @@ function clusterV2Wizard() {
             this.stage = 'checks';
             this.checks.started = true;
             this.checks.running = true;
-            const revision = ++this.checksRevision;
             const peers = this.pairedDevices();
-            try {
-                await Promise.all([
-                    ...peers.map((peer) => this.probePeer(peer, revision)),
-                    this.refreshDiscoveryHealth(),
-                ]);
-            } finally {
-                if (revision === this.checksRevision) {
-                    this.checks.running = false;
-                    this.checks.ranAt = Date.now();
-                }
-            }
+            await Promise.all([
+                ...peers.map((peer) => this.probePeer(peer)),
+                this.refreshDiscoveryHealth(),
+            ]);
+            this.checks.running = false;
+            this.checks.ranAt = Date.now();
         },
 
         async saveSSHUser(device) {
@@ -1689,8 +1682,6 @@ function clusterV2Wizard() {
                 ++this.planRequestRevision;
                 this.plan = null;
                 this.planProposal = null;
-                ++this.checksRevision;
-                this.checks.running = false;
                 this.checks.probes = {};
                 this.checks.benchmark = null;
                 this.checks.started = false;
@@ -1722,20 +1713,18 @@ function clusterV2Wizard() {
             return withUser(first ? first.ip : this.deviceName(device));
         },
 
-        async probePeer(peer, revision = this.checksRevision) {
+        async probePeer(peer) {
             const ssh = this.sshTargetFor(peer);
             try {
                 const result = await this.apiFetch(CLUSTER_V2_API.peerProbe, {
                     method: 'POST',
                     body: JSON.stringify({ ssh }),
                 });
-                if (revision !== this.checksRevision) return;
                 this.checks.probes = {
                     ...this.checks.probes,
                     [peer.node_id]: { ok: true, ssh, result },
                 };
             } catch (error) {
-                if (revision !== this.checksRevision) return;
                 this.checks.probes = {
                     ...this.checks.probes,
                     [peer.node_id]: {
