@@ -347,15 +347,6 @@ the two target Macs:
 
 ### Different SSH usernames in the Cluster v2 wizard
 
-On each paired remote device card, enter the remote account's short login name
-in **SSH username** and select **Save SSH username**. Re-run the checks, then
-create a new plan. For example, a coordinator logged in as `coordinator_user`
-can connect to a worker as `worker_user` without editing `~/.ssh/config`.
+Pairing installs each Mac's key in the account that runs oMLX, and each Mac sends that account name with its pairing request or approval. The other Mac stores it and uses it for peer checks, model discovery and new plans, so Macs with different usernames need no extra setup.
 
-The override is stored by node ID on the coordinator and survives refreshes and
-restarts. It applies to peer checks, model discovery and newly planned launches,
-even when the peer address changes. Clear the field and save to restore the
-enrolled login or normal OpenSSH configuration. Only an administrator can change
-it, and only for an already paired device. Pairing keys remain unchanged.
-Existing signed deployments retain their original SSH targets; recreate their
-plan to use a changed username.
+A peer on an older oMLX version does not send its account name, and devices paired before this version have none stored. If the SSH check fails for such a device, enter the remote account's short login name in the **SSH username** field shown under the failed check and select **Save SSH username**, then re-run the checks. Clearing the field and saving removes the stored account, including one received during pairing, and falls back to your OpenSSH configuration. Existing signed deployments keep their original SSH targets; recreate their plan to use a changed username.
