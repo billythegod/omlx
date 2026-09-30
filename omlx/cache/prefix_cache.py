@@ -246,12 +246,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
 
-        # Supersede-on-extend lineage for rotating (sliding-window) models:
-        # newest tip block hash -> previous tip block hash. When a chain is
-        # extended again, the entry two generations back is stripped of its
-        # rotating payload (see _strip_rotating_payload); the immediate
+        # Supersede-on-extend lineage: newest tip block hash -> previous tip
+        # block hash. When a chain is extended again, the tip two generations
+        # back is dropped: a tail is deleted, a rotating full block loses its
+        # rotating payload (see _strip_rotating_payload). The immediate
         # previous tip is kept intact as the walk-back fallback.
-        self._rotating_tip_lineage: dict[bytes, bytes] = {}
+        self._tip_lineage: dict[bytes, bytes] = {}
 
         # Hashes this session stored as tip blocks. A lineage entry is only
         # recorded when the block preceding the new blocks really was a tip:
@@ -1453,22 +1453,25 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.num_tokens -= len(block_tokens)
                     break
 
-        # Supersede-on-extend: on rotating (sliding-window) models every store
-        # of a growing conversation writes one tip block carrying the full
-        # sliding-window state of all rotating layers (hundreds of MB fp16 on
-        # a gemma3-class model). Restore only ever consumes the newest such
-        # block, and the immediate previous tip is kept intact as the
-        # walk-back fallback — so the tip two generations back is dead
-        # weight. Without stripping it, those blocks fill the hot cache after
+        # Supersede-on-extend: every store of a growing conversation writes one
+        # heavy tip block. On rotating (sliding-window) models it carries the
+        # full sliding-window state (hundreds of MB fp16 on a gemma3-class
+        # model), and a tail tip carries every non-sliceable layer state, such
+        # as hybrid recurrent state. Restore only ever consumes the newest such
+        # block, and the immediate previous tip is kept intact as the walk-back
+        # and edited-turn fallback, so the tip two generations back is dead
+        # weight. Without dropping it, those blocks fill the hot cache after
         # ~10-20 turns and LRU eviction breaks the prefix chain (multi-turn
-        # cache hit collapses to 0%). Steady state after stripping: two heavy
-        # blocks per chain.
+        # cache hit collapses to 0%). Steady state: two heavy blocks per chain.
+        # Non-rotating layouts track tail tips only.
+        rotating_layout = bool(layer_cache_types) and any(
+            CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
+        )
         if (
             tip_block_saved
             and first_new_block_idx is not None
             and first_new_block_idx < len(block_table.block_ids)
-            and layer_cache_types
-            and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
+            and (rotating_layout or tail_in_table)
         ):
             new_tip_id = block_table.block_ids[-1]
             new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
@@ -1490,15 +1493,15 @@ class BlockAwarePrefixCache(CacheManager):
                     prev_tip_hash is not None
                     and prev_tip_hash in self._store_tip_hashes
                 ):
-                    superseded = self._rotating_tip_lineage.pop(prev_tip_hash, None)
+                    superseded = self._tip_lineage.pop(prev_tip_hash, None)
                     if superseded is not None:
                         if superseded in self._tail_hashes:
-                            self._discard_tail_block(superseded)
-                        else:
+                            self._discard_tail_block(superseded, layer_cache_types)
+                        elif rotating_layout:
                             self._strip_rotating_payload(superseded)
-                    self._rotating_tip_lineage[new_tip.block_hash] = prev_tip_hash
-                    if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
-                        self._rotating_tip_lineage.clear()
+                    self._tip_lineage[new_tip.block_hash] = prev_tip_hash
+                    if len(self._tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                        self._tip_lineage.clear()
                 self._store_tip_hashes.add(new_tip.block_hash)
                 if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._store_tip_hashes.clear()
@@ -1907,7 +1910,11 @@ class BlockAwarePrefixCache(CacheManager):
 
         return 0
 
-    def _discard_tail_block(self, block_hash: bytes) -> bool:
+    def _discard_tail_block(
+        self,
+        block_hash: bytes,
+        layer_cache_types: list[str] | None = None,
+    ) -> bool:
         """Drop a superseded tail from every tier when no request holds it.
 
         The hash leaves the hot map under the lock before the payload goes.
@@ -1923,6 +1930,17 @@ class BlockAwarePrefixCache(CacheManager):
         if self.paged_ssd_cache is not None:
             try:
                 self.paged_ssd_cache.delete_block(block_hash)
+                # A split-GDN tail keeps its recurrent state in a sidecar.
+                if self._gdn_split_layout_supported(layer_cache_types):
+                    self.paged_ssd_cache.forget_gdn_checkpoint(
+                        block_hash,
+                        self.paged_ssd_cache.gdn_cache_signature_for(
+                            model_name=self.paged_cache.model_name,
+                            num_layers=len(layer_cache_types),
+                            block_size=self.block_size,
+                            layer_cache_types=layer_cache_types,
+                        ),
+                    )
             except Exception:
                 logger.exception(
                     "Failed to delete superseded tail block %s", block_hash.hex()[:16]

@@ -997,3 +997,82 @@ def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
     finally:
         boundary.shutdown()
         ssd.close()
+
+
+def test_split_tail_two_turns_back_drops_its_sidecar(tmp_path):
+    """The deleted tail's recurrent sidecar goes with it; the previous one stays."""
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+    )
+    boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+    signature = ssd.gdn_cache_signature_for(
+        model_name="hybrid-model",
+        num_layers=2,
+        block_size=BLOCK_SIZE,
+        layer_cache_types=LAYER_TYPES,
+    )
+
+    def turn(request_id, token_count):
+        tokens = list(range(token_count))
+        prefix.fetch_cache(request_id, tokens)
+        grid = (token_count // BLOCK_SIZE) * BLOCK_SIZE
+        for tc in (grid, token_count):
+            extracted = _hybrid_extracted(tc, float(tc))
+            assert boundary.save(
+                request_id,
+                tc,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            [grid],
+            {},
+            paged_ssd_manager=ssd,
+            tail_terminal_token_count=token_count,
+        )
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            _hybrid_extracted(token_count, float(token_count)),
+            boundary_snapshots=provider,
+            _store_tail_terminal=True,
+        )
+        assert stored is not None and stored.num_tokens == token_count
+        paged.release_for_eviction(stored.block_ids)
+        return _block_hashes(prefix, stored)[-1]
+
+    try:
+        tail1 = turn("turn-1", 6)
+        tail2 = turn("turn-2", 10)
+        assert ssd.has_gdn_checkpoint(tail1, signature)
+        tail3 = turn("turn-3", 14)
+
+        assert not ssd.has_block(tail1)
+        assert not ssd.has_gdn_checkpoint(tail1, signature)
+        assert ssd.has_gdn_checkpoint(tail2, signature)
+        assert ssd.has_gdn_checkpoint(tail3, signature)
+    finally:
+        boundary.shutdown()
+        ssd.close()
