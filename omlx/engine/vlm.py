@@ -110,6 +110,9 @@ COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
+# mlx-vlm's Gemma4Processor.apply_chat_template renders the messages again. It
+# moves audio markers to the last user turn and prints list system content.
+TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES = {"gemma4", "gemma4_unified", "diffusion_gemma"}
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -3012,6 +3015,14 @@ class VLMBatchedEngine(BaseEngine):
 
         logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
 
+    def _chat_template_target(self, model_type: str) -> Any:
+        """Return the object that renders messages already formatted by oMLX."""
+        if model_type in TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES or not hasattr(
+            self._processor, "apply_chat_template"
+        ):
+            return getattr(self._processor, "tokenizer", self._processor)
+        return self._processor
+
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:
         """Count multimodal parts in list content by type."""
@@ -3965,10 +3976,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        # Use processor or its tokenizer for chat template application
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             prompt = apply_chat_template_with_reasoning_effort_fallback(
                 template_target,
@@ -5340,9 +5348,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             return template_target.apply_chat_template(
                 formatted_messages, **template_kwargs

@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from omlx.patches.mlx_vlm_glm5_next_compat import (
@@ -1704,6 +1705,32 @@ class TestPrepareVisionInputs:
 
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") is None
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_gemma4_renders_formatted_turns_with_tokenizer(self, mock_prepare):
+        """Gemma4Processor would move the audio marker to the last user turn."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        engine._processor.tokenizer = MagicMock()
+        engine._processor.tokenizer.apply_chat_template.return_value = "<prompt>"
+        mock_prepare.return_value = {"input_ids": mx.array([[1, 2, 3]])}
+        audio_part = {"type": "input_audio", "input_audio": {"data": "x"}}
+        messages = [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [audio_part, {"type": "text", "text": "Hi"}]},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "Again"},
+        ]
+
+        engine._prepare_vision_inputs(
+            messages, [], audio=[(np.zeros(16000, np.float32), 16000)]
+        )
+
+        engine._processor.apply_chat_template.assert_not_called()
+        rendered = engine._processor.tokenizer.apply_chat_template.call_args[0][0]
+        assert rendered[0]["content"] == "Be brief."
+        assert {"type": "audio"} in rendered[1]["content"]
+        assert rendered[3]["content"] == "Again"
 
     # --- per-image vision feature cache -------------------------------
 
