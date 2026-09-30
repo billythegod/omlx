@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -1411,9 +1412,41 @@ def install_server_telemetry(
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
+        def _omlx_align_prefill_step(self, sequences) -> None:
+            if ssd_store is None:
+                return
+            step = min(self.prefill_step_size, snapshot_step)
+            for uid, segments in sequences:
+                # MLX-LM moves these directly to generation before prefill.
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    continue
+                full = self._omlx_tokens.get(uid)
+                if full is not None:
+                    position = len(full) - sum(map(len, segments))
+                    step = min(step, snapshot_step - position % snapshot_step)
+            self.prefill_step_size = step
+
+        def _make_batch(self, n):
+            # Use the actual admission count, after generation frees capacity.
+            self._omlx_align_prefill_step(
+                (state[0], state[1]) for state in islice(self._unprocessed_sequences, n)
+            )
+            return super()._make_batch(n)
+
         def next(self) -> Any:
             started = time.perf_counter()
-            prompt_responses, generation_responses = super().next()
+            original_step = getattr(self, "prefill_step_size", None)
+            if ssd_store is not None and original_step is not None:
+                active = zip(
+                    getattr(getattr(self, "_prompt_batch", None), "uids", ()),
+                    getattr(self, "_currently_processing", ()),
+                )
+                self._omlx_align_prefill_step((uid, state[0]) for uid, state in active)
+            try:
+                prompt_responses, generation_responses = super().next()
+            finally:
+                if original_step is not None:
+                    self.prefill_step_size = original_step
             elapsed = time.perf_counter() - started
             for response in generation_responses:
                 response.token = _python_token_id(response.token)
