@@ -382,10 +382,7 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
-        # Forced-offload decisions are recomputed by every status and projection
-        # call, including the read-only model list the desktop app polls. Keep
-        # the last emitted state per (model, decision) so a stable decision logs
-        # once instead of once per poll (upstream issue #4099).
+        # Last logged forced-offload state per (model_id, kind).
         self._offload_warn_state: dict[tuple[str, str], bool] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
@@ -642,16 +639,10 @@ class EnginePool:
         message: str,
         *args: object,
     ) -> None:
-        """Log a forced-offload decision only when it changes for this model.
+        """Log a forced offload only when its state changes for this model.
 
-        The Qwen4 PLE and DeepSeek V4.1 Engram resolvers below are also reached
-        from read-only paths: the admin model list, the per-model detail
-        endpoint and the engine runtime signature. A polled model list calls
-        them once per UI refresh, so warning on every call turns one stable
-        decision into thousands of identical log lines (measured: ~1.7k/h while
-        a desktop app polled the list every ~2s). The decision itself is
-        unaffected — only the emission is deduplicated, and a transition still
-        reports.
+        The admin model list and the runtime signature resolve it on every poll
+        and request.
         """
 
         state = getattr(self, "_offload_warn_state", None)
@@ -3278,6 +3269,10 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            # A status read may have logged a forced offload long before this
+            # load. Log it again next to the load.
+            for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
+                self._offload_warn_state.pop((model_id, kind), None)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
