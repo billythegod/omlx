@@ -2362,11 +2362,9 @@ class VLMBatchedEngine(BaseEngine):
                 )
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
-                # Byte budget, not a 20-entry cap: agent sessions accumulate
-                # 20-90 screenshots, and an entry cap below that re-encodes
-                # every image on every turn (~0.8s/MP in the vision tower).
+                # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
-                max_memory_bytes=4 * 1024**3,
+                max_memory_bytes=1024**3,
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -3306,17 +3304,10 @@ class VLMBatchedEngine(BaseEngine):
         per_hashes: List[str],
         image_token_count: Optional[int],
     ) -> Optional[mx.array]:
-        """Encode only the images missing from the vision feature cache.
+        """Encode only uncached images and combine with cached ones in order.
 
-        Qwen-style vision towers consume flat patch rows grouped per image
-        (``image_grid_thw``), so a subset of images can be encoded
-        independently and the per-image features re-concatenated in prompt
-        order. Multi-turn agent loops add one screenshot per turn; encoding
-        only the new image collapses the fixed per-turn vision cost from
-        O(all history images) to O(new images).
-
-        Returns the combined full-batch features, or None when the request
-        cannot be split safely (caller falls back to encoding all images).
+        Qwen-style towers attend within each image, so a subset encodes
+        independently. Returns None when the request cannot be split safely.
         """
         model = self._vlm_model
         model_type = self.model_type or ""
@@ -3336,12 +3327,8 @@ class VLMBatchedEngine(BaseEngine):
         if not miss_idx or len(miss_idx) == num_images:
             return None
 
-        try:
-            grids = [
-                [int(grid_thw[i][0]), int(grid_thw[i][1]), int(grid_thw[i][2])]
-                for i in range(num_images)
-            ]
-        except (IndexError, TypeError, ValueError):
+        grids = [_grid_row(grid_thw, i) for i in range(num_images)]
+        if any(g is None for g in grids):
             return None
 
         rows = [t * h * w for t, h, w in grids]
@@ -3349,11 +3336,8 @@ class VLMBatchedEngine(BaseEngine):
             return None
 
         vision_tower = getattr(model, "vision_tower", None)
-        merge_sq = (
-            getattr(vision_tower, "spatial_merge_size", 2) ** 2
-        )
-        # A cached entry whose token count disagrees with the current grid
-        # came from a different resize regime — recompute the whole batch.
+        merge_sq = getattr(vision_tower, "spatial_merge_size", 2) ** 2
+        # A token count mismatch means a different resize regime.
         for f, (t, h, w) in zip(cached_per_image, grids):
             if f is not None and f.shape[0] != (t * h * w) // merge_sq:
                 return None
@@ -3408,24 +3392,11 @@ class VLMBatchedEngine(BaseEngine):
         prompt: str,
         images: List[Any],
     ) -> Optional[Dict[str, Any]]:
-        """Assemble model inputs without running the image processor on
-        images whose features are already cached.
+        """Build ``prepare_inputs``-style inputs, preprocessing only cache misses.
 
-        Multi-turn agent loops resend every history image each turn. The
-        normal path runs the HF image processor (resize / normalize /
-        patchify) on *all* of them before the per-image feature cache is
-        consulted, so cached images pay full preprocessing cost every turn.
-        This fast path hashes first, preprocesses only the cache misses, and
-        rebuilds ``input_ids`` by hand: split the prompt on the vision marker
-        triple (vision_start + image_pad + vision_end), tokenize the text
-        chunks verbatim, and expand each marker to its ``image_pad`` run
-        using the cached patch grid (hits) or the processor's fresh grid
-        (misses). Verified token-for-token identical to the processor output
-        for the gated qwen-style families.
-
-        Returns a dict shaped like ``mlx_vlm.utils.prepare_inputs`` output
-        plus ``cached_image_features`` (combined in prompt order), or None
-        when any precondition fails — the caller then runs the full path.
+        Splits the prompt on the vision marker, tokenizes the text chunks, and
+        expands each marker from the cached or fresh patch grid. Adds
+        ``cached_image_features``. Returns None to use the full path.
         """
         model_type = self.model_type or ""
         if (
@@ -3471,12 +3442,10 @@ class VLMBatchedEngine(BaseEngine):
             for h in per_hashes:
                 feat = self._vision_cache.get(h, self._model_name)
                 grid = self._vision_cache.get_grid(h, self._model_name)
-                # A cached entry whose feature rows disagree with its grid
-                # came from a different resize regime — treat as a miss.
+                # A row count mismatch means a different resize regime.
                 if (
                     feat is not None
                     and grid is not None
-                    and len(grid) == 3
                     and (grid[0] * grid[1] * grid[2]) % merge_sq == 0
                     and feat.shape[0] == (grid[0] * grid[1] * grid[2]) // merge_sq
                 ):
@@ -3490,9 +3459,7 @@ class VLMBatchedEngine(BaseEngine):
                 return None  # Nothing cached; the full path costs the same.
 
             if miss_idx:
-                # Preprocess only the missing images. The marker-only prompt
-                # keeps their tokenization trivial — the real prompt text is
-                # tokenized separately below.
+                # Marker-only prompt; the real text is tokenized below.
                 from mlx_vlm.utils import prepare_inputs
 
                 miss_images = [images[i] for i in miss_idx]
@@ -3530,16 +3497,12 @@ class VLMBatchedEngine(BaseEngine):
                         grid=miss_grids[k],
                     )
 
-            # Rebuild input_ids: text chunks tokenized verbatim, each marker
-            # expanded to start + pads*count + end from its grid.
             token_ids: List[int] = []
             chunks = prompt.split(marker)
-            # The count guard above guarantees len(chunks) == len(images)+1.
             for k, chunk in enumerate(chunks):
                 if chunk:
                     enc = tokenizer(chunk, add_special_tokens=False)
-                    chunk_ids = enc["input_ids"] if isinstance(enc, dict) else enc.input_ids
-                    token_ids.extend(chunk_ids)
+                    token_ids.extend(enc["input_ids"])
                 if k < len(chunks) - 1:
                     t, h, w = grids[k]
                     token_ids.append(vs_id)
@@ -3960,9 +3923,7 @@ class VLMBatchedEngine(BaseEngine):
                 **template_kwargs,
             )
 
-        # Hash-first preprocessing: images whose features AND patch grids are
-        # already cached skip the image processor (resize/normalize/patchify)
-        # entirely this turn; only cache misses are preprocessed.
+        # Images with cached features and grids skip the image processor.
         fast_cached_features = None
         inputs = None
         if num_audios == 0:
@@ -4216,15 +4177,9 @@ class VLMBatchedEngine(BaseEngine):
                                 for j, (h, f) in enumerate(
                                     zip(per_hashes, per_features)
                                 ):
+                                    grid = _grid_row(grid_thw, j)
                                     self._vision_cache.put(
-                                        h,
-                                        self._model_name,
-                                        f,
-                                        grid=(
-                                            _grid_row(grid_thw, j)
-                                            if grid_thw is not None
-                                            else None
-                                        ),
+                                        h, self._model_name, f, grid=grid
                                     )
                                 logger.debug(
                                     "Vision feature cache miss, stored %d per-image entries",

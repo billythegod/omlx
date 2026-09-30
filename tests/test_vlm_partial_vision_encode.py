@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Partial-miss vision encoding: only uncached images hit the vision tower.
-
-Multi-turn agent loops resend every historical screenshot each turn. When the
-vision feature cache holds all but the newest image, the vision tower must
-encode only the missing subset — not the whole batch (regression for the
-~0.8 s/MP fixed per-turn TTFT floor on qwen-style models).
-"""
+"""Tests for ``VLMBatchedEngine._encode_missing_vision_features``."""
 
 from types import SimpleNamespace
 
@@ -16,7 +10,7 @@ from omlx.cache.vision_feature_cache import VisionFeatureSSDCache
 from omlx.engine.vlm import VLMBatchedEngine
 
 _MODEL = "fake-model"
-# t*h*w per image: 4, 4, 8 rows → 1, 1, 2 merged tokens.
+# t*h*w per image: 4, 4, 8 rows -> 1, 1, 2 merged tokens.
 _GRIDS = [[1, 2, 2], [1, 2, 2], [1, 2, 4]]
 
 

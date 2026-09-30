@@ -69,10 +69,7 @@ class VisionFeatureSSDEntry:
     created_at: float
     last_access: float
     num_tensors: int = 1  # 1 for single image, N for multi-image list
-    # Per-image patch grid [t, h, w]. Lets the request path rebuild
-    # input_ids placeholder expansion and MRoPE position ids from the
-    # cache alone, without running the image processor on this image.
-    grid: Optional[List[int]] = None
+    grid: Optional[List[int]] = None  # Per-image patch grid [t, h, w].
 
 
 class VisionFeatureSSDCache:
@@ -82,12 +79,7 @@ class VisionFeatureSSDCache:
         cache_dir: SSD storage directory. None for memory-only mode.
         max_size_bytes: Maximum SSD cache size in bytes (default 10GB).
         max_memory_entries: Maximum in-memory LRU entries (default 20).
-        max_memory_bytes: Maximum in-memory LRU size in bytes (default 4GB).
-            Entry-count alone cannot bound residency: a multi-image agent
-            conversation with more than ``max_memory_entries`` screenshots
-            evicts its own history on every turn's store, so the next turn
-            misses and re-encodes *all* images. A byte budget sized for
-            whole conversations keeps the hot set resident.
+        max_memory_bytes: Maximum in-memory LRU size in bytes (default 1GB).
     """
 
     def __init__(
@@ -95,7 +87,7 @@ class VisionFeatureSSDCache:
         cache_dir: Optional[Path] = None,
         max_size_bytes: int = 10 * 1024**3,
         max_memory_entries: int = 20,
-        max_memory_bytes: int = 4 * 1024**3,
+        max_memory_bytes: int = 1024**3,
     ):
         self._cache_dir = cache_dir
         self._max_size_bytes = max_size_bytes
@@ -106,10 +98,7 @@ class VisionFeatureSSDCache:
         self._memory_cache: OrderedDict[str, Any] = OrderedDict()
         self._memory_bytes = 0
         self._memory_entry_bytes: Dict[str, int] = {}
-        # Per-image patch grid [t, h, w] alongside features. Lets the request
-        # path rebuild placeholder expansion + MRoPE positions for a cached
-        # image without running the image processor on it. Mirrors the
-        # ``grid_thw`` safetensors metadata written for the same key.
+        # Lets a cache hit rebuild placeholder tokens without the processor.
         self._memory_grid: Dict[str, List[int]] = {}
         self._memory_lock = threading.Lock()
 
@@ -169,8 +158,7 @@ class VisionFeatureSSDCache:
         if self._cache_dir is not None:
             features = self._load_from_ssd(key)
             if features is not None:
-                # Promote to memory cache (grid travels with the entry so
-                # get_grid() stays served from memory after the first hit).
+                # Promote to memory cache
                 with self._ssd_lock:
                     entry = self._ssd_index.get(key)
                     grid = entry.grid if entry is not None else None
@@ -200,10 +188,7 @@ class VisionFeatureSSDCache:
             image_hash: SHA256 hash from compute_image_hash().
             model_name: Model path for cache isolation.
             features: Evaluated mx.array (or list of mx.array for multi-image).
-            grid: Optional per-image patch grid ``[t, h, w]``. Persisted in
-                safetensors metadata so a later cache hit can reconstruct
-                placeholder expansion and MRoPE position ids for this image
-                without re-running the image processor on it.
+            grid: Optional per-image patch grid ``[t, h, w]``.
         """
         key = _composite_key(model_name, image_hash)
 
@@ -220,14 +205,7 @@ class VisionFeatureSSDCache:
         self._stats["saves"] += 1
 
     def get_grid(self, image_hash: str, model_name: str) -> Optional[List[int]]:
-        """Return the cached patch grid ``[t, h, w]`` for an image.
-
-        Mirrors :meth:`get`: memory first, then the SSD index (whose grids
-        come from safetensors metadata scanned at startup or recorded at
-        write time). Returns ``None`` when no grid was stored — callers must
-        then treat the feature entry as unusable for the processor-free
-        path and fall back to full preprocessing.
-        """
+        """Return the cached patch grid ``[t, h, w]``, or None if not stored."""
         key = _composite_key(model_name, image_hash)
         with self._memory_lock:
             grid = self._memory_grid.get(key)
@@ -320,15 +298,8 @@ class VisionFeatureSSDCache:
                 return  # Already pending
             self._pending_write_keys.add(key)
 
-        # Check if already on SSD. An entry written before grids existed
-        # carries no grid metadata in its file, but rewriting it here is
-        # unsafe: a failed background write would unlink the still-valid old
-        # file. So we do not backfill SSD. The grid is still recorded in the
-        # in-memory table by put(), so the processor-free path works for the
-        # rest of this session; the grid is persisted to disk only for
-        # entries written from now on. Legacy entries fall back to full
-        # preprocessing on the first hit after each restart — correct, just
-        # not yet optimized.
+        # Check if already on SSD. Entries without grid metadata are not
+        # rewritten: a failed rewrite would unlink the valid old file.
         with self._ssd_lock:
             if key in self._ssd_index:
                 self._ssd_index[key].last_access = time.time()
@@ -363,8 +334,7 @@ class VisionFeatureSSDCache:
             # Estimate file size for index
             estimated_size = sum(len(raw) for raw, _, _ in tensors_raw.values())
 
-            # Add to index immediately (size updated after write). Existing
-            # keys already returned above, so this is always a new entry.
+            # Add to index immediately (size updated after write)
             now = time.time()
             entry = VisionFeatureSSDEntry(
                 image_hash=image_hash,

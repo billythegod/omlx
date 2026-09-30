@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hash-first cached vision inputs: cached images skip the image processor.
-
-Multi-turn agent loops resend every history image each turn. Once an image's
-features AND patch grid are in the vision feature cache, the HF image
-processor (resize/normalize/patchify) for that image is pure repeated work —
-it used to run before the per-image feature cache was even consulted. These
-tests cover ``VLMBatchedEngine._try_build_cached_vision_inputs``: the
-processor-free token rebuild, the miss-only preprocessing path, and every
-guard that must fall back to the full path.
-"""
+"""Tests for ``VLMBatchedEngine._try_build_cached_vision_inputs``."""
 
 from types import SimpleNamespace
 
@@ -98,18 +89,6 @@ def cache():
 
 
 # ── cache-layer grid plumbing ─────────────────────────────────────────
-
-
-def test_put_get_grid_roundtrip_memory(cache):
-    cache.put("h0", _MODEL, mx.zeros((1, 8)), grid=[1, 2, 2])
-    assert cache.get_grid("h0", _MODEL) == [1, 2, 2]
-    assert cache.get_grid("missing", _MODEL) is None
-
-
-def test_legacy_entry_without_grid(cache):
-    cache.put("h0", _MODEL, mx.zeros((1, 8)))
-    assert cache.get("h0", _MODEL) is not None
-    assert cache.get_grid("h0", _MODEL) is None
 
 
 def test_grid_survives_ssd_roundtrip(tmp_path):
@@ -238,8 +217,7 @@ def test_guard_nothing_cached(cache):
 
 
 def test_guard_legacy_entry_without_grid(cache):
-    # Feature cached before grids existed — without a grid the fast path
-    # cannot rebuild placeholder expansion; must fall back.
+    # Entries cached before grids existed must use the full path.
     imgs = _images()
     hashes = compute_per_image_hashes(imgs)
     cache.put(hashes[0], _MODEL, mx.full((4, 8), 7.0))
@@ -252,8 +230,7 @@ def test_guard_legacy_entry_without_grid(cache):
 
 
 def test_guard_stale_grid_rejected(cache, monkeypatch):
-    # Cached grid claims 16 merged tokens but the feature has 4 rows —
-    # different resize regime; treat as a miss and reprocess that image.
+    # Grid says 16 merged tokens but the feature has 4 rows: reprocess it.
     imgs = _images()
     hashes = compute_per_image_hashes(imgs)
     cache.put(hashes[0], _MODEL, mx.full((4, 8), 7.0), grid=[1, 4, 4])

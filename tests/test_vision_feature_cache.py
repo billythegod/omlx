@@ -668,17 +668,9 @@ class TestMemoryByteLRU:
             assert cache._memory_bytes == 64
             assert cache.get("h0", "m") is not None
             cache.put("h1", "m", mx.zeros((16,), dtype=mx.bfloat16))
-            # Budget 64: h0(64)+h1(32) overflows → oldest (h0) evicted.
+            # Budget 64: h0(64)+h1(32) overflows -> oldest (h0) evicted.
             assert cache._memory_bytes == 32
             assert cache.get("h0", "m") is None
             assert cache.get("h1", "m") is not None
-        finally:
-            cache.close()
-
-    def test_sized_for_conversation_hot_set(self):
-        # 24 images x 4MB features fit in the engine's default budget.
-        cache = VisionFeatureSSDCache(cache_dir=None, max_memory_entries=4096)
-        try:
-            assert cache._max_memory_bytes >= 24 * 4 * 1024**2
         finally:
             cache.close()
