@@ -49,6 +49,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
@@ -2067,6 +2068,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
             apply_pixtral_torch_free_patch()
+            apply_gemma4_audio_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _strip_vision_config_if_orphaned(Path(self._model_name)),

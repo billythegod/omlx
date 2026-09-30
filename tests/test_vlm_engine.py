@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
 )
@@ -1826,6 +1827,49 @@ class TestPrepareVisionInputs:
             call.args and call.args[0] == compute_image_hash(images)
             for call in cache.get.call_args_list
         )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4AudioPatch:
+    def test_multi_clip_rows_line_up_with_placeholders(self):
+        from mlx_vlm.models.gemma4.audio import AudioEncoder
+        from mlx_vlm.models.gemma4.audio_feature_extractor import (
+            Gemma4AudioFeatureExtractor,
+        )
+        from mlx_vlm.models.gemma4.config import AudioConfig
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        apply_gemma4_audio_patch()
+        mx.random.seed(0)
+        encoder = AudioEncoder(
+            AudioConfig(
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                subsampling_conv_channels=(8, 4),
+                output_proj_dims=16,
+            )
+        )
+        extractor = Gemma4AudioFeatureExtractor()
+        processor = SimpleNamespace(feature_extractor=extractor, audio_seq_length=750)
+        rng = np.random.default_rng(0)
+        # Both lengths get one placeholder too many from ceil(ms / 40).
+        clips = [rng.standard_normal(n).astype(np.float32) for n in (48001, 76194)]
+
+        def encode(batch):
+            out = extractor(batch, sampling_rate=16000, return_attention_mask=True)
+            features = mx.array(np.stack(out["input_features"]))
+            valid = mx.array(np.stack(out["input_features_mask"]))
+            return encoder(features, ~valid)[0][0]
+
+        rows = encode(clips)
+        counts = [
+            Gemma4Processor._compute_audio_num_tokens(processor, clip, 16000)
+            for clip in clips
+        ]
+        assert Gemma4Processor.supports_multiple_audio
+        assert rows.shape[0] == sum(counts)
+        assert mx.allclose(rows[counts[0] :], encode(clips[1:]), atol=1e-5).item()
 
 
 class TestFormatMessagesForVLMTemplate:
