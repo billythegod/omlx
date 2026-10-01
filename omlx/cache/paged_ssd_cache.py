@@ -28,6 +28,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -922,6 +923,22 @@ def _fsync_parent_dir(path: str | Path) -> None:
         pass
     finally:
         os.close(dir_fd)
+
+
+def _unique_tmp_path(file_path: Path) -> Path:
+    """Build a per-writer temp path for ``file_path``.
+
+    The classic ``<stem>_tmp.safetensors`` name is derived only from the
+    final path, so the inline write fallback can race the background writer
+    (or a second manager sharing the directory) on the same block and
+    interleave two writes into one file; the later rename then commits
+    whichever bytes happened to land last. A unique suffix keeps every
+    writer on its own file while staying recoverable: the startup scan
+    globs ``*.safetensors`` and reads metadata from tmp files directly.
+    """
+    return file_path.with_name(
+        f"{file_path.stem}_tmp_{uuid.uuid4().hex[:8]}.safetensors"
+    )
 
 
 def _write_safetensors_no_mx(
@@ -2329,6 +2346,8 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        orphaned_tmp_cleaned = 0
+        unreadable_orphans = 0
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2340,6 +2359,20 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
+                        # Unreadable tmp files are torn writes by definition
+                        # (a completed write renames them away); without this
+                        # they'd linger forever outside every index and
+                        # budget. Unreadable final-named files are left on
+                        # disk and only counted — deleting non-tmp cache
+                        # files automatically at startup would mask data-
+                        # losing bugs (e.g. an fs regression).
+                        stem = file_path.stem
+                        if "_tmp_" in stem or stem.endswith("_tmp"):
+                            with contextlib.suppress(OSError):
+                                file_path.unlink()
+                            orphaned_tmp_cleaned += 1
+                        else:
+                            unreadable_orphans += 1
                         continue
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
@@ -2374,6 +2407,13 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
+        if orphaned_tmp_cleaned > 0:
+            log_msg += f", removed_torn_tmp={orphaned_tmp_cleaned}"
+        if unreadable_orphans > 0:
+            log_msg += (
+                f", unreadable_orphans={unreadable_orphans} "
+                f"(left on disk; not indexed or budgeted)"
+            )
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
@@ -3114,7 +3154,7 @@ class PagedSSDCacheManager(CacheManager):
             temp_path = None
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+                temp_path = _unique_tmp_path(file_path)
                 actual_size = _write_safetensors_no_mx(
                     str(temp_path), tensors_raw, metadata
                 )
@@ -3660,6 +3700,13 @@ class PagedSSDCacheManager(CacheManager):
             # Hot cache disabled: use temporary buffer + immediate SSD write
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
+                # Account symmetrically with _hot_cache_remove(), which
+                # always subtracts on pop: without this the counter drifts
+                # negative by each staging block's size, skewing
+                # hot_cache_size_bytes and defeating shrink targets.
+                self._hot_cache_total_bytes += self._hot_cache_entry_size(
+                    cache_entry
+                )
 
             # Track pending write
             with self._pending_write_hashes_lock:
