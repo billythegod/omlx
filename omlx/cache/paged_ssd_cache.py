@@ -70,6 +70,10 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+# Unreadable tmp files younger than this are left alone during the startup
+# scan: the cache directory can be shared with a live manager whose
+# in-flight tmp is briefly unreadable mid-write. Well past any real write.
+_STALE_TMP_CLEANUP_SECONDS = 600.0
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
@@ -2362,12 +2366,23 @@ class PagedSSDCacheManager(CacheManager):
                         # Unreadable tmp files are torn writes by definition
                         # (a completed write renames them away); without this
                         # they'd linger forever outside every index and
-                        # budget. Unreadable final-named files are left on
-                        # disk and only counted — deleting non-tmp cache
+                        # budget. Only tmp files older than a generous write
+                        # window are removed — the directory can be shared
+                        # with a live manager whose in-flight tmp is briefly
+                        # unreadable mid-write, and unlinking it would fail
+                        # its rename. Unreadable final-named files are left
+                        # on disk and only counted — deleting non-tmp cache
                         # files automatically at startup would mask data-
                         # losing bugs (e.g. an fs regression).
                         stem = file_path.stem
-                        if "_tmp_" in stem or stem.endswith("_tmp"):
+                        try:
+                            tmp_is_stale = (
+                                time.time() - file_path.stat().st_mtime
+                                > _STALE_TMP_CLEANUP_SECONDS
+                            )
+                        except OSError:
+                            tmp_is_stale = False
+                        if ("_tmp_" in stem or stem.endswith("_tmp")) and tmp_is_stale:
                             with contextlib.suppress(OSError):
                                 file_path.unlink()
                             orphaned_tmp_cleaned += 1
