@@ -2029,5 +2029,7 @@
   "cluster.v2.join.confirm_forget_cleanup": "Confirmer l’oubli",
   "cluster.v2.join.forget_cleanup_warning": "Arrêter les tentatives de cette ancienne annulation et supprimer définitivement cet avertissement sur ce Mac. L’autre Mac peut conserver l’ancienne demande. Le couplage actuel et le cluster restent inchangés.",
   "cluster.v2.join.cleanup_forgotten": "Ancien nettoyage oublié sur ce Mac. Le nettoyage distant n’a pas été confirmé.",
-  "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage."
+  "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage.",
+  "cluster.v2.membership.waiting_request": "En attente du code et de la demande de couplage de ce Mac.",
+  "cluster.v2.membership.add_device": "Ajouter ce Mac"
 }

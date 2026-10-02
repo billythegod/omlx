@@ -2029,5 +2029,7 @@
   "cluster.v2.join.confirm_forget_cleanup": "Confirm forget",
   "cluster.v2.join.forget_cleanup_warning": "Stop retrying this old cancellation and permanently clear this warning on this Mac. The other Mac may still retain the old request. Current pairing and cluster setup stay unchanged.",
   "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
-  "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup."
+  "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup.",
+  "cluster.v2.membership.waiting_request": "Waiting for this Mac to show its code and send a pairing request.",
+  "cluster.v2.membership.add_device": "Add this Mac"
 }
