@@ -2325,17 +2325,14 @@ async def cluster_complete_worker_join(
         last_seen_at=now,
     )
     try:
-        # Complete the enrollment first, pin the host key only afterwards:
-        # a failed complete() (node cap, expired session) must not leave a
-        # pinned key behind — the registry and known_hosts would disagree,
-        # and a retry with the same key would then be rejected as a
-        # "changed key" requiring manual cleanup.
-        enrolled = get_cluster_enrollment().complete(raw_session, node)
+        # Pin first: complete() persists the node and consumes the session,
+        # so a later pin failure would leave an enrolled node with no retry.
         await asyncio.to_thread(
             pin_enrolled_host_key,
             hostname=primary_address,
             public_key=request.ssh_host_public_key,
         )
+        enrolled = get_cluster_enrollment().complete(raw_session, node)
     except (EnrollmentError, OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return enrolled.to_dict()

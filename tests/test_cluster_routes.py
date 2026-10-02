@@ -1315,11 +1315,14 @@ def test_cuda_worker_claim_replay_and_completion_fail_closed(monkeypatch, tmp_pa
         lambda: SimpleNamespace(public_key=public_key, fingerprint=fingerprint),
     )
     pinned = []
-    monkeypatch.setattr(
-        ssh_keys,
-        "pin_enrolled_host_key",
-        lambda **kwargs: pinned.append(kwargs),
-    )
+    pin_failures = []
+
+    def pin(**kwargs):
+        if pin_failures:
+            raise RuntimeError(pin_failures.pop())
+        pinned.append(kwargs)
+
+    monkeypatch.setattr(ssh_keys, "pin_enrolled_host_key", pin)
     raw_key, _ = store.issue_join_key(
         controller_url="http://10.42.0.10:8000",
         source_digest="b" * 64,
@@ -1366,6 +1369,17 @@ def test_cuda_worker_claim_replay_and_completion_fail_closed(monkeypatch, tmp_pa
     assert changed.status_code == 400
     assert "identity changed" in changed.json()["detail"]
     assert pinned == []
+
+    # A refused pin must leave nothing enrolled and the session retryable.
+    pin_failures.append("refusing changed SSH host key")
+    refused = client.post(
+        "/cluster/join/complete",
+        json=completion,
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert refused.status_code == 400
+    assert "changed SSH host key" in refused.json()["detail"]
+    assert client.get("/admin/api/cluster/join-status").json()["nodes"] == []
 
     completed = client.post(
         "/cluster/join/complete",
