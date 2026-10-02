@@ -2024,5 +2024,10 @@
   "cluster.v2.toast.forgotten_local": "Suppression locale terminée. L’arrêt distant n’a pas été vérifié.",
   "cluster.v2.active.forget_mac": "Oublier ce Mac",
   "cluster.v2.active.confirm_forget_mac": "Cliquer pour confirmer",
-  "cluster.v2.active.leave_cluster": "Quitter le cluster"
+  "cluster.v2.active.leave_cluster": "Quitter le cluster",
+  "cluster.v2.join.forget_cleanup": "Oublier ce nettoyage",
+  "cluster.v2.join.confirm_forget_cleanup": "Confirmer l’oubli",
+  "cluster.v2.join.forget_cleanup_warning": "Arrêter les tentatives de cette ancienne annulation et supprimer définitivement cet avertissement sur ce Mac. L’autre Mac peut conserver l’ancienne demande. Le couplage actuel et le cluster restent inchangés.",
+  "cluster.v2.join.cleanup_forgotten": "Ancien nettoyage oublié sur ce Mac. Le nettoyage distant n’a pas été confirmé.",
+  "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage."
 }

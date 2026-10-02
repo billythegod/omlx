@@ -2024,5 +2024,10 @@
   "cluster.v2.toast.forgotten_local": "Local removal complete. Remote shutdown was not verified.",
   "cluster.v2.active.forget_mac": "Forget this Mac",
   "cluster.v2.active.confirm_forget_mac": "Click again to confirm",
-  "cluster.v2.active.leave_cluster": "Leave cluster"
+  "cluster.v2.active.leave_cluster": "Leave cluster",
+  "cluster.v2.join.forget_cleanup": "Forget this cleanup",
+  "cluster.v2.join.confirm_forget_cleanup": "Confirm forget",
+  "cluster.v2.join.forget_cleanup_warning": "Stop retrying this old cancellation and permanently clear this warning on this Mac. The other Mac may still retain the old request. Current pairing and cluster setup stay unchanged.",
+  "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
+  "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup."
 }
