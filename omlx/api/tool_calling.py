@@ -630,33 +630,16 @@ def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str
 # while accepting hyphens and dots in parameter names.
 _XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=([\w.-]+)>")
 
-# A parameter whose open tag lost its ``>``.  The Qwen templates write
-# ``<parameter=name>value</parameter>``; models occasionally emit the ``name=``
-# form instead (``<parameter=proxy=`` with no ``>``) for a parameter with an
-# empty value.  ``mlx_lm.tool_parsers.qwen3_coder._parse_xml_function_call``
-# then runs ``match_text.index(">")`` on that payload and raises
-# ``ValueError: substring not found``.  The XML fallback recovers the call but
-# silently drops the malformed parameter, so the client receives a tool call
-# with an argument missing and no indication that anything was lost.
+# Models sometimes drop the ``>`` of an empty parameter's open tag and emit
+# ``<parameter=name=`` or ``<parameter=name`` right before the close tag.
 _PARAMETER_OPEN_LOST_GT_RE = re.compile(
-    r"<parameter=([\w.-]+)=(?=[\s]*(?:</parameter>|</function>|$))"
-)
-_PARAMETER_OPEN_BARE_RE = re.compile(
-    r"<parameter=([\w.-]+)(?=[\s]*(?:</parameter>|</function>|$))"
+    r"<parameter=([\w.-]+)=?(?=\s*(?:</parameter>|</function>|$))"
 )
 
 
 def repair_parameter_open_tags(text: str) -> str:
-    """Re-terminate parameter open tags that lost their closing ``>``.
-
-    Rewrites ``<parameter=name=`` and ``<parameter=name`` (with no ``>`` and no
-    value before the next close tag) to the template's ``<parameter=name>``.
-    Only the open tag is touched, and only in the malformed shape: a well-formed
-    ``<parameter=name>`` is left byte-identical, so this is idempotent and safe
-    to apply at more than one entry point.
-    """
-    text = _PARAMETER_OPEN_LOST_GT_RE.sub(r"<parameter=\1>", text)
-    return _PARAMETER_OPEN_BARE_RE.sub(r"<parameter=\1>", text)
+    """Restore ``<parameter=name>`` for empty parameters that lost their ``>``."""
+    return _PARAMETER_OPEN_LOST_GT_RE.sub(r"<parameter=\1>", text)
 
 
 def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
@@ -873,7 +856,6 @@ def _parse_xml_tool_calls(
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    text = repair_parameter_open_tags(text)
     matches = _marker_payloads(text, "<tool_call>", "</tool_call>")
 
     for match in matches:
@@ -900,7 +882,9 @@ def _parse_xml_tool_calls(
         func_close = content.rfind(_XML_FUNCTION_CLOSE)
         if func_open and func_close >= func_open.end():
             func_name = func_open.group(1)
-            params_text = content[func_open.end() : func_close]
+            params_text = repair_parameter_open_tags(
+                content[func_open.end() : func_close]
+            )
             props = _tool_param_properties(func_name, tools)
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
@@ -2050,19 +2034,18 @@ def _parse_tool_calls_impl(
                             # Use XML values to avoid decoding parsed strings twice.
                             for key, val in _iter_xml_parameters(match):
                                 spec = props.get(key)
-                                if isinstance(spec, dict) and (
-                                    (
-                                        isinstance(spec.get("type"), list)
-                                        and _matches_union_type(
-                                            arguments.get(key), spec["type"]
-                                        )
-                                        is False
-                                    )
-                                    or (
-                                        "type" not in spec
-                                        and isinstance(arguments.get(key), str)
-                                    )
-                                ):
+                                if not isinstance(spec, dict):
+                                    continue
+                                value = arguments.get(key)
+                                union_mismatch = (
+                                    isinstance(spec.get("type"), list)
+                                    and _matches_union_type(value, spec["type"])
+                                    is False
+                                )
+                                untyped_string = "type" not in spec and isinstance(
+                                    value, str
+                                )
+                                if union_mismatch or untyped_string:
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name
                                     )
@@ -2256,7 +2239,6 @@ def parse_qwen_tool_calls(
     Never close a parameter value or infer missing argument bytes.
     """
     calls, prose, errors = [], [], []
-    text = repair_parameter_open_tags(text)
     pos = 0
     while match := _QWEN_OPEN_RE.search(text, pos):
         start = match.start()

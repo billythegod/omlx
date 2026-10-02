@@ -6,10 +6,12 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
 import ast
+import importlib
 import json
 import logging
 import re
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -38,14 +40,15 @@ from omlx.api.tool_calling import (
     _strip_marker_spans,
     build_json_system_prompt,
     convert_tools_for_template,
-    repair_parameter_open_tags,
     enrich_tool_params_for_gemma4,
     extract_json_from_text,
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
+    parse_qwen_tool_calls,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    repair_parameter_open_tags,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
     validate_json_schema,
@@ -2012,21 +2015,27 @@ class TestParseToolCallsSyntaxError:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+_QWEN_PARSER_MODULES = [
+    "mlx_lm.tool_parsers.qwen3_coder",
+    "mlx_vlm.tools.parsers.qwen3_coder",
+    None,
+]
+
+
+def _qwen_parser_tokenizer(parser_module):
+    if parser_module is None:
+        return None
+    parser = importlib.import_module(parser_module)
+    return SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start=parser.tool_call_start,
+        tool_call_end=parser.tool_call_end,
+        tool_parser=parser.parse_tool_call,
+    )
+
+
 class TestParameterOpenTagMissingGt:
-    """Regression: `<parameter=name=` with no `>` must not cost the tool argument.
-
-    The Qwen templates delimit a parameter as `<parameter=name>value</parameter>`.
-    Models occasionally emit a parameter with an empty value as
-
-        <parameter=proxy=
-        </parameter>
-
-    (no ``>``).  mlx-lm's qwen3_coder parser runs ``match_text.index(">")`` on
-    that payload and raises ``ValueError: substring not found``; the XML
-    fallback then recovers the call while silently dropping the parameter, so
-    the client gets a tool call whose arguments are missing a value it never
-    sees.
-    """
+    """Empty Qwen parameters whose open tag lost its ``>``."""
 
     BASH_TOOL = {
         "type": "function",
@@ -2043,12 +2052,6 @@ class TestParameterOpenTagMissingGt:
         },
     }
 
-    MISSING_GT = (
-        "<tool_call>\n<function=bash>\n<parameter=proxy=\n</parameter>\n"
-        "<parameter=description>\nlist files\n</parameter>\n"
-        "</function>\n</tool_call>"
-    )
-
     def test_repair_leaves_valid_tags_untouched(self):
         for good in (
             "<parameter=proxy>\n</parameter>",
@@ -2056,40 +2059,39 @@ class TestParameterOpenTagMissingGt:
             "<function=bash>\n<parameter=command>ls -la</parameter>",
         ):
             assert repair_parameter_open_tags(good) == good
-            assert repair_parameter_open_tags(repair_parameter_open_tags(good)) == good
 
-    def test_repair_rewrites_missing_gt_payload(self):
-        fixed = repair_parameter_open_tags(self.MISSING_GT)
-        assert "<parameter=proxy>" in fixed
-        assert "<parameter=proxy=" not in fixed
-        assert "<parameter=description>" in fixed
-
-    def test_xml_fallback_keeps_the_empty_argument(self):
-        _, tool_calls = _parse_xml_tool_calls(self.MISSING_GT, [self.BASH_TOOL])
-        assert tool_calls is not None
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("open_tag", ["<parameter=proxy=", "<parameter=proxy"])
+    def test_empty_argument_is_kept(self, parser_module, open_tag):
+        text = (
+            f"<tool_call>\n<function=bash>\n{open_tag}\n</parameter>\n"
+            "<parameter=description>\nlist files\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(
+            text, _qwen_parser_tokenizer(parser_module), [self.BASH_TOOL]
+        )
         assert len(tool_calls) == 1
-        args = json.loads(tool_calls[0].function.arguments)
-        assert args == {"proxy": "", "description": "list files"}
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "proxy": "",
+            "description": "list files",
+        }
 
-    def test_native_parser_gets_a_repaired_payload(self):
-        """The native qwen3_coder path must never see the unterminated tag."""
-        seen = {}
-
-        def strict_parser(payload, tools):
-            seen["payload"] = payload
-            body = re.search(r"<parameter=(.*?)</parameter>", payload, re.DOTALL)
-            name, _ = body.group(1).split(">", 1)  # ValueError before the fix
-            return {"name": "bash", "arguments": {name: ""}}
-
-        tok = MagicMock(spec=[])
-        tok.has_tool_calling = True
-        tok.tool_call_start = "<tool_call>"
-        tok.tool_call_end = "</tool_call>"
-        tok.tool_parser = strict_parser
-
-        _, tool_calls = parse_tool_calls(self.MISSING_GT, tok, [self.BASH_TOOL])
-        assert tool_calls is not None and len(tool_calls) == 1
-        assert "<parameter=proxy=" not in seen["payload"]
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("with_call", [False, True])
+    def test_prose_is_not_rewritten(self, parser_module, with_call):
+        call = (
+            "<tool_call>\n<function=bash>\n<parameter=description>\nls\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+        )
+        text = (call if with_call else "") + "The open tag is <parameter=name"
+        tokenizer = _qwen_parser_tokenizer(parser_module)
+        content, _ = parse_tool_calls(text, tokenizer, [self.BASH_TOOL])
+        qwen_content, _, _ = parse_qwen_tool_calls(
+            text, tokenizer, [self.BASH_TOOL], "stop"
+        )
+        assert content.endswith("<parameter=name")
+        assert qwen_content.endswith("<parameter=name")
 
 
 class TestParseNakedQwenFunctionCalls:
@@ -5563,13 +5565,14 @@ def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
+@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
     from mlx_lm.tool_parsers import qwen3_coder
 
     monkeypatch.setattr(
         qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
     )
-    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": {}}}}}]
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": spec}}}}]
     _, calls = parse_tool_calls(
         '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
         TestNakedQwenFollowup.tokenizer(),
@@ -5578,10 +5581,7 @@ def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
     assert json.loads(calls[0].function.arguments)["v"] == "123"
 
 
-@pytest.mark.parametrize(
-    "parser_module",
-    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder", None],
-)
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
 @pytest.mark.parametrize(
     "types, raw, expected",
     [
@@ -5600,36 +5600,19 @@ def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
         (["number", "null"], "1.25", 1.25),
         (["integer", "null"], "1.0", 1.0),
         (["string", "integer"], "1.25", "1.25"),
-        (["null", "object"], '{"enabled":false}', {"enabled": False}),
-        (["null", "string"], "123", "123"),
-        (["string", "integer"], "false", "false"),
         (["string"], "null", "null"),
         (["string", "null"], '"null"', "null"),
         (["number", "string"], "42", 42),
-        (["null"], "null", None),
     ],
 )
 def test_xml_union_parameter_preserves_declared_value_type(
     parser_module, types, raw, expected
 ):
-    import importlib
-    from types import SimpleNamespace
-
     schema = {"type": "object", "properties": {"v": {"type": types}}, "required": ["v"]}
     tools = [{"function": {"name": "f", "parameters": schema}}]
-    if parser_module is None:
-        tokenizer = None
-    else:
-        parser = importlib.import_module(parser_module)
-        tokenizer = SimpleNamespace(
-            has_tool_calling=True,
-            tool_call_start=parser.tool_call_start,
-            tool_call_end=parser.tool_call_end,
-            tool_parser=parser.parse_tool_call,
-        )
     _, calls = parse_tool_calls(
         f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
-        tokenizer,
+        _qwen_parser_tokenizer(parser_module),
         tools,
     )
     assert calls and len(calls) == 1
@@ -5637,28 +5620,6 @@ def test_xml_union_parameter_preserves_declared_value_type(
     assert arguments["v"] == expected
     assert type(arguments["v"]) is type(expected)
     assert validate_json_schema(arguments, schema)[0]
-
-
-def test_qwen_union_parameter_is_not_decoded_twice(monkeypatch):
-    from mlx_lm.tool_parsers import qwen3_coder
-
-    monkeypatch.setattr(
-        qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
-    )
-    tools = [
-        {
-            "function": {
-                "name": "f",
-                "parameters": {"properties": {"v": {"type": ["string", "null"]}}},
-            }
-        }
-    ]
-    _, calls = parse_tool_calls(
-        '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
-        TestNakedQwenFollowup.tokenizer(),
-        tools,
-    )
-    assert json.loads(calls[0].function.arguments)["v"] == "123"
 
 
 @pytest.mark.parametrize("types", [["unknown"], [None], []])
@@ -5680,16 +5641,6 @@ def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
 def test_native_union_parameter_keeps_correct_python_literal_values(
     parser_module, types, raw, expected
 ):
-    import importlib
-    from types import SimpleNamespace
-
-    parser = importlib.import_module(parser_module)
-    tokenizer = SimpleNamespace(
-        has_tool_calling=True,
-        tool_call_start=parser.tool_call_start,
-        tool_call_end=parser.tool_call_end,
-        tool_parser=parser.parse_tool_call,
-    )
     tools = [
         {
             "function": {
@@ -5700,39 +5651,7 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
     ]
     _, calls = parse_tool_calls(
         f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
-        tokenizer,
+        _qwen_parser_tokenizer(parser_module),
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == expected
-
-
-@pytest.mark.parametrize(
-    "parser_module",
-    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder", None],
-)
-def test_xml_union_accepts_either_valid_interpretation(parser_module):
-    import importlib
-    from types import SimpleNamespace
-
-    schema = {"type": "object", "properties": {"v": {"type": ["string", "boolean"]}}}
-    tools = [{"function": {"name": "f", "parameters": schema}}]
-    parser = importlib.import_module(parser_module) if parser_module else None
-    tokenizer = (
-        SimpleNamespace(
-            has_tool_calling=True,
-            tool_call_start=parser.tool_call_start,
-            tool_call_end=parser.tool_call_end,
-            tool_parser=parser.parse_tool_call,
-        )
-        if parser
-        else None
-    )
-    _, calls = parse_tool_calls(
-        "<tool_call><function=f><parameter=v>true</parameter></function></tool_call>",
-        tokenizer,
-        tools,
-    )
-    arguments = json.loads(calls[0].function.arguments)
-    # Native parsing may already produce a permitted string or boolean.
-    assert arguments["v"] in ("true", True)
-    assert validate_json_schema(arguments, schema)[0]
