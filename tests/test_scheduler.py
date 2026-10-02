@@ -5785,6 +5785,42 @@ class TestCacheCorruptionRecovery:
         assert scheduler.request_id_to_uid["req-async-cleanup"] == 999
         assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
 
+    def test_drain_after_fail_all_leaves_reused_uid_alone(
+        self, mock_model, mock_tokenizer
+    ):
+        """A deferred remove must not touch a uid the next generator reused."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        finished = Request(
+            request_id="req-finished",
+            prompt="finished",
+            sampling_params=SamplingParams(),
+        )
+        future = concurrent.futures.Future()
+        scheduler.requests[finished.request_id] = finished
+        scheduler._inflight_store_futures[finished.request_id] = future
+        scheduler.request_id_to_uid[finished.request_id] = 0
+        scheduler.uid_to_request_id[0] = finished.request_id
+        scheduler._pending_async_removes.append((0, finished.request_id, future))
+        scheduler.batch_generator = MagicMock()
+
+        scheduler.fail_all_requests()
+
+        # mlx-lm BatchGenerator uids restart at 0 on a new instance.
+        new_batch_generator = MagicMock()
+        scheduler.batch_generator = new_batch_generator
+        scheduler.request_id_to_uid["req-new"] = 0
+        scheduler.uid_to_request_id[0] = "req-new"
+        future.set_result(None)
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            assert scheduler._drain_pending_async_removes() is True
+
+        new_batch_generator.remove.assert_not_called()
+        assert scheduler.uid_to_request_id[0] == "req-new"
+        assert scheduler.request_id_to_uid["req-new"] == 0
+        assert finished.request_id not in scheduler.request_id_to_uid
+        assert finished.request_id not in scheduler.requests
+
 
 class TestGenerationOverflowRecovery:
     """Tests for MLX __next_prime overflow recovery."""
