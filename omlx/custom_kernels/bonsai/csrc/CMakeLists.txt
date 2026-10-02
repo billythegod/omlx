@@ -133,9 +133,7 @@ if(BUILD_SHARED_LIBS)
   # resolves the mlx wheel's libmlx.dylib from the installed site-packages
   # layout (omlx/custom_kernels/<pkg> -> site-packages -> mlx/lib); without
   # it the only libmlx rpath is the link-time absolute path into the build
-  # env, which is dead after install (issue #2233). bonsai shipped without
-  # this entry, so dlopen failed with "Library not loaded:
-  # @rpath/libmlx.dylib" on venv installs (issue #2822).
+  # env, which is dead after install (issue #2233).
   target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path
                       -Wl,-rpath,@loader_path/../../../mlx/lib)
 endif()
