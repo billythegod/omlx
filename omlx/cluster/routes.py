@@ -3891,7 +3891,7 @@ async def forget_cluster(node_id: str | None = None):
     deployments after verified local teardown; retain all other peer trust.
     Omitting node_id, or selecting this Mac, leaves the whole local cluster.
     """
-    from .pairing_routes import _manager
+    from .pairing_routes import PairingError, _manager, _pairing_http_error
 
     manager = _manager()
     peers = await asyncio.to_thread(manager.list_paired)
@@ -3911,8 +3911,11 @@ async def forget_cluster(node_id: str | None = None):
     for deployment in affected:
         await deactivate_cluster_deployment(deployment.deployment_id, local_only=True)
     results = []
-    for target in targets:
-        results.append(await asyncio.to_thread(manager.unpair, target))
+    try:
+        for target in targets:
+            results.append(await asyncio.to_thread(manager.unpair, target))
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
     return {
         "ok": True,
         "local_only": True,

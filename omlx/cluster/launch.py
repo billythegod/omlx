@@ -330,6 +330,7 @@ def _set_serve_release(
     payload: dict[str, Any] | None,
     *,
     runner: SSHRunner = subprocess.run,
+    local_only: bool = False,
 ) -> None:
     """Atomically publish or clear the post-load serve gate on every rank."""
 
@@ -357,7 +358,7 @@ def _set_serve_release(
     remote_root = str(state_dir).rstrip("/") or "."
     remote_path = f"{remote_root}/{filename}"
     for host in deployment.hosts:
-        if host.ssh in _LOOPBACK_SSH_TARGETS:
+        if local_only or host.ssh in _LOOPBACK_SSH_TARGETS:
             continue
         script = (
             _REMOTE_CLEAR_SERVE_MARKER_SCRIPT
@@ -3145,7 +3146,9 @@ class DistributedJobSupervisor:
         # Every rank is proven gone, so its RDMA link may carry the next launch.
         _release_rdma_stage_links(self.deployment.deployment_id)
         with suppress(Exception):
-            _set_serve_release(self.deployment, self.state_dir, None)
+            _set_serve_release(
+                self.deployment, self.state_dir, None, local_only=local_only
+            )
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None

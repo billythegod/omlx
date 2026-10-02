@@ -2477,5 +2477,10 @@ def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):
         "_reap_remote_ranks",
         lambda: pytest.fail("remote reaping attempted"),
     )
+    monkeypatch.setattr(
+        launch,
+        "_run_cluster_ssh",
+        lambda *_a, **_k: pytest.fail("remote serve gate cleared over SSH"),
+    )
     supervisor.stop(local_only=True)
     assert supervisor.process is None

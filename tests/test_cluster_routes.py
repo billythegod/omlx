@@ -2501,3 +2501,24 @@ def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, st
         == status
     )
     assert not removed
+
+
+def test_forget_member_maps_pairing_errors(monkeypatch):
+    from omlx.cluster import pairing_routes
+    from omlx.cluster.pairing import PairingStateError
+
+    def unpair(node):
+        raise PairingStateError("approval is already in progress")
+
+    manager = SimpleNamespace(
+        node_id="self", list_paired=lambda: [{"node_id": "busy"}], unpair=unpair
+    )
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=busy")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "approval is already in progress"
