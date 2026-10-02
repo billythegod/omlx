@@ -3434,22 +3434,10 @@ class EnginePool:
                             f"Falling back to default engine."
                         )
                 elif dflash_enabled:
-                    # dflash_enabled but no draft could be resolved: no
-                    # bundled auto-detection exists for this checkpoint
-                    # family (only MiMo has one, via
-                    # resolve_bundled_mimo_draft) and dflash_draft_model
-                    # was left unset. Every other branch above logs why
-                    # DFlash isn't active; this one silently fell through
-                    # to the default engine with no signal at all, which
-                    # is exactly what makes a stale dflash_enabled=true
-                    # (e.g. carried over from a settings migration or a
-                    # recipe import) look identical to a healthy load.
                     logger.warning(
-                        "DFlash enabled for %s but no draft model could be "
-                        "resolved (dflash_draft_model is unset and no "
-                        "bundled draft was found for this checkpoint "
-                        "family); loading without DFlash acceleration. Set "
-                        "dflash_draft_model explicitly to enable it.",
+                        "DFlash enabled for %s but no draft model is set; "
+                        "loading without DFlash. Set dflash_draft_model to "
+                        "enable it.",
                         model_id,
                     )
 

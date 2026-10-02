@@ -1633,11 +1633,7 @@ class TestEnginePoolAsync:
     async def test_dflash_enabled_without_resolvable_draft_warns_and_falls_back(
         self, pool_with_mock_engines, caplog
     ):
-        """dflash_enabled=True with no explicit dflash_draft_model and no
-        bundled-draft match (model-a is plain ``llama``, not mimo) used to
-        fall through to the default engine with zero log signal -- making a
-        stale/mistaken dflash_enabled=true indistinguishable from a healthy
-        load. It must now warn, and still load normally."""
+        """dflash_enabled without a resolvable draft warns and loads normally."""
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
@@ -1656,7 +1652,7 @@ class TestEnginePoolAsync:
         assert engine is mock_engine
         mock_engine.start.assert_called_once()
         assert any(
-            "no draft model could be resolved" in r.getMessage()
+            "no draft model is set" in r.getMessage()
             for r in caplog.records
         )
 
