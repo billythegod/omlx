@@ -153,21 +153,38 @@ class XLMRobertaSelfAttention(nn.Module):
         keys = self.transpose_for_scores(keys)
         values = self.transpose_for_scores(values)
 
-        attention_scores = queries @ keys.swapaxes(-1, -2)
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        if output_attentions or head_mask is not None:
+            attention_scores = queries @ keys.swapaxes(-1, -2)
+            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
 
-        if attention_mask is not None:
-            attention_scores = attention_scores + attention_mask
+            if attention_mask is not None:
+                attention_scores = attention_scores + attention_mask
 
-        attention_probs = nn.softmax(
-            attention_scores.astype(mx.float32), axis=-1
-        ).astype(attention_scores.dtype)
-        attention_probs = self.dropout(attention_probs)
+            attention_probs = nn.softmax(
+                attention_scores.astype(mx.float32), axis=-1
+            ).astype(attention_scores.dtype)
+            attention_probs = self.dropout(attention_probs)
 
-        if head_mask is not None:
-            attention_probs = attention_probs * mx.array(head_mask)
+            if head_mask is not None:
+                attention_probs = attention_probs * mx.array(head_mask)
 
-        context_layer = attention_probs @ values
+            context_layer = attention_probs @ values
+        else:
+            # The eager path materializes batch x heads x L x L scores, and its
+            # looped softmax (L > 4096) corrupts rows past the Metal grid limit.
+            mask = (
+                attention_mask.astype(queries.dtype)
+                if attention_mask is not None
+                else None
+            )
+            context_layer = mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=1.0 / math.sqrt(self.attention_head_size),
+                mask=mask,
+            )
+
         context_layer = context_layer.transpose(0, 2, 1, 3)
         new_context_layer_shape = context_layer.shape[:-2] + (self.all_head_size,)
         context_layer = context_layer.reshape(new_context_layer_shape)

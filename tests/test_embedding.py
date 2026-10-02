@@ -1574,6 +1574,79 @@ class TestNativeEmbeddingLoading:
         norm = math.sqrt(sum(x * x for x in emb))
         assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"
 
+    def test_xlm_roberta_sdpa_attention_matches_eager(self):
+        """The fused attention path must match the eager path on padded rows."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                intermediate_size=64,
+                vocab_size=100,
+                max_position_embeddings=40,
+            )
+        )
+        model.train(False)
+        input_ids = mx.array([[0, 5, 6, 7, 8, 2], [0, 9, 2, 1, 1, 1]])
+        attention_mask = mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]])
+
+        fused = model(input_ids, attention_mask=attention_mask)
+        # output_attentions needs the probabilities, so it keeps the eager path.
+        eager = model(input_ids, attention_mask=attention_mask, output_attentions=True)
+
+        assert mx.allclose(
+            fused.last_hidden_state, eager.last_hidden_state, atol=1e-5
+        ).item()
+
+    def test_embed_batches_long_inputs_in_input_order(self, tmp_path):
+        """Token-budget batches must match single-input vectors in input order."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 100,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 128,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        texts = ["w " * 40, "a b", "x " * 20, "c d e"]
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=self.MockNativeTokenizer(vocab_size=config["vocab_size"]),
+        ):
+            model.load()
+            singles = [model.embed([text], max_length=64) for text in texts]
+
+            shapes = []
+            forward = model.model
+
+            def recording_forward(**kwargs):
+                shapes.append(kwargs["input_ids"].shape)
+                return forward(**kwargs)
+
+            model.model = recording_forward
+            with patch("omlx.models.embedding.ENCODER_BATCH_TOKEN_BUDGET", 48):
+                batched = model.embed(texts, max_length=64)
+
+        assert len(shapes) == 3
+        assert all(batch * width <= 48 for batch, width in shapes)
+        for got, single in zip(batched.embeddings, singles):
+            assert got == pytest.approx(single.embeddings[0], abs=1e-5)
+        assert batched.total_tokens == sum(single.total_tokens for single in singles)
+
 
 class TestGetEmbeddingMaxLength:
     """The server helper that resolves the per-request embedding token cap."""

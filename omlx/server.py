@@ -3694,6 +3694,7 @@ async def create_rerank(
     Supports:
     - String documents or dict documents with 'text' field
     - Optional top_n to limit results
+    - Optional max_length to limit tokens per query-document pair
     - Optional return_documents to include document text in response
     """
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3726,6 +3727,7 @@ async def create_rerank(
             query=request.query,
             documents=documents_raw,
             top_n=request.top_n,
+            max_length=request.max_length,
         )
 
     elapsed = time.perf_counter() - start_time
