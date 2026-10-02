@@ -2260,6 +2260,21 @@ def parse_qwen_tool_calls(
             )
             if relative_end is not None:
                 function_end = function_start + relative_end
+                if (
+                    paired
+                    and found is not None
+                    and function_end < found[0]
+                    and _QWEN_OPEN_RE.search(text[function_end : found[0]])
+                ):
+                    # The boundary scan found this function's own
+                    # </function>, and a new opening marker starts between
+                    # it and the adopted outer close — that close belongs
+                    # to the later call, not to this one. Split here:
+                    # merging both calls into one envelope made the native
+                    # parser keep only the last function, corrupting the
+                    # first call's arguments with the second call's markup
+                    # and silently losing a call.
+                    found = None
             elif (
                 paired
                 and found
@@ -2283,7 +2298,14 @@ def parse_qwen_tool_calls(
         else:
             end = function_end
             if end is None or (
-                paired and (finish_reason != "stop" or text[end:].strip())
+                paired
+                and (
+                    finish_reason != "stop"
+                    or (
+                        bool(text[end:].strip())
+                        and _QWEN_OPEN_RE.match(text[end:].lstrip()) is None
+                    )
+                )
             ):
                 errors.append("incomplete")
                 pos = len(text)
@@ -3112,6 +3134,18 @@ class ToolCallStreamFilter:
                 candidate
             ) or self._could_be_partial_attr_function_open(candidate):
                 keep = max(keep, len(candidate))
+                # An open-tag candidate grows with the tool or namespace
+                # name, so the fixed 128-char window below would chop it
+                # mid-tag — after which the complete open tag can never
+                # reassemble inside the buffer and the whole envelope
+                # leaks as visible content. Hold candidates up to a bound
+                # derived from the declared tool names instead (plus a
+                # floor for the namespaced form, whose namespace is not
+                # registry-constrained).
+                longest = max(
+                    (len(n) for n in self._registered_tool_names), default=0
+                )
+                return min(keep, max(512, longest + 64))
 
         # Partial prefix detection for bracket markers (e.g. "[", "[C",
         # "[Cal" could be start of "[Calling tool:" or "[Tool call:").
@@ -3484,6 +3518,15 @@ class ToolCallStreamFilter:
             tail = self._buffer
             self._buffer = ""
             if self._should_drop_tail_at_finish(tail):
+                # A bracket-prefix hold that never resolved (no closing
+                # ']') used to be dropped silently here — swallowing an
+                # unbounded amount of post-marker prose with no signal.
+                # Route it through the conditional-recovery contract
+                # instead: the caller re-emits it only when final parsing
+                # confirms no structured tool call, exactly like an
+                # unterminated paired envelope.
+                if any(tail.startswith(bp) for bp in self._bracket_prefixes):
+                    self._recovery_candidate = tail
                 return recovered
             return recovered + tail
 
