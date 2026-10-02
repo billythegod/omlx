@@ -560,7 +560,6 @@ class TestConvertToolsForTemplate:
         }
 
         def reverse_object_keys(value):
-            """Simulate a client reserializing objects without changing arrays."""
             if isinstance(value, dict):
                 return {
                     key: reverse_object_keys(child)
@@ -570,20 +569,10 @@ class TestConvertToolsForTemplate:
                 return [reverse_object_keys(child) for child in value]
             return value
 
-        def make_tools(parameters):
-            """Wrap a schema in the OpenAI tool format used by the converter."""
-            return [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search",
-                        "parameters": parameters,
-                    },
-                }
-            ]
-
-        tools = make_tools(schema)
-        reordered_tools = make_tools(reverse_object_keys(schema))
+        tools, reordered_tools = (
+            [{"type": "function", "function": {"name": "search", "parameters": params}}]
+            for params in (schema, reverse_object_keys(schema))
+        )
         originals = [json.dumps(tools), json.dumps(reordered_tools)]
         converted = convert_tools_for_template(tools)
         reordered = convert_tools_for_template(reordered_tools)
