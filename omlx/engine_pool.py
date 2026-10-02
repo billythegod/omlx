@@ -3126,21 +3126,8 @@ class EnginePool:
                 and actual_freed > 0
                 and not footprint_pending
             ):
-                # This unload released memory, stopped short of the bar, and
-                # the gauge has not moved since. The remaining rounds only
-                # repeat gc/synchronize/clear_cache against a number that is
-                # not changing, so they cannot settle the barrier — burn them
-                # and the 3s emergency reclaim for nothing (#2757: ~10s
-                # shutdown hang on a model that plateaus just short).
-                #
-                # Scoped deliberately:
-                #  - actual_freed > 0 means memory *was* returned and merely
-                #    fell short. A constant 0 is a different situation, left
-                #    to run the full barrier and its emergency reclaim.
-                #  - not footprint_pending, because a flat MLX gauge with the
-                #    phys footprint ledger still lagging is exactly what the
-                #    barrier exists to wait out; bailing there is what causes
-                #    the 507 on an immediate settings reload.
+                # A non-zero plateau means gc/clear_cache stopped releasing
+                # memory. A zero plateau still gets the full barrier.
                 settle_stalled = True
                 logger.info(
                     f"Settle for '{model_id}' stalled at "
@@ -3183,13 +3170,7 @@ class EnginePool:
             # get_engine), so any unreleased memory stays visible to both.
             pass
         elif settle_stalled:
-            # The barrier gave up early because the gauge stopped moving
-            # (logged above). Emergency reclaim is skipped for the same
-            # reason it is skipped above, and more directly here: it is three
-            # more gc + synchronize + clear_cache rounds, which is precisely
-            # the work that just proved it releases nothing. Recovery relies
-            # on the same two safety nets — the enforcer re-poll woken below
-            # and the live gauge re-read at pre-load admission.
+            # Emergency reclaim repeats the gc/clear_cache work that just stalled.
             pass
         else:
             # Barrier timed out - try emergency reclaim

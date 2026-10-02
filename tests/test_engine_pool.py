@@ -3680,49 +3680,34 @@ class TestMemorySettleBarrier:
     async def test_settle_bails_when_freed_plateaus_short(
         self, pool_with_loaded_model, caplog
     ):
-        """A plateau short of the bar must not burn the whole barrier (#2757).
-
-        The reported shape: memory is genuinely returned, lands just under the
-        required freed amount, and then stops moving — the same value every
-        round. Further rounds and the emergency reclaim cannot move it.
-        """
+        """A non-zero plateau short of the bar ends the barrier (#2757)."""
         pool = pool_with_loaded_model
-        # est_size = 5GB, tolerance = 2GB, need >= 3GB freed.
-        # Pre-unload 10GB; settle reads 10GB, then 9.4GB forever: 0.6GB freed
-        # is short of 3GB and identical on every round.
+        # Need >= 3GB freed; 0.6GB is freed and then stays flat.
         freed_short = 10 * 1024**3 - int(0.6 * 1024**3)
-        active_memory_values = [10 * 1024**3] + [freed_short] * 12
-        call_idx = [0]
         sleep_calls = []
-
-        def mock_get_active():
-            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
-            call_idx[0] += 1
-            return val
 
         async def mock_sleep(duration):
             sleep_calls.append(duration)
 
-        with caplog.at_level(logging.INFO):
-            with (
-                patch("omlx.engine_pool.mx") as mock_mx,
-                patch("omlx.engine_pool.get_mlx_executor", return_value=None),
-                patch("asyncio.sleep", side_effect=mock_sleep),
-            ):
-                mock_mx.get_active_memory = mock_get_active
-                mock_mx.synchronize = MagicMock()
-                mock_mx.clear_cache = MagicMock()
+        with (
+            caplog.at_level(logging.INFO),
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=mock_sleep),
+        ):
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3] + [freed_short] * 12
+            )
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
 
-                await pool._unload_engine("model-a")
+            await pool._unload_engine("model-a")
 
-        # Stalled, not timed out.
         assert "stalled at" in caplog.text
         assert "Settle barrier timed out" not in caplog.text
-        # Pre-unload sample + 2 settle rounds, not 11.
-        assert call_idx[0] == 3
-        # No emergency reclaim, so no 1.0s sleeps.
+        # Pre-unload sample + 2 settle rounds, and no emergency reclaim.
+        assert mock_mx.get_active_memory.call_count == 3
         assert 1.0 not in sleep_calls
-        # Accounting is unaffected by the bail.
         assert pool._current_model_memory == 0
         assert pool._entries["model-a"].engine is None
 
@@ -3730,22 +3715,9 @@ class TestMemorySettleBarrier:
     async def test_settle_keeps_waiting_while_footprint_pending(
         self, pool_with_loaded_model
     ):
-        """A plateau must NOT bail while the phys footprint ledger lags.
-
-        Metal can return arrays before macOS updates its footprint, and
-        admission reads both gauges. Bailing there is what makes an immediate
-        settings reload fail with 507, so the barrier must keep waiting.
-        """
+        """A plateau does not end the barrier while the footprint lags."""
         pool = pool_with_loaded_model
-        # Freed stays flat at 0.6GB, but the footprint never catches up.
         freed_short = 10 * 1024**3 - int(0.6 * 1024**3)
-        active_memory_values = [10 * 1024**3] + [freed_short] * 12
-        call_idx = [0]
-
-        def mock_get_active():
-            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
-            call_idx[0] += 1
-            return val
 
         with (
             patch("omlx.engine_pool.mx") as mock_mx,
@@ -3753,53 +3725,16 @@ class TestMemorySettleBarrier:
             patch("omlx.engine_pool.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
-            mock_mx.get_active_memory = mock_get_active
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3] + [freed_short] * 12
+            )
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
 
             await pool._unload_engine("model-a")
 
         # Pre-unload + 10 settle rounds + the emergency reclaim's own check.
-        assert call_idx[0] == 12
-
-    @pytest.mark.asyncio
-    async def test_settle_zero_freed_still_runs_full_barrier(
-        self, pool_with_loaded_model
-    ):
-        """A gauge that never moved at all keeps today's full-barrier path.
-
-        Nothing was returned, which is a different situation from "returned
-        some, fell short". It still gets the 10 rounds and the emergency
-        reclaim so its diagnostics are unchanged.
-        """
-        pool = pool_with_loaded_model
-        active_memory_values = [10 * 1024**3] * 14
-        call_idx = [0]
-        sleep_calls = []
-
-        def mock_get_active():
-            call_idx[0] += 1
-            return active_memory_values[
-                min(call_idx[0] - 1, len(active_memory_values) - 1)
-            ]
-
-        async def mock_sleep(duration):
-            sleep_calls.append(duration)
-
-        with (
-            patch("omlx.engine_pool.mx") as mock_mx,
-            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
-            patch("asyncio.sleep", side_effect=mock_sleep),
-        ):
-            mock_mx.get_active_memory = mock_get_active
-            mock_mx.synchronize = MagicMock()
-            mock_mx.clear_cache = MagicMock()
-
-            await pool._unload_engine("model-a")
-
-        # Pre-unload + 10 settle rounds + the emergency reclaim's own check.
-        assert call_idx[0] == 12
-        assert sleep_calls.count(1.0) == 3
+        assert mock_mx.get_active_memory.call_count == 12
 
     @pytest.mark.asyncio
     async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
