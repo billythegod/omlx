@@ -74,6 +74,10 @@ class XLMRobertaEmbeddings(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.padding_idx = config.pad_token_id
+        # RoBERTa models number positions after padding_idx. BERT counts from 0.
+        self.position_offset = (
+            0 if config.model_type == "bert" else config.pad_token_id + 1
+        )
 
     def create_position_ids_from_input_ids(
         self, input_ids, padding_idx, past_key_values_length=0
@@ -98,9 +102,17 @@ class XLMRobertaEmbeddings(nn.Module):
         seq_length = input_shape[1]
 
         if position_ids is None:
-            position_ids = self.create_position_ids_from_input_ids(
-                input_ids, self.padding_idx, past_key_values_length
-            )
+            if self.position_offset == 0:
+                position_ids = mx.broadcast_to(
+                    mx.arange(
+                        past_key_values_length, past_key_values_length + seq_length
+                    ),
+                    input_shape,
+                )
+            else:
+                position_ids = self.create_position_ids_from_input_ids(
+                    input_ids, self.padding_idx, past_key_values_length
+                )
 
         if token_type_ids is None:
             token_type_ids = mx.zeros(input_shape, dtype=mx.int32)
@@ -406,6 +418,11 @@ class Model(nn.Module):
             self.pooler = None  # Not used for classification
         else:
             self.pooler = XLMRobertaPooler(config) if config.add_pooling_layer else None
+
+    @property
+    def max_input_length(self) -> int:
+        """Longest input whose position ids stay inside the position table."""
+        return self.config.max_position_embeddings - self.embeddings.position_offset
 
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits."""

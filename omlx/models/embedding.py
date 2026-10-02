@@ -816,6 +816,10 @@ class MLXEmbeddingModel:
             self.load()
 
         max_length = self._resolve_max_length(max_length)
+        # Absolute position tables read out of range without an error.
+        position_limit = getattr(self.model, "max_input_length", None)
+        if isinstance(position_limit, int):
+            max_length = min(max_length, position_limit)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         for item in normalized_inputs:
             image_ref = item.get("image")
@@ -829,7 +833,14 @@ class MLXEmbeddingModel:
 
         processor = self.processor
         uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
-        if hasattr(processor, "_tokenizer") and not uses_custom_embedding_inputs:
+        # Unwrap only mlx-embeddings' TokenizerWrapper. transformers tokenizers
+        # also have a Rust _tokenizer whose encode() applies tokenizer.json
+        # padding and truncation instead of this request's settings.
+        if (
+            type(processor).__name__ == "TokenizerWrapper"
+            and hasattr(processor, "_tokenizer")
+            and not uses_custom_embedding_inputs
+        ):
             processor = processor._tokenizer
 
         if has_image_inputs and (self._using_native or not uses_custom_embedding_inputs):

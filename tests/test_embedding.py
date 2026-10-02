@@ -553,6 +553,33 @@ class TestEmbeddingCompileFallback:
 
         assert generate.call_args.kwargs["max_length"] == 1024
 
+    def test_max_length_is_capped_at_position_table(self):
+        """XLM-R declares 8194 positions but only 8192 inputs fit after the offset."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(
+            config=SimpleNamespace(max_position_embeddings=8194),
+            max_input_length=8192,
+        )
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+            model.embed(["test"], max_length=1024)
+
+        lengths = [call.kwargs["max_length"] for call in generate.call_args_list]
+        assert lengths == [8192, 1024]
+
     def test_custom_processor_compiled_path_uses_prepare_embedding_inputs(self):
         """Custom embedding processors should use their own prepare API."""
         import mlx.core as mx
@@ -1514,6 +1541,69 @@ class TestNativeEmbeddingLoading:
 
         assert result is False
         assert model._loaded is False
+
+    def test_native_embed_tokenizes_with_tokenizer_call(self, tmp_path):
+        """transformers tokenizers expose a Rust _tokenizer that must stay unused."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 100,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ):
+            model.load()
+            expected = model.embed(["hello world"]).embeddings
+            # Its encode() would apply tokenizer.json padding as real tokens.
+            tokenizer._tokenizer = object()
+            assert model.embed(["hello world"]).embeddings == expected
+
+    def test_position_ids_follow_bert_and_roberta_numbering(self):
+        """BERT positions start at 0; XLM-R positions start after padding_idx."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        input_ids = mx.array([[5, 6, 7, 8]])
+        common = dict(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            vocab_size=16,
+        )
+        cases = (
+            ("bert", 0, 512, [0, 1, 2, 3], 512),
+            ("xlm-roberta", 1, 8194, [2, 3, 4, 5], 8192),
+        )
+        for model_type, pad_token_id, table, positions, max_input in cases:
+            model = Model(
+                ModelArgs(
+                    model_type=model_type,
+                    pad_token_id=pad_token_id,
+                    max_position_embeddings=table,
+                    **common,
+                )
+            )
+            model.train(False)
+            expected = model.embeddings(input_ids, position_ids=mx.array([positions]))
+
+            assert mx.array_equal(model.embeddings(input_ids), expected).item()
+            assert model.max_input_length == max_input
 
     def test_load_native_falls_back_for_unknown_arch(self, tmp_path):
         """Test that native loading returns False for unsupported architectures."""
