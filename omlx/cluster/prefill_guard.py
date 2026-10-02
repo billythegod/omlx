@@ -75,6 +75,14 @@ def rank_monitor(
     # never charge more KV layers than that, and never more than the stage holds.
     kv_layers = int(getattr(monitor, "_num_kv_cache_layers", 0) or 0)
     stage_kv_layers = min(stage_layers, kv_layers) if kv_layers else stage_layers
+    # Keep the window-capped sliding layers, clamped to the stage's other layers.
+    spare = stage_layers - stage_kv_layers
+    rotating = []
+    for count, window in getattr(monitor, "_rotating_layer_specs", ()):
+        count = min(int(count), spare)
+        if count > 0:
+            rotating.append((count, int(window)))
+            spare -= count
 
     # Tensor parallel: heads are split across ranks, so both the KV this rank
     # stores and the attention transient it computes shrink with the shard.
@@ -93,6 +101,7 @@ def rank_monitor(
         num_attention_heads=heads,
         num_kv_cache_layers=stage_kv_layers,
         kv_bytes_per_token=kv_override,
+        rotating_layer_specs=rotating,
     )
     return monitor
 

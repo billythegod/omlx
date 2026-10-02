@@ -70,3 +70,28 @@ def test_rank_prefill_guard_never_charges_more_than_the_stage_holds(monkeypatch)
         memory_monitor, "set_model_info_from_model", _classified_monitor(64)
     )
     assert rank_monitor(object(), layer_count=33)._num_kv_cache_layers == 33
+
+
+def test_rank_prefill_guard_keeps_sliding_window_layers(monkeypatch):
+    from omlx import memory_monitor
+    from omlx.cluster.prefill_guard import rank_monitor
+
+    def classified(monitor, model):
+        monitor.set_model_info(
+            num_layers=36,
+            num_kv_heads=8,
+            head_dim=64,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=18,
+            rotating_layer_specs=[(18, 128)],
+        )
+
+    monkeypatch.setattr(memory_monitor, "set_model_info_from_model", classified)
+    tp = rank_monitor(object(), tensor_parallel_size=2)
+    assert tp._rotating_layer_specs == ((18, 128),)
+    assert tp.estimate_resident_kv_bytes(
+        32768, chunk_tokens=2048
+    ) > tp.estimate_prompt_kv_bytes(32768)
+    # A 20-layer stage has room for only 2 sliding layers next to 18 full ones.
+    assert rank_monitor(object(), layer_count=20)._rotating_layer_specs == ((2, 128),)
