@@ -3177,6 +3177,28 @@ class ToolCallStreamFilter:
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
         return min(keep, 128)
 
+    def _bracket_tail_names_declared_tool(self, tail: str) -> bool:
+        """Whether an unresolved bracket hold looks like a truncated call.
+
+        ``True`` means the markup must stay suppressed at finish (the
+        drops-unresolved-bracket-fragment contract): the token right after
+        the marker is a declared tool name, so this is a truncated
+        invocation carrying half-written JSON. With no tools declared the
+        bracket can never become a structured call, so the answer is False
+        and the prose stays recoverable.
+        """
+        for bp in self._bracket_prefixes:
+            if not tail.startswith(bp):
+                continue
+            rest = tail[len(bp) :].lstrip()
+            token = re.match(r"[A-Za-z_][\w.\-]*", rest)
+            if token is None:
+                return False
+            if not self._registered_tool_names:
+                return False
+            return token.group(0) in self._registered_tool_names
+        return False
+
     def _should_drop_tail_at_finish(self, tail: str) -> bool:
         """Whether unresolved tail should be suppressed under strict mode."""
         if not tail:
@@ -3523,10 +3545,14 @@ class ToolCallStreamFilter:
                 # unbounded amount of post-marker prose with no signal.
                 # Route it through the conditional-recovery contract
                 # instead: the caller re-emits it only when final parsing
-                # confirms no structured tool call, exactly like an
-                # unterminated paired envelope.
+                # confirms no structured tool call. One case stays
+                # suppressed: a tail whose next token is a *declared* tool
+                # name is a truncated invocation, and its markup
+                # (half-written JSON naming the tool) must not surface —
+                # the drops-unresolved-bracket-fragment contract.
                 if any(tail.startswith(bp) for bp in self._bracket_prefixes):
-                    self._recovery_candidate = tail
+                    if not self._bracket_tail_names_declared_tool(tail):
+                        self._recovery_candidate = tail
                 return recovered
             return recovered + tail
 

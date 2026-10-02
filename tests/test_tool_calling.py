@@ -5797,3 +5797,19 @@ class TestQwenSplitRecoveryRegression:
         # argument value had swallowed the second call's markup.
         assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
         assert errors == ()
+
+    def test_truncated_declared_tool_call_stays_suppressed(self):
+        """A truncated invocation naming a declared tool keeps the contract.
+
+        '[Calling tool: get_weather({"city":"SF"}' (no closing bracket) is
+        a cut-off call, not prose: its markup — half-written JSON naming
+        the tool — must not surface, matching the
+        drops-unresolved-bracket-fragment e2e contract.
+        """
+        f = ToolCallStreamFilter(_make_tokenizer(), tools={"get_weather"})
+        text = 'Before [Calling tool: get_weather({"city":"SF"}'
+        out = [f.feed(ch) for ch in text]
+        out.append(f.finish())
+        assert "".join(out) == "Before "
+        assert f.take_recovery_candidate() == ""
+
