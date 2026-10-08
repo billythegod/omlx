@@ -1158,6 +1158,20 @@ class BlockAwarePrefixCache(CacheManager):
             if (
                 len(block_tokens) == self.block_size or is_tail_terminal
             ) and not (is_exact_terminal or is_exact_split_block):
+                # Hash the block BEFORE the lookup. find_cached_block()
+                # drops its lock on return, and block objects are pooled:
+                # reading existing_block.block_hash after the window would
+                # accept a block that was freed and reallocated to other
+                # content in between, because its pooled object then
+                # carries the new content's hash — which would trivially
+                # match itself. The locally computed chain hash cannot
+                # drift.
+                expected_hash = compute_block_hash(
+                    parent_hash,
+                    block_tokens,
+                    extra_keys=block_extra_keys,
+                    model_name=self.paged_cache.model_name,
+                )
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -1226,7 +1240,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # the chain hash and takes the reference under one lock;
                     # on mismatch fall through and store a fresh block.
                     acquired = self.paged_cache.acquire_cached_block(
-                        existing_block.block_id, existing_block.block_hash
+                        existing_block.block_id, expected_hash
                     )
                     if acquired is not None:
                         block_table.block_ids.append(existing_block.block_id)

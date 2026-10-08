@@ -6382,7 +6382,10 @@ class Scheduler:
                     request.request_id,
                     vlm_mtp_uid,
                 )
-                return
+                # The request is already running on the MTP path; report
+                # success so callers don't emit a spurious error output
+                # for it.
+                return True
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
