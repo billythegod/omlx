@@ -1820,29 +1820,40 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         )
         warmup_started = time.perf_counter()
-        warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
-        warmup_prefill_tokens = warmup_prompt_tokens - 1
-        warmup_prompt = _generate_prompt(
-            tokenizer,
-            warmup_prompt_tokens,
-            request.context_profile,
-        )
-        warmup_max_tokens = (
-            request.generation_length
-            if getattr(engine, "is_diffusion_model", False)
-            else 8
-        )
-        async for _ in engine.stream_generate(
-            prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
-        ):
-            pass
-        logger.info(
-            "Benchmark: warmup complete "
-            f"(mode={request.warmup_mode.value}, "
-            f"prompt_tokens={warmup_prompt_tokens}, "
-            f"prefill_tokens={warmup_prefill_tokens}, "
-            f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
-        )
+        if chat is not None:
+            await chat.warmup(_warmup_prompt_tokens(request.warmup_mode))
+            logger.info(
+                "Benchmark: warmup complete "
+                f"(mode={request.warmup_mode.value}, "
+                f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+            )
+        else:
+            warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
+            warmup_prefill_tokens = warmup_prompt_tokens - 1
+            warmup_prompt = _generate_prompt(
+                tokenizer,
+                warmup_prompt_tokens,
+                request.context_profile,
+            )
+            warmup_max_tokens = (
+                request.generation_length
+                if getattr(engine, "is_diffusion_model", False)
+                else 8
+            )
+            async for _ in engine.stream_generate(
+                prompt=warmup_prompt,
+                max_tokens=warmup_max_tokens,
+                temperature=0.0,
+                skip_cache_store=True,
+            ):
+                pass
+            logger.info(
+                "Benchmark: warmup complete "
+                f"(mode={request.warmup_mode.value}, "
+                f"prompt_tokens={warmup_prompt_tokens}, "
+                f"prefill_tokens={warmup_prefill_tokens}, "
+                f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+            )
 
         # Start host sampling after warmup: Metal shader and JIT compilation
         # would otherwise be folded into the CPU aggregates.
